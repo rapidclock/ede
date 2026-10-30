@@ -1,0 +1,51 @@
+# Working agreements
+
+- Use Rust for application code, examples, and tests. When Python is appropriate for auxiliary scripts, use `uv`; never install packages into the system Python.
+
+## Branching Strategy
+
+- Do not work off of the `main` branch.
+- Top level Features will branch off of `main` and use the format `feat/PROJECT_NAME` for the project specifications.
+- When working on a step/stage of a project, we branch off of the feat branch and create a branch in the format `stage/STAGE_NAME`.
+- Always PR the Stage branch to the Feature/Project Branch and project branch PRs into `main`.
+
+## Specification Documents
+
+- Specifications are iterative working documents. Update them as decisions change;
+  distinguish requirements, proposals, open questions, and approved decisions.
+- Start each project at `specs/NNN_project_name/overview.md`. Capture the complete
+  functional scope, constraints, and unresolved decisions at a high level first.
+- Obtain explicit user approval of the overview before breaking down the entire project into self-contained stages.
+- Then describe the observable outcome expected at the end of each stage in the overview, and elaborate stage details in `NN_stage_name.md` files.
+- Stage specifications must be writen in a very concise and clear manner with a level of detail such implementable by a human suffering from AI Slop consumption fatigue.
+
+- Approval of a specification does not itself authorize implementation. Follow the
+  user's current scope; do not create application scaffolding, implementation,
+  stage files, or tests before the corresponding work is authorized.
+- A workflow where the agent writes functional/system tests and the user writes
+  implementation is an option to discuss later, not an established requirement.
+
+## Programming Style and Guidelines
+
+### Rust
+
+- Always format code with `cargo fmt`.
+- Always fix all possible clippy bugs using `cargo clippy`. Some reasonable and contained skipping is reasonable when is recommended industry best-practice.
+- Always ensure test cases are successful before pushing and being done. If something fails, fix it. Do NOT be LAZY!
+- Be cognizant of external dependencies. Always ensure you are not pulling in old/decrepid dependencies. Use them when absolutely needed.
+- Write module, type and function level docstrings in such a manner a new person to the project understands everything about the entity and can use and extend it.
+
+### Python
+
+- Never install anything in the system Python.
+- Always use `uv` to run scripts and manage python versions and virtual environments.
+- When scripts are going to be persisted, lint and format them with `ruff` and type check with `ty`.
+- Always write documentation and docstrings. 
+- Add type hints everwhere possible.
+
+
+### Bash/Shell
+
+- Attempt to write any scripts in POSIX compliant shell.
+- Run shellcheck to lint scripts if they are going to be persisted in the repo.
+- Always follow industry standard practices.

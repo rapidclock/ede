@@ -1,0 +1,41 @@
+name: Rust CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Format, lint, and test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      # Temporary: specification work precedes creation of the Rust project.
+      - name: Report specification-only checkout
+        if: ${{ hashFiles('Cargo.toml') == '' }}
+        run: echo 'Rust checks skipped because Cargo.toml does not exist yet.' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Install stable Rust with formatting and linting tools
+        if: ${{ hashFiles('Cargo.toml') != '' }}
+        run: rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+
+      - name: Check formatting
+        if: ${{ hashFiles('Cargo.toml') != '' }}
+        run: cargo +stable fmt --all -- --check
+
+      - name: Run Clippy
+        if: ${{ hashFiles('Cargo.toml') != '' }}
+        run: cargo +stable clippy --workspace --all-targets -- -D warnings
+
+      - name: Run tests
+        if: ${{ hashFiles('Cargo.toml') != '' }}
+        run: cargo +stable test --workspace
