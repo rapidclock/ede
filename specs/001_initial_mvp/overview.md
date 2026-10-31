@@ -1,6 +1,6 @@
 # 001 — Initial MVP overview
 
-Status: **Draft — awaiting user approval.**
+Status: **MVP scope approved — stage breakdown proposed for review.**
 
 Project: **ede**, a predominantly Rust terminal text editor for macOS and Linux.
 
@@ -18,8 +18,9 @@ is a first-class part of the interface. The application must also remain fully
 usable through the keyboard and in remote terminal sessions.
 
 The target experience combines familiar tabbed editing and search/replace with
-pager-like navigation and log following. Familiar desktop-editor behavior is the
-proposed interaction model; a particular default keymap has not been approved.
+pager-like navigation and log following. Use non-modal editing with familiar
+Ctrl-based shortcuts and optional Cmd equivalents where the terminal delivers
+them. The complete default keymap remains to be designed under FR-09.
 
 Users initially compile and run the application themselves. Packaging, installers,
 automatic updates, and release distribution are not MVP requirements.
@@ -28,20 +29,33 @@ automatic updates, and release distribution are not MVP requirements.
 
 - **Required:** the functional requirements in section 3, including both viewing
   and editing large files and compatibility with remote terminal workflows.
-- **Proposed:** the architecture and baseline policies in sections 4 and 5.
+- **Agreed starting defaults:** the highlighting heuristics, scratch checkpoint
+  interval, and responsiveness goals below, subject to benchmark validation.
+- **Proposed:** the architecture in section 4 and verification details not yet
+  agreed in section 5.
 - **Unresolved:** the decisions in section 6. These are not implied commitments.
 - **Deferred/optional:** the capabilities in section 7.
 
 Markdown means source editing and syntax highlighting, including YAML frontmatter
 and fenced code blocks. A rendered Markdown preview is not required.
 
+This iteration opens individual text files, not folders or project workspaces.
+The file picker may navigate directories to locate a file, but opening a directory
+as a workspace and recursively loading its files are outside this iteration.
+
+The initial MVP package version is `0.0.1`. Development versions may use SemVer
+prerelease identifiers such as `0.0.1-dev.1`, `0.0.1-dev.2`, and so on, preceding
+`0.0.1`. This is the Cargo package version, separate from the Rust compiler version
+and edition. No Cargo project is created during specification work.
+
 ## 3. Functional requirements
 
 ### FR-01 — Platforms and terminal lifecycle
 
 - Run natively on macOS and Linux; Windows support is outside the initial scope.
-- Support local sessions and sessions through SSH, tmux, Eternal Terminal, and
-  mosh, including combinations such as a remote connection with tmux.
+- Run correctly in local terminals and through SSH, Eternal Terminal, or mosh,
+  including inside local or remote tmux sessions. Test keyboard input, mouse
+  interaction, paste, rendering, and resizing across supported configurations.
 - Keep core editing and navigation available through a portable keyboard baseline.
   Enhanced terminal features must have usable fallbacks.
 - Respond to terminal resizing, including small terminals, without losing document
@@ -60,11 +74,17 @@ test them; do not claim universal support for every protocol/version combination
 - Create a document, open an existing file, insert and delete text, select ranges,
   cut/copy/paste, and navigate by character, line, and page.
 - Support undo/redo and save/save-as. Mark modified documents and protect unsaved
-  changes when closing tabs or exiting.
+  changes when closing tabs or exiting. Preserve scratch documents across normal
+  application exits without requiring an explicit save (FR-10).
 - Keep cursor placement, selection, and text rendering consistent for tabs,
   combining characters, and wide Unicode characters.
 - Preserve supported encoding and newline conventions according to an explicit
   policy. Do not silently replace undecodable bytes and save corrupted content.
+- Binary formats are unsupported. Reject detected binary files with a clear
+  message such as "Cannot open binary file" and leave the file unchanged. Define
+  detection and unsupported-text-encoding behavior separately so an encoding error
+  does not automatically imply binary content. No binary viewer or hex editor is
+  required.
 - Report open/save failures clearly and preserve unsaved work on failure.
 - Detect relevant external changes and define an explicit reload/conflict policy;
   do not silently overwrite another process's changes.
@@ -89,9 +109,15 @@ are proposed interaction details, subject to review.
 
 ### FR-04 — Syntax highlighting and language expansion
 
-- Bundle support for Markdown, TOML, YAML, JSON, JavaScript, TypeScript, Python,
-  Rust, INI, XML, HTML, and CSS. Syntax highlighting must work without a language
-  server or runtime grammar downloads.
+- Target initial support for Markdown, TOML, YAML, JSON, JavaScript, TypeScript,
+  Python, Rust, INI, XML, HTML, and CSS. Discuss and agree any language or embedded
+  syntax deferrals with the user if their complexity is disproportionate to the
+  MVP; do not silently reduce this target list.
+- External highlighting libraries, grammar packages, or tools are acceptable if
+  lightweight, performant, and well maintained. Select the approach together with
+  the user, including its installation/build needs and maintenance tradeoffs.
+  Bundle the agreed syntax assets or document agreed external prerequisites;
+  routine highlighting must work offline without a language server.
 - For Markdown, highlight source structure, YAML frontmatter, inline code, and
   fenced code. Use the fence language when a corresponding bundled language is
   available; use a readable fallback for unknown languages.
@@ -108,18 +134,35 @@ are proposed interaction details, subject to review.
 Exact grammars, dialects, theme defaults, and extension-loading mechanisms remain
 open. Adding a native grammar may initially require recompilation.
 
+Agreed initial highlighting heuristics (configurable and subject to benchmarks):
+
+| Trigger | Behavior |
+| --- | --- |
+| Document exceeds 20 MiB | Disable highlighting for the document |
+| Any document line exceeds 64 KiB of text | Disable highlighting for the document |
+| A background parsing operation exceeds 250 ms | Cancel parsing and fall back to plain text |
+
+These are highlighting limits, not file-opening or editing limits. Use a whole
+document plain-text fallback rather than a column cutoff that loses syntax
+context. Show the reason in the UI and avoid repeatedly retrying an expensive
+parser automatically. Keep parsing off the interactive UI path and discard stale
+results after edits. Library-specific cancellation behavior needs validation.
+
 ### FR-05 — Tabs and interactive file selection
 
 - Open multiple documents in tabs. Show the active document and modified state.
 - Switch and close tabs using the mouse and keyboard, preserving each document's
   content and its cursor/viewport state.
 - Provide an in-application file picker with directory navigation, file selection,
-  and a way to enter a path directly. Handle permission and missing-file errors.
-- Make ordinary files, large files, and stream documents distinguishable without
-  requiring users to learn unrelated navigation interfaces.
+  and a way to enter a file path directly. Directory navigation is only for
+  locating files; it does not open a folder as a workspace. Handle permission,
+  missing-file, and directory-as-file errors clearly.
+- Make ordinary files, large files, stream documents, and persistent scratch
+  documents distinguishable without requiring users to learn unrelated navigation
+  interfaces.
 
-A permanent project tree, fuzzy project search, and split panes are not implied by
-the file-picker requirement.
+Folder/workspace opening, a permanent project tree, fuzzy project search, and
+split panes are outside this iteration.
 
 ### FR-06 — Large-file viewing and editing
 
@@ -131,6 +174,9 @@ the file-picker requirement.
   count. Show indexing/progress state where an operation needs unexplored data.
 - Render only needed content and handle extremely long lines without allocating
   or laying out the entire line for every frame.
+- For exceptionally long lines, default to horizontal scrolling rather than soft
+  wrapping, initially using the 64 KiB line threshold from FR-04. Keep all text
+  accessible and editable; disabling wrapping must not truncate the document.
 - Keep UI input responsive while indexing, searching, replacing, and saving.
   Long operations need progress and cancellation where interruption is safe.
 - Search across storage boundaries and preserve correct selections and edits even
@@ -161,9 +207,13 @@ Disk-backed storage trades RAM demand for disk I/O, metadata, and temporary spac
   for truncation and log rotation.
 - Keep terminal control output out of redirected document output. Define
   noninteractive behavior before claiming compatibility as a `cat` replacement.
-- Define a way to take received content into editing. A stable editable snapshot
-  while a live tab continues following is proposed; editing the live source is not
-  yet an agreed requirement.
+- Keep piped content read-only while stdin is still active. Navigation, selection,
+  search, and follow/pause remain available; pausing follow does not enable edits.
+- Once stdin reaches EOF, make the received text available as an editable unnamed
+  document that can be saved to a chosen file. Changing this document does not
+  modify the producer's source files.
+- Concurrent ingestion and editing, and editable snapshots taken before EOF, are
+  outside this MVP. An indefinitely running producer remains a read-only stream.
 
 The intent is a lightweight stand-in for common `less`/`more`/`cat` workflows, not
 complete command-line or flag compatibility with those programs.
@@ -179,8 +229,9 @@ complete command-line or flag compatibility with those programs.
   and make document changes undoable.
 - Include large files in search and replacement without requiring a full in-memory
   copy. Bound result storage and make long searches cancellable.
-- Search retained stream history with an explicit scope; do not ambiguously apply
-  replacements to content that is still arriving.
+- Search retained stream history with an explicit scope. Disable replacement for
+  active streams; enable it for piped text after EOF, when the document becomes
+  editable. Multi-document replacement must identify and skip read-only streams.
 - Specify partial failures, cancellation, and per-document undo for multi-document
   replacement before implementation. Do not imply one atomic cross-file disk save.
 
@@ -198,10 +249,53 @@ not initial requirements.
 - Keep a recovery route for an unusable configuration or keymap.
 - Provide portable defaults and usable alternatives when terminal protocols cannot
   distinguish a requested shortcut. Do not depend on macOS Command-key delivery.
+- Use familiar non-modal defaults, including Ctrl+S for save, Ctrl+F for find, and
+  Ctrl+Z for undo. Offer Cmd equivalents where supported without depending on them
+  for essential commands or changing OS/terminal shortcut settings automatically.
+- Ctrl+C copies selected text. Escape cancels the current cancellable operation
+  or dismisses its UI; quitting uses a separate command and shortcut. Specify
+  behavior when nothing is selected and stream cancellation during detailed design.
+- While the editor owns the terminal, configure raw input and disable software
+  flow control so Ctrl+S saves instead of suspending terminal output. Restore the
+  previous settings on exit and suspend; reapply editor settings on resume.
+- Avoid known OS, terminal, and default tmux shortcut conflicts. Upstream shortcuts
+  may consume events before they reach the editor; document this limitation,
+  provide alternate bindings, and support user remapping rather than claiming
+  compatibility with every custom configuration.
 - Expose current commands and their effective bindings through discoverable UI.
 
 TOML configuration, a command palette, and an input recorder for diagnosing remote
 key delivery are current proposals.
+
+### FR-10 — Persistent scratch documents
+
+- Create and edit scratch documents without choosing a filename or save location.
+  Support multiple scratch documents in tabs with the usual editing and search
+  capabilities.
+- Automatically persist scratch contents in application-managed storage. Quitting
+  normally must preserve all current contents without requiring explicit saving,
+  naming the document, or answering a save prompt for each scratch document.
+- Schedule a checkpoint every **5 seconds while modified**, and finish persisting
+  current contents on normal exit. The interval is configurable. Keep checkpoint
+  work off the interactive UI path and avoid rewriting unchanged content.
+- After an application crash, restore the last successfully completed checkpoint.
+  Changes not included in that checkpoint may be lost. An interrupted checkpoint
+  must leave the previous complete checkpoint usable. This does not promise a
+  five-second maximum loss window when storage is slow or failing, or guarantee
+  survival of power loss or storage failure.
+- Restore retained scratch documents and their contents on the next launch,
+  including their tab order, active tab, and cursor/viewport positions.
+- Allow saving a scratch document as a named file and explicitly discarding one.
+  Quitting the application must not be treated as discarding scratch documents.
+- Report persistence failures and offer a way to preserve the content before exit;
+  do not silently quit after failing to retain it.
+- Keep persistence scoped to the user on the machine running the editor. In a
+  remote session, scratch storage lives on the remote machine; cross-machine
+  synchronization is not required.
+
+Persistence location, concurrent-instance behavior, undo-history restoration, and
+power-loss durability need detailed design. Normal-exit retention and restoration
+of the last complete checkpoint after an application crash are required.
 
 ## 4. Proposed architectural direction
 
@@ -214,8 +308,19 @@ commands. Background work should use document revisions so stale results cannot
 overwrite current state. Changes should be expressed as undoable transactions.
 
 Ratatui with Crossterm is the leading TUI candidate; Tree-sitter is the leading
-highlighting candidate. These are research recommendations, not approved dependency
-or version selections. Audit grammar coverage, compatibility, and licenses first.
+highlighting candidate, with alternatives such as Syntect still open. These are
+research recommendations, not approved dependency or version selections. Compare
+runtime/build weight, performance, maintenance, language coverage, compatibility,
+and licenses with the user before choosing. Record any agreed highlighting scope
+deferrals explicitly.
+
+Prefer reuse of ripgrep's Rust libraries where they fit editor search. Evaluate
+`grep-searcher`, `grep-matcher`, and `grep-regex` before writing a custom engine.
+Adapt search to the current document revision, including unsaved edits, scratch
+documents, and paged storage, rather than searching only the underlying saved file.
+Validate chunk-boundary matches, case handling, long-line memory use, cancellation,
+and match offsets used for replacement. Reusing these libraries does not require
+the external `rg` executable or add regex search to the user-facing MVP scope.
 
 Evaluate a paged, disk-backed piece tree for large-file editing: reference stable
 original ranges and append-only added text, caching only needed blocks. A piece
@@ -233,9 +338,31 @@ storage. Avoid assuming that an open file descriptor or memory map freezes data.
   frontmatter and mixed-language fences, to verify bundled language behavior.
 - Exercise Unicode placement/selection, newline preservation, undo, save failures,
   external changes, and replacement across chunk boundaries.
+- Verify binary-file rejection and directory-as-file errors without modifying the
+  source or disrupting existing documents.
+- Verify scratch contents survive quitting without saving and are restored on
+  relaunch. Cover multiple scratch tabs, save-as, explicit discard, and persistence
+  failures without silent content loss.
+- Verify application-crash recovery from the last complete scratch checkpoint,
+  including interruption during a subsequent checkpoint write.
+- Verify active pipes remain read-only and become editable after EOF, without
+  losing received text. Pausing follow must not enable editing or replacement.
 - Benchmark ordinary files, multi-gigabyte files, millions of short lines, very
   long lines, and sustained streams. Specify hardware and cache conditions when
   defining memory, CPU, first-display, and interaction latency targets.
+- The agreed initial large-file benchmark is viewing and occasional edits to a
+  **1 GiB text file on a machine with 8 GiB RAM**. This is a validation target, not
+  a hard file-size limit or permission to consume all available RAM. Record CPU,
+  storage, file shape, and warm/cold cache conditions with the measurements.
+- First-display latency measures launch/open until the first usable text appears;
+  input latency measures an available key/mouse event until its visible result.
+  The agreed initial goals are **first usable text within 1 second locally** and
+  **ordinary input response within 50 ms**, to validate on the benchmark baseline.
+  These are engineering goals, not measured results or universal guarantees.
+  Separate editor processing time from additional remote connection latency.
+  Application memory budgets and measurement details remain to be designed.
+- Verify whole-document highlighting fallback for the size, line-length, and
+  parsing-time heuristics while retaining editing and search functionality.
 - Verify local and remote terminal combinations for mouse, keys, paste, resizing,
   latency, detach/reattach, and reconnect behavior. Terminal compatibility needs
   integration/manual evidence beyond ordinary unit tests.
@@ -251,13 +378,15 @@ storage. Avoid assuming that an open file descriptor or memory map freezes data.
 | Area | Decision to resolve |
 | --- | --- |
 | Terminal matrix | Named terminal apps, minimum versions, tmux/connection versions, and supported nesting combinations |
-| Interaction | Default keymap, menus, mouse gestures, clipboard fallbacks, and small-screen behavior |
-| Text formats | Encoding baseline, invalid UTF-8/binary handling, newline policy, and INI/Markdown dialects |
+| Interaction | Remaining default bindings, Ctrl+C without selection, menus, mouse gestures, clipboard fallbacks, and small-screen behavior |
+| Text formats | Encoding baseline, invalid UTF-8 handling, binary detection/rejection, newline policy, and INI/Markdown dialects |
+| Highlighting | User-agreed engine/dependencies, bundled or external prerequisites, and any language/embedded-syntax deferrals |
 | Storage | Unified or separate backends; stable snapshots; indexing and undo resource budgets |
 | Saving | Atomic replacement policy, metadata/links, cancellation, disk exhaustion, and external-change conflicts |
-| Live content | Direct file-follow semantics, log rotation, retention quotas, and editable snapshots |
-| Search | Whole-word semantics, Unicode case behavior, multi-document replacement and cancellation |
-| Performance | Benchmark corpus, reference hardware, numeric targets, and highlighting budgets |
+| Scratch persistence | Storage location, concurrent instances, undo restoration, power-loss durability, and whether named-file unsaved edits also persist |
+| Live content | Direct file-follow semantics, log rotation, retention quotas, and producer-error handling |
+| Search | ripgrep library integration, whole-word semantics, Unicode case behavior, multi-document replacement and cancellation |
+| Performance | Benchmark corpus and CPU/storage details for the agreed 1 GiB / 8 GiB RAM baseline; measurement methods, memory budgets, and validation of agreed latency/highlighting defaults |
 | Dependencies | Libraries, grammar versions, compiler/toolchain baseline, and configuration locations |
 
 ## 7. Deferred and optional capabilities
@@ -266,19 +395,152 @@ storage. Avoid assuming that an open file descriptor or memory map freezes data.
   protocol is a candidate once commands and document edits are stable. A plugin
   runtime is not needed to make bundled language definitions extensible.
 - Rendered Markdown preview, LSP/code intelligence, split panes, project-wide
-  indexing, regex search, and packaging/distribution are outside the initial
-  required scope unless later explicitly added.
+  indexing, folder/workspace opening, binary viewing/editing, regex search, and
+  packaging/distribution are outside the initial required scope unless later
+  explicitly added.
+- Editing while a pipe is active and creating editable stream snapshots before
+  EOF are deferred. Piped text becomes editable after EOF (FR-07).
 
-## 8. Approval and next planning step
+## 8. Approval and stage breakdown
 
-No overview approval has been recorded. No stage breakdown or stage files are
-defined in this draft.
+On 2026-10-30, the user accepted the initial highlighting heuristics, five-second
+scratch checkpoints, and responsiveness goals. The user subsequently approved
+proceeding from the overview to the stage breakdown. The MVP scope is approved;
+the architectural proposals and unresolved decisions remain open as identified
+above. Implementation is not authorized.
 
-After explicit user approval of the overview, add a stage breakdown here that
-states the observable outcome at the end of each stage. Then elaborate stages in
-`NN_stage_name.md` files, with enough detail for a human to implement them without
-chat context. Discuss implementation authorization separately. Update this
-overview as agreed requirements change rather than treating approval as a freeze.
+The breakdown below is proposed for review. Filenames identify future documents;
+no numbered stage files exist yet. Write their detailed designs progressively
+after reviewing the breakdown. Each detailed design must resolve its prerequisite
+decisions and define behavior, interfaces, failure cases, and acceptance criteria
+before its implementation is authorized. The stages may be adjusted as we learn.
+
+Dependencies below are minimum functional dependencies. The proposed delivery
+order is 01 through 10, with completed stages integrated into `feat/initial_mvp`
+through stage PRs. Tests and failure handling belong in every stage; stage 10 is
+the final integrated validation, not the first time correctness is checked.
+
+### 01 — Terminal foundation
+
+Planned file: `01_terminal_foundation.md`. Depends on: none.
+
+- Deliver a buildable Rust application shell with input, resize handling, focus,
+  named command routing, and a place to report background work and errors.
+- Complete when it starts/exits safely, restores terminal settings, receives mouse
+  events, and handles Ctrl+S without freezing output. Select the TUI/toolchain and
+  initial terminal test matrix here. Activate Rust CI and native macOS checks.
+- Establish command and layout/hit-testing contracts so later UI controls share
+  keyboard/mouse behavior. Basic remote and tmux checks begin here. Covers FR-01
+  and the foundation of FR-03/FR-09.
+
+### 02 — Document storage and file integrity
+
+Planned file: `02_document_storage.md`. Depends on: 01.
+
+- Select the storage model and define document revisions, range access, edits,
+  undo/redo, stable source content, and resource budgets before UI features depend
+  on them. Resolve encoding, newline, binary detection, and safe-save policies.
+- Complete when document-level checks can open/read/edit/save text, undo changes,
+  reject binaries/directories, and preserve work through I/O failures and external
+  changes. Demonstrate correct paging with a test file larger than its cache budget.
+- Validate storage feasibility against the 1 GiB baseline early. This stage must
+  support the larger-than-RAM design rather than leave a replacement engine for
+  later. Covers FR-02 and the storage foundation of FR-06.
+
+### 03 — Interactive editing and mouse selection
+
+Planned file: `03_editing_and_mouse.md`. Depends on: 01–02.
+
+- Deliver single-document editing: cursor movement, insertion/deletion, selection,
+  cut/copy/paste, undo/redo, save/save-as, and unsaved-change protection.
+- Complete when keyboard and mouse actions agree on Unicode/tab placement;
+  dragging selects across lines and autoscrolls; scrolling, resizing, and long-line
+  horizontal navigation preserve selection and document content.
+- Resolve mouse gestures and clipboard fallbacks here. Verify responsive viewport
+  rendering over paged storage. Covers FR-02/FR-03 and interactive FR-06 behavior.
+
+### 04 — Tabs and file selection
+
+Planned file: `04_tabs_and_file_picker.md`. Depends on: 03.
+
+- Deliver multiple document tabs and a keyboard/mouse file picker with directory
+  navigation solely for selecting files, plus direct path entry.
+- Complete when users can open/switch/close files without losing per-tab state;
+  modified tabs are protected and file-access errors leave other tabs usable.
+  Tab and dialog controls must work with both keyboard and mouse. Covers FR-05.
+
+### 05 — Persistent scratch documents and recovery
+
+Planned file: `05_scratch_recovery.md`. Depends on: 02–04.
+
+- Deliver unnamed scratch tabs, five-second checkpoints while modified, restoration
+  on launch, save-as, and explicit discard. Resolve storage location and concurrent
+  editor ownership so instances cannot overwrite each other's recovery data.
+- Complete when quitting/relaunching retains current contents and tab state, and
+  forced termination restores the last complete checkpoint even when the next
+  write was interrupted. Persistence failures must be visible. Covers FR-10.
+
+### 06 — Search and replacement
+
+Planned file: `06_search_and_replace.md`. Depends on: 02–05.
+
+- Deliver literal search, case sensitivity, next/previous, replace-next/all, and
+  current/all-open-document scopes, including unsaved and scratch contents.
+- Complete when matches and undoable replacements are correct across storage
+  boundaries, long operations can be cancelled, and results stay within resource
+  budgets. Resolve whole-word scope, case semantics, and partial replacement rules.
+- Evaluate ripgrep libraries against document revisions and paged storage. Define
+  read-only document handling for stream integration in stage 08. Covers FR-08.
+
+### 07 — Syntax highlighting
+
+Planned file: `07_syntax_highlighting.md`. Depends on: 02–04.
+
+- Select an established highlighting library with the user. Deliver language
+  detection/override, themes, and the agreed language set, including Markdown
+  frontmatter/fences and embedded syntax. Record any user-approved deferrals.
+- Complete when representative fixtures highlight correctly, new language support
+  does not require UI changes, and all three agreed heuristics trigger an explained
+  whole-document plain-text fallback without disabling edits/search. Covers FR-04.
+
+### 08 — Pipes, pager behavior, and live following
+
+Planned file: `08_pipes_and_follow.md`. Depends on: 02–07.
+
+- Deliver incremental stdin display, bounded ingestion/spooling, follow/pause,
+  retained-history search, and direct file following. Resolve storage exhaustion,
+  producer errors, controlling-terminal access, truncation, and rotation behavior.
+- Complete when active input remains read-only, EOF makes piped content editable,
+  and partial lines/characters are handled correctly. Verify input/UI separation,
+  replacement restrictions, quitting with an active producer, and redirected-output
+  behavior. Covers FR-07 and stream integration with FR-08.
+
+### 09 — Configuration and keybinding UI
+
+Planned file: `09_configuration_and_keybindings.md`. Depends on: 01–08.
+
+- Deliver configuration loading/persistence and a keyboard/mouse UI for remapping
+  all commands. Expose effective bindings and make the agreed highlighting and
+  checkpoint defaults configurable.
+- Complete when UI/config changes agree, context conflicts and malformed settings
+  are explained, and a broken keymap has a recovery route. Finalize remaining
+  default shortcuts and terminal alternatives without altering upstream settings.
+  Covers FR-09 and configuration of FR-04/FR-10.
+
+### 10 — Integrated MVP validation
+
+Planned file: `10_mvp_validation.md`. Depends on: 01–09.
+
+- Validate the complete workflow on macOS/Linux and the agreed local, SSH, tmux,
+  Eternal Terminal, and mosh combinations. Include reconnect/resize behavior,
+  clipboard fallbacks, checkpoint interruptions, and file/storage failures.
+- Complete when all required FR-01–FR-10 outcomes have evidence; the 1 GiB/8 GiB
+  baseline, long-line/stream workloads, and a larger-than-RAM file have been
+  exercised; and measured latency/memory results are recorded. Resolve missed
+  goals through fixes or explicit user-approved requirement changes.
+- Supply concise build/use/configuration guidance and supported-terminal details.
+  Finish at package version `0.0.1`, with development prereleases used beforehand.
+  Distribution and deployment remain outside scope.
 
 ## 9. Research references
 
@@ -291,3 +553,7 @@ These explain candidate technologies; they do not constitute implementation choi
 - [VS Code piece-tree design](https://code.visualstudio.com/blogs/2018/03/23/text-buffer-reimplementation)
 - [tmux clipboard integration](https://github.com/tmux/tmux/wiki/Clipboard)
 - [Mosh capabilities](https://mosh.org/)
+- [ripgrep searcher library](https://docs.rs/grep-searcher/latest/grep_searcher/)
+- [ripgrep regex matcher library](https://docs.rs/grep-regex/latest/grep_regex/)
+- [Cargo package version](https://doc.rust-lang.org/cargo/reference/manifest.html#the-version-field)
+- [Semantic Versioning prerelease identifiers](https://semver.org/#spec-item-9)
