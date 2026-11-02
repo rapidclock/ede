@@ -102,7 +102,7 @@ scheduling and `status.rs` owns the bounded background mailbox.
 
 | Module | Responsibility |
 | --- | --- |
-| `main.rs` | CLI, process exit status, outer error/panic boundary |
+| `bin/ede.rs` | CLI, process exit status, outer error/panic boundary |
 | `lib.rs` | Testable application entry points; no terminal side effects on import |
 | `terminal.rs` | Terminal acquisition, lifecycle, restoration, signal flags |
 | `input.rs` | Crossterm-to-application event normalization and contextual binding lookup |

@@ -57,7 +57,7 @@ broken connections can prevent cleanup. Scratch recovery is a later stage.
 
 | Module | Responsibility |
 | --- | --- |
-| `main` / `lib` | CLI, entry point, deferred error/panic reporting |
+| `src/bin/ede.rs` / `lib` | CLI, entry point, deferred error/panic reporting |
 | `terminal` | Acquired modes, restoration, signal flags, job control |
 | `runtime` | One event reader, frame scheduling, side effects |
 | `input` / `command` | Event normalization and shared command identities/bindings |
