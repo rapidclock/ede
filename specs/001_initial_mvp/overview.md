@@ -1,6 +1,6 @@
 # 001 — Initial MVP overview
 
-Status: **MVP scope approved — stage breakdown proposed for review.**
+Status: **MVP scope and stage roadmap accepted — stage 01 complete; PR open for review.**
 
 Project: **ede**, a predominantly Rust terminal text editor for macOS and Linux.
 
@@ -366,9 +366,9 @@ storage. Avoid assuming that an open file descriptor or memory map freezes data.
 - Verify local and remote terminal combinations for mouse, keys, paste, resizing,
   latency, detach/reattach, and reconnect behavior. Terminal compatibility needs
   integration/manual evidence beyond ordinary unit tests.
-- Establish native Linux and macOS checks as implementation begins. The initial
-  simple GitHub Actions workflow runs formatting, Clippy, and tests on Linux once
-  a root Cargo manifest exists; it explicitly reports a skip before then.
+- Native Linux and macOS GitHub Actions jobs run formatting, Clippy, and tests
+  using the pinned toolchain and locked dependencies. Stage 01 removes the
+  specification-only manifest guard.
 - Choose meaningful unit, functional, and system tests during stage design. An
   arrangement where the agent writes tests and the user implements the editor is
   a possible future collaboration model, not an assumption.
@@ -407,13 +407,15 @@ On 2026-10-30, the user accepted the initial highlighting heuristics, five-secon
 scratch checkpoints, and responsiveness goals. The user subsequently approved
 proceeding from the overview to the stage breakdown. The MVP scope is approved;
 the architectural proposals and unresolved decisions remain open as identified
-above. Implementation is not authorized.
+above. On 2026-11-01, the user approved the detailed Stage 01 design and explicitly
+authorized its implementation. Later stages are not authorized for implementation.
 
-The breakdown below is proposed for review. Filenames identify future documents;
-no numbered stage files exist yet. Write their detailed designs progressively
-after reviewing the breakdown. Each detailed design must resolve its prerequisite
-decisions and define behavior, interfaces, failure cases, and acceptance criteria
-before its implementation is authorized. The stages may be adjusted as we learn.
+The user accepted proceeding one stage at a time: detailed design, review,
+separately authorized implementation, validation, and stage PR before moving on.
+Stage 01 is implemented; the later filenames identify future documents.
+Each detailed design must resolve its prerequisite decisions and define behavior,
+interfaces, failure cases, and acceptance criteria before its implementation is
+authorized. The stages may be adjusted as we learn.
 
 Dependencies below are minimum functional dependencies. The proposed delivery
 order is 01 through 10, with completed stages integrated into `feat/initial_mvp`
@@ -422,7 +424,9 @@ the final integrated validation, not the first time correctness is checked.
 
 ### 01 — Terminal foundation
 
-Planned file: `01_terminal_foundation.md`. Depends on: none.
+Design: [01_terminal_foundation.md](01_terminal_foundation.md). Depends on: none.
+Status: complete; [PR #1](https://github.com/rapidclock/ede/pull/1) targets `feat/initial_mvp`.
+Evidence: [Stage 01 validation record](01_validation.md).
 
 - Deliver a buildable Rust application shell with input, resize handling, focus,
   named command routing, and a place to report background work and errors.
