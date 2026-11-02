@@ -33,6 +33,9 @@
 
 ### Rust
 
+- Design structured, modular, idiomatic Rust with clear ownership and small,
+  cohesive interfaces. Use *Rust for Rustaceans* as a design guide. Favor readable
+  code over convoluted abstractions or unnecessary verbosity.
 - Always format code with `cargo fmt`.
 - Run `cargo clippy` and fix all warnings. Allow only narrowly scoped exceptions
   accompanied by a written reason.

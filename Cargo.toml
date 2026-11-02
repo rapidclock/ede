@@ -1,0 +1,21 @@
+[package]
+name = "ede"
+version = "0.0.1-dev.1"
+edition = "2024"
+rust-version = "1.99.1"
+description = "A terminal text editor for macOS and Linux"
+publish = false
+
+[dependencies]
+crossterm = { version = "0.29.0", default-features = false, features = ["events", "bracketed-paste"] }
+nix = { version = "0.31.3", default-features = false, features = ["term", "process"] }
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm"] }
+signal-hook = { version = "0.4.5", default-features = false }
+
+[dev-dependencies]
+nix = { version = "0.31.3", default-features = false, features = ["signal", "fs"] }
+vt100 = "0.18.1"
+
+[lints.rust]
+missing_docs = "warn"
+

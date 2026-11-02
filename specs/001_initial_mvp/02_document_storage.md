@@ -2,13 +2,12 @@
 
 Status: **Design draft — awaiting review; implementation is not authorized.**
 
-Parent: [MVP overview](overview.md). Depends on Stage 01, currently delivered in
-[PR #1](https://github.com/rapidclock/ede/pull/1) and under user review.
+Parent: [MVP overview](overview.md). Depends on Stage 01, squash-merged into
+`feat/initial_mvp` through [PR #1](https://github.com/rapidclock/ede/pull/1).
 Branch: `stage/document_storage`. PR target: `feat/initial_mvp`.
-Merge the accepted Stage 01 changes into the project branch and update this branch
-before implementation; do not merge its unreviewed implementation here merely to
-write this design. This document proposes decisions rather than declaring them
-approved. Later stage designs and application code are outside this task.
+This branch includes the accepted Stage 01 baseline. This document proposes
+decisions rather than declaring them approved. Stage 02 implementation and later
+stage designs are outside the currently authorized scope.
 
 ## Outcome and boundary
 

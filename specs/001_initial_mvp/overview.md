@@ -1,6 +1,6 @@
 # 001 — Initial MVP overview
 
-Status: **MVP scope and roadmap accepted — Stage 01 under review; Stage 02 design draft.**
+Status: **MVP scope and roadmap accepted — Stage 01 merged; Stage 02 design draft.**
 
 Project: **ede**, a predominantly Rust terminal text editor for macOS and Linux.
 
@@ -307,8 +307,8 @@ and background services. Route keyboard and mouse actions through the same named
 commands. Background work should use document revisions so stale results cannot
 overwrite current state. Changes should be expressed as undoable transactions.
 
-Stage 01 selects Ratatui with Crossterm; its implementation and dependency
-versions are in the stage PR under review. Tree-sitter remains the leading
+Stage 01 selects Ratatui with Crossterm; its implementation is merged and dependency
+versions are recorded in the stage design. Tree-sitter remains the leading
 highlighting candidate, with alternatives such as Syntect still open. Highlighting
 dependencies are research recommendations, not approved selections. Compare
 runtime/build weight, performance, maintenance, language coverage, compatibility,
@@ -367,9 +367,9 @@ storage. Avoid assuming that an open file descriptor or memory map freezes data.
 - Verify local and remote terminal combinations for mouse, keys, paste, resizing,
   latency, detach/reattach, and reconnect behavior. Terminal compatibility needs
   integration/manual evidence beyond ordinary unit tests.
-- Establish native Linux and macOS checks as implementation begins. The initial
-  simple GitHub Actions workflow runs formatting, Clippy, and tests on Linux once
-  a root Cargo manifest exists; it explicitly reports a skip before then.
+- Native Linux and macOS GitHub Actions jobs run formatting, Clippy, and tests
+  using the pinned toolchain and locked dependencies. Stage 01 removes the
+  specification-only manifest guard.
 - Choose meaningful unit, functional, and system tests during stage design. An
   arrangement where the agent writes tests and the user implements the editor is
   a possible future collaboration model, not an assumption.
@@ -408,10 +408,10 @@ On 2026-10-30, the user accepted the initial highlighting heuristics, five-secon
 scratch checkpoints, and responsiveness goals. The user subsequently approved
 proceeding from the overview to the stage breakdown. The MVP scope is approved;
 the architectural proposals and unresolved decisions remain open as identified
-above. Stage 01 was approved and implemented on its own branch, with
-[PR #1](https://github.com/rapidclock/ede/pull/1) under user review. On 2026-11-01,
-the user authorized writing the Stage 02 design while reviewing Stage 01.
-Stage 02 implementation is not authorized.
+above. On 2026-11-01, the user approved the detailed Stage 01 design and explicitly
+authorized its implementation. Stage 01 is now squash-merged into `feat/initial_mvp`
+through [PR #1](https://github.com/rapidclock/ede/pull/1). The user authorized the
+Stage 02 design while reviewing Stage 01; Stage 02 implementation is not authorized.
 
 The user accepted proceeding one stage at a time: detailed design, review,
 separately authorized implementation, validation, and stage PR before moving on.
@@ -427,9 +427,9 @@ the final integrated validation, not the first time correctness is checked.
 
 ### 01 — Terminal foundation
 
-File: `01_terminal_foundation.md` (delivered in [PR #1](https://github.com/rapidclock/ede/pull/1)). Depends on: none.
-Status: implementation delivered; user review pending. Its files enter this
-specification branch after the accepted changes are integrated into the project.
+Design: [01_terminal_foundation.md](01_terminal_foundation.md). Depends on: none.
+Status: complete; [PR #1](https://github.com/rapidclock/ede/pull/1) merged into `feat/initial_mvp`.
+Evidence: [Stage 01 validation record](01_validation.md).
 
 - Deliver a buildable Rust application shell with input, resize handling, focus,
   named command routing, and a place to report background work and errors.
