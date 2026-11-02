@@ -60,6 +60,7 @@ struct Target {
 pub(crate) struct LayoutSnapshot {
     pub area: Rect,
     pub generation: u64,
+    pub help_open: bool,
     pub overlay: Option<Rect>,
     targets: Vec<Target>,
 }
@@ -70,6 +71,7 @@ impl LayoutSnapshot {
         let mut layout = Self {
             area,
             generation,
+            help_open: help,
             overlay: None,
             targets: Vec::new(),
         };

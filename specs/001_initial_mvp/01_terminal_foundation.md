@@ -1,6 +1,6 @@
 # 01 — Terminal foundation
 
-Status: **Approved and implemented — final CI/review handoff in progress.**
+Status: **Complete — ready for review in [PR #1](https://github.com/rapidclock/ede/pull/1).**
 
 The user approved this design and explicitly authorized Stage 01 implementation
 on 2026-11-01. Readability, cohesive modules, and idiomatic Rust are required; use

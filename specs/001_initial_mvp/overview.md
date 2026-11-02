@@ -1,6 +1,6 @@
 # 001 — Initial MVP overview
 
-Status: **MVP scope and stage roadmap accepted — stage 01 implemented; CI/review handoff in progress.**
+Status: **MVP scope and stage roadmap accepted — stage 01 complete; PR open for review.**
 
 Project: **ede**, a predominantly Rust terminal text editor for macOS and Linux.
 
@@ -425,7 +425,7 @@ the final integrated validation, not the first time correctness is checked.
 ### 01 — Terminal foundation
 
 Design: [01_terminal_foundation.md](01_terminal_foundation.md). Depends on: none.
-Status: approved and implemented; final CI/review handoff in progress.
+Status: complete; [PR #1](https://github.com/rapidclock/ede/pull/1) targets `feat/initial_mvp`.
 Evidence: [Stage 01 validation record](01_validation.md).
 
 - Deliver a buildable Rust application shell with input, resize handling, focus,

@@ -7,8 +7,10 @@ Specification: [Terminal foundation](01_terminal_foundation.md).
 
 The implementation has 23 automated tests: 15 library tests, 3 CLI process tests,
 and 5 executable pseudo-terminal tests. Formatting and Clippy pass locally with
-the pinned toolchain. Native CI uses the same commands on Linux and macOS; its
-results must be checked on the stage PR before declaring the stage complete.
+the pinned toolchain. Native CI passed the same commands on Linux and macOS:
+[initial implementation CI](https://github.com/rapidclock/ede/actions/runs/41369091471).
+The [stage PR](https://github.com/rapidclock/ede/pull/1) provides the checks for the
+latest revision; it targets `feat/initial_mvp` and remains open for review.
 
 | Acceptance | Evidence |
 | --- | --- |
@@ -65,6 +67,8 @@ capture are checked as emitted control sequences, without a human visual check.
 - Ratatui 0.30.2's `Terminal::clear()` requests the cursor position. Re-entry uses
   fullscreen `resize()` to invalidate/redraw without that round trip. The PTY
   suite does not answer cursor queries and rejects emitted query sequences.
+  A manually resized fixed viewport keeps Ratatui from independently changing
+  frame geometry between application layout, rendering, and hit-testing.
 - Signal handlers set flags only. Main-loop checks happen between individual
   events, with at most a 20 ms idle poll and at most 64 background messages per
   iteration. Routine redraws are limited to about 60 Hz; fresh pointer geometry

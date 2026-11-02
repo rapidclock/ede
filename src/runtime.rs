@@ -157,7 +157,7 @@ fn event_loop(host: &mut impl Host, inbox: StatusInbox) -> io::Result<Exit> {
             };
             app.notify(message);
         }
-        if layout.area != area || layout.overlay.is_some() != app.help {
+        if layout.area != area || layout.help_open != app.help {
             layout = LayoutSnapshot::new(area, app.help, layout.generation.wrapping_add(1));
         }
         app.sync_layout(&layout);
@@ -347,6 +347,14 @@ mod tests {
         let (_, inbox) = status::mailbox();
         assert_eq!(event_loop(&mut host, inbox).unwrap().code, 0);
         assert_eq!(host.frames.last().unwrap().2, Rect::new(0, 0, 40, 8));
+        assert!(host.frames.len() <= 3);
+        // An open but hidden help overlay at tiny sizes must not regenerate layout on every event.
+        let mut events = vec![Input::Command(Command::Help), Input::Resize(20, 4)];
+        events.extend(vec![motion; 500]);
+        events.push(Input::Command(Command::Quit));
+        let mut host = Fake::new(events);
+        let (_, inbox) = status::mailbox();
+        assert_eq!(event_loop(&mut host, inbox).unwrap().code, 0);
         assert!(host.frames.len() <= 3);
         let mut host = Fake::new(vec![motion; 10_000]);
         let (_, inbox) = status::mailbox();
