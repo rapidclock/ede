@@ -1,6 +1,6 @@
 # 001 — Initial MVP overview
 
-Status: **MVP scope approved — stage breakdown proposed for review.**
+Status: **MVP scope and roadmap accepted — Stage 01 under review; Stage 02 design draft.**
 
 Project: **ede**, a predominantly Rust terminal text editor for macOS and Linux.
 
@@ -307,9 +307,10 @@ and background services. Route keyboard and mouse actions through the same named
 commands. Background work should use document revisions so stale results cannot
 overwrite current state. Changes should be expressed as undoable transactions.
 
-Ratatui with Crossterm is the leading TUI candidate; Tree-sitter is the leading
-highlighting candidate, with alternatives such as Syntect still open. These are
-research recommendations, not approved dependency or version selections. Compare
+Stage 01 selects Ratatui with Crossterm; its implementation and dependency
+versions are in the stage PR under review. Tree-sitter remains the leading
+highlighting candidate, with alternatives such as Syntect still open. Highlighting
+dependencies are research recommendations, not approved selections. Compare
 runtime/build weight, performance, maintenance, language coverage, compatibility,
 and licenses with the user before choosing. Record any agreed highlighting scope
 deferrals explicitly.
@@ -407,13 +408,17 @@ On 2026-10-30, the user accepted the initial highlighting heuristics, five-secon
 scratch checkpoints, and responsiveness goals. The user subsequently approved
 proceeding from the overview to the stage breakdown. The MVP scope is approved;
 the architectural proposals and unresolved decisions remain open as identified
-above. Implementation is not authorized.
+above. Stage 01 was approved and implemented on its own branch, with
+[PR #1](https://github.com/rapidclock/ede/pull/1) under user review. On 2026-11-01,
+the user authorized writing the Stage 02 design while reviewing Stage 01.
+Stage 02 implementation is not authorized.
 
-The breakdown below is proposed for review. Filenames identify future documents;
-no numbered stage files exist yet. Write their detailed designs progressively
-after reviewing the breakdown. Each detailed design must resolve its prerequisite
-decisions and define behavior, interfaces, failure cases, and acceptance criteria
-before its implementation is authorized. The stages may be adjusted as we learn.
+The user accepted proceeding one stage at a time: detailed design, review,
+separately authorized implementation, validation, and stage PR before moving on.
+Stage 02 is now a design draft; later filenames identify future documents. Each
+detailed design must resolve its prerequisite decisions and define behavior,
+interfaces, failure cases, and acceptance criteria before its implementation is
+authorized. The stages may be adjusted as we learn.
 
 Dependencies below are minimum functional dependencies. The proposed delivery
 order is 01 through 10, with completed stages integrated into `feat/initial_mvp`
@@ -422,7 +427,9 @@ the final integrated validation, not the first time correctness is checked.
 
 ### 01 — Terminal foundation
 
-Planned file: `01_terminal_foundation.md`. Depends on: none.
+File: `01_terminal_foundation.md` (delivered in [PR #1](https://github.com/rapidclock/ede/pull/1)). Depends on: none.
+Status: implementation delivered; user review pending. Its files enter this
+specification branch after the accepted changes are integrated into the project.
 
 - Deliver a buildable Rust application shell with input, resize handling, focus,
   named command routing, and a place to report background work and errors.
@@ -435,7 +442,15 @@ Planned file: `01_terminal_foundation.md`. Depends on: none.
 
 ### 02 — Document storage and file integrity
 
-Planned file: `02_document_storage.md`. Depends on: 01.
+Design: [02_document_storage.md](02_document_storage.md). Depends on: 01.
+Status: draft for review; implementation not authorized.
+
+The draft recommends one paged piece tree with private stable source snapshots,
+UTF-8 text with preserved BOM/newlines, bounded caches/history, and guarded atomic
+saves. These are proposals, including loading time before editing, resource
+budgets, permission/link policies, and external-writer limitations; they are not
+approved by inclusion here. It delivers a testable storage core; interactive
+editing remains Stage 03.
 
 - Select the storage model and define document revisions, range access, edits,
   undo/redo, stable source content, and resource budgets before UI features depend
