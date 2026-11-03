@@ -95,7 +95,9 @@ cargo run --release --locked --example storage_bench -- ordinary 1024 copy
 
 Corpus choices are `ordinary`, `dense`, and `long`; size is MiB. `clone` attempts a
 filesystem clone with a copy fallback; output reports whether cloning was used.
-Fixtures live in an isolated temporary directory and are removed afterwards.
+An optional fourth argument, up to `1000`, measures repeated edits with default
+undo history (for example `ordinary 1024 copy 1000`). Fixtures live in an isolated
+temporary directory and are removed afterwards.
 Results identify warm generated-file conditions; they do not claim cold-cache or
 end-to-end UI latency. See the [Stage 02 validation record](specs/001_initial_mvp/02_document_storage.md#validation-record).
 

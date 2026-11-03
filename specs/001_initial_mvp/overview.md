@@ -1,6 +1,6 @@
 # 001 — Initial MVP overview
 
-Status: **MVP scope and roadmap accepted — Stage 01 merged; Stage 02 implementation in progress.**
+Status: **MVP scope and roadmap accepted — Stage 01 merged; Stage 02 complete.**
 
 Project: **ede**, a predominantly Rust terminal text editor for macOS and Linux.
 
@@ -416,7 +416,7 @@ implementation on 2026-11-02.
 
 The user accepted proceeding one stage at a time: detailed design, review,
 separately authorized implementation, validation, and stage PR before moving on.
-Stage 02 implementation is now in progress; later filenames identify future documents. Each
+Stage 02 is complete as of 2026-11-03; later filenames identify future documents. Each
 detailed design must resolve its prerequisite decisions and define behavior,
 interfaces, failure cases, and acceptance criteria before its implementation is
 authorized. The stages may be adjusted as we learn.
@@ -447,7 +447,8 @@ Evidence: [Stage 01 validation record](01_terminal_foundation.md#validation-reco
 ### 02 — Document storage and file integrity
 
 Design: [02_document_storage.md](02_document_storage.md). Depends on: 01.
-Status: implementation authorized on 2026-11-02; validation in progress.
+Status: complete; [PR #2](https://github.com/rapidclock/ede/pull/2) ready for review.
+Implementation was authorized on 2026-11-02 and completed on 2026-11-03.
 Evidence: [Stage 02 validation record](02_document_storage.md#validation-record).
 
 The implementation uses one paged piece tree with private stable source snapshots,

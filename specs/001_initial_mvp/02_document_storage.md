@@ -1,6 +1,6 @@
 # 02 — Document storage and file integrity
 
-Status: **Implementation authorized on 2026-11-02; validation in progress.**
+Status: **Complete — ready for review in [PR #2](https://github.com/rapidclock/ede/pull/2).**
 
 Parent: [MVP overview](overview.md). Depends on Stage 01, squash-merged into
 `feat/initial_mvp` through [PR #1](https://github.com/rapidclock/ede/pull/1).
@@ -47,9 +47,9 @@ with a larger-than-RAM engine. This is our design choice, not a claim that an
 existing piece-tree implementation automatically supplies paging or safe saves.
 
 Use standard-library file APIs, including Unix positional reads, where possible.
-Proposed additions are `tempfile` for working/save files and `memchr` for scanning
-newlines/NUL bytes. Existing Unix dependencies may support capability probes.
-Recheck versions/features/maintenance before implementation and record selections;
+Selected additions are `tempfile` 3.27.0 for working/save files and `memchr` 2.8.3
+for scanning newlines/NUL bytes. Existing Unix dependencies may support capability probes.
+Versions/features/maintenance were checked before implementation;
 do not add a database, async runtime, Ropey, highlighting, or search engine merely
 for this stage. Keep any platform-specific snapshot/metadata calls in one adapter.
 
@@ -117,8 +117,8 @@ successful editable open. There is no permanent size-based read-only mode.
 
 Copy-on-write cloning is an optimization; its absence is not a platform failure.
 The fallback can make the interval between preview and editing several seconds
-for a large file. Report separate preview/ready times and disk cost. This tradeoff
-requires user approval; do not hide the wait or claim immediate large-file editing.
+for a large file. Report separate preview/ready times and disk cost. This tradeoff is part of the authorized implementation baseline. Do not hide the
+wait or claim immediate large-file editing.
 
 A file descriptor does not freeze another process's in-place writes. Once Ready,
 only private immutable bytes back document roots, so later replacement, deletion,
@@ -137,7 +137,8 @@ instance directories, never a blanket deletion of other instances' data.
 
 Keep terminal input, UI geometry, and filesystem access out of the document model's
 semantic types. Use concrete Rust types and cohesive modules rather than a generic
-storage framework. Proposed files under `src/document/`:
+storage framework. Core responsibilities under `src/document/` (additional cohesive modules are
+listed in the validation record):
 
 | Module | Ownership |
 | --- | --- |
@@ -254,7 +255,7 @@ return a recoverable resource error rather than exceed a bound or make an edit
 silently non-undoable. If retaining even the newest undo transaction exceeds its
 budget, reject the edit before publication rather than immediately pruning it.
 Consequently, a single very large deletion/replacement can require a higher undo
-budget; this is a proposed resource policy to approve, not a read-only file cutoff.
+budget; this is a resource policy, not a read-only file cutoff.
 Charge retained ranges conservatively at page granularity if exact range accounting
 would be more expensive. Moving the save point must not newly charge data that
 was previously unaccounted for and unexpectedly destroy undo history.
@@ -294,11 +295,11 @@ or power-loss guarantees.
 | New Save As path | Must not exist; publication must fail if another process creates it first |
 | Existing ordinary single-link file | Require the expected baseline; preserve ordinary mode bits, owner, and group or fail |
 | Symlink-opened document | Save the previously resolved target, preserving the symlink; recheck resolution and target identity; retargeting is a conflict |
-| File with multiple hard links | Same-path replacement requires a policy the user has not approved; initially return SaveAsRequired rather than silently break aliases or overwrite them in place |
+| File with multiple hard links | Initially return SaveAsRequired rather than silently break aliases or overwrite them in place |
 | ACLs, extended attributes, special permission bits, filesystem flags | Detect them; preserve through a tested platform adapter or return SaveAsRequired before replacement. Silent metadata removal is forbidden |
 | Unwritable target / unsupported metadata preservation | Retain edits and explain failure; the UI can offer another Save As path later |
 
-Proposed new-file permissions are 0600; changing that default is a review decision.
+New-file permissions are 0600; changing that default is a review decision.
 Private working and pre-publication staging files must be private regardless.
 Creating an absent path and replacing an expected existing file are distinct API
 operations. Existing-target Save As needs an explicit expected baseline/overwrite
@@ -340,8 +341,8 @@ Atomic replacement is not a portable compare-and-swap of file contents. There is
 a residual race between the final conflict check and rename against uncooperative
 writers. The proposed policy detects observed changes and never intentionally
 overwrites a known conflict; it does **not** promise race-free concurrent saves
-across arbitrary applications. Approve this limitation or require a different
-coordination model before implementing persistence. Reload/recovery/conflict UI
+across arbitrary applications. This limitation is part of the authorized persistence baseline; stronger
+coordination would require a design change. Reload/recovery/conflict UI
 belongs to later interaction stages; the core already returns precise outcomes.
 
 ## Implementation sequence
@@ -431,15 +432,107 @@ defaults. Material changes to requirements still need review.
 
 ## Validation record
 
-Implementation and validation are in progress. Local macOS fmt, Clippy and the
-current automated suite pass. Linux/macOS CI and memory-constrained benchmarks
-will be recorded here before stage completion is claimed.
+Implementation was authorized on 2026-11-02. Validation spans 2026-11-02/03.
+Package: `0.0.1-dev.2`, pinned Rust 1.99.1. Local formatting, Clippy with warnings
+as errors, and all **52 tests** pass: 17 library, 3 CLI, 27 document integration,
+and 5 terminal integration tests. Linux adds one non-UTF-8-filename check (53 total).
+[Final code CI](https://github.com/rapidclock/ede/actions/runs/41603574341) passes
+on native Linux and macOS, including all four memory-capped benchmarks. The Linux
+measurement table below records the [benchmark run](https://github.com/rapidclock/ede/actions/runs/41600228777);
+the final compaction stress measurement was run separately on the local host.
+The [stage PR](https://github.com/rapidclock/ede/pull/2) targets `feat/initial_mvp`.
+
+### Acceptance evidence
+
+| Checks | Evidence |
+| --- | --- |
+| D01 | Exact BOM, UTF-8, control-byte and mixed/final/no-final-newline round trips; distinct unsupported encoding, binary and type failures; OS-string paths and Linux non-UTF-8 filenames |
+| D02 | Provisional preview before whole-file validation, late invalid encoding/NUL, cancellation, observed source changes and preparation-sync failures; no Ready or leaked working directory on failure |
+| D03 | Forced-copy tests on both platforms; optional clone path on capable filesystems; external overwrite, truncate, unlink and rename preserve snapshots and undo |
+| D04–D05 | 1,500 deterministic reference-model edit/undo/redo operations; multi-replacement atomicity, scalar/CRLF bounds, stale epochs, failed edits retaining redo, no-ops and undo-to-save-point; older-revision save keeps newer edits dirty |
+| D06 | More than a million short lines, a 1 MiB unbroken line, scalar/page/CRLF crossings, byte/line queries and continuations; 1 GiB dense/long workloads below |
+| D07 | Tiny-cache eviction, structural B+ occupancy/corruption checks, bounded snapshot/window/path admission, metadata retained after document close, explicit history pruning/newest-undo rejection, lease-safe compaction, shared-page metadata reclamation, source-hole packing and history preservation |
+| D08–D09 | Injected read/write/flush/sync/metadata/publish/directory-sync/verification failures; cancellation before/after commit; no-clobber creation races and final known conflicts; symlinks, hard links, modes and native xattr behavior |
+| D10 | Bounded request/result admission, cancellation and close under backpressure, stale closed results; a deliberately blocked background open still allows foreground snapshot reads |
+| D11 | Existing terminal/CLI acceptance remains green; native Linux/macOS workflow uses the lockfile, fmt, Clippy and all tests |
+| D12 | Real allocated text fixtures, complete saved-byte verification, beginning/middle/end edits and undo/redo, default-history churn, native APFS clone/copy comparison and swapless Linux memory caps |
+
+### Benchmark conditions and results
+
+The Rust harness is `examples/storage_bench.rs`, built in release mode. Every run
+writes a real, fully allocated text fixture with bounded buffers, then opens,
+reads, edits at beginning/middle/end, undoes/redoes, performs Save As and verifies
+all output bytes. The three-position edit maximum is separate from optional
+1,000-edit churn. Full preparation and line indexing finish together in this
+implementation. Save timing below is creation of a new destination; same-path
+conflict checking is covered by functional tests rather than these timings.
+
+Local host: MacBookPro18,2, Apple M1 Max (10 CPU cores), 32 GiB RAM, macOS 27.2
+(26B123), internal SSD/APFS. Inputs were generated immediately before each run;
+there was no OS cache flush. First/repeated window reads are reported separately
+by the harness; no cold-cache measurement is claimed. All lengths below are 1 GiB.
+
+| Corpus / snapshot | Preview ms | Ready + index ms | Max edit ms | Save ms | Peak RSS MiB | CPU seconds |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Ordinary / copy | 0.800 | 1,643 | 1.103 | 1,465 | 123.6 | 1.171 |
+| Dense / copy | 0.979 | 5,141 | 0.912 | 1,499 | 118.3 | 4.592 |
+| Long / copy | 0.401 | 1,491 | 0.819 | 1,489 | 115.1 | 1.015 |
+| Ordinary / APFS clone | 0.197 | 420 | 1.336 | 1,681 | 102.8 | 1.028 |
+| Dense / APFS clone | 0.382 | 4,066 | 1.419 | 1,529 | 93.6 | 4.558 |
+| Long / APFS clone | 0.201 | 284 | 1.355 | 1,686 | 106.8 | 0.967 |
+
+Actual filesystem cloning was confirmed for the three clone runs. First/repeated
+4 KiB window reads were at most 0.031/0.004 ms in these runs. A separate 1 GiB
+copy run retained 1,000 worst-order typing transactions: median 5.489 ms,
+p95 10.404 ms, maximum 19.860 ms. Compaction took 244.690 ms, reducing metadata
+from 21,920,520 to 21,871,176 bytes; all 1,000 transactions could then be undone.
+Peak RSS was 130.6 MiB, managed caches 96.0 MiB, working metadata about 20.9 MiB. These are single-host
+engineering measurements, not UI-latency or hardware-independent guarantees.
+
+Linux CI: Ubuntu 24.04.5 x86_64 VM, 2 vCPUs of AMD EPYC 9V74, approximately
+7.7 GiB usable system RAM, ext4 on `/dev/nvme0n1p1`. Runs use systemd cgroup v2
+`MemoryMax=8G` or `256M`, `MemorySwapMax=0`, with actual limits printed by the
+harness. The cap includes anonymous memory and charged filesystem cache; the
+host/kernel remain outside this application cgroup. This documents the 8 GiB
+baseline and a 1 GiB workload larger than its enforced 256 MiB memory allowance.
+
+| Corpus / memory cap | Preview ms | Ready + index ms | Max edit ms | Save ms | Peak RSS MiB | CPU seconds |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Ordinary / 8 GiB | 0.182 | 11,968 | 0.241 | 10,942 | 66.5 | 1.259 |
+| Dense / 8 GiB | 0.443 | 10,703 | 0.224 | 9,845 | 66.7 | 3.472 |
+| Long / 8 GiB | 0.173 | 8,118 | 0.230 | 8,262 | 66.5 | 1.181 |
+| Ordinary / 256 MiB | 0.588 | 12,843 | 0.338 | 12,201 | 66.7 | 2.113 |
+
+These runs used the mandatory copy fallback. Peak RSS comes from `getrusage`,
+not the systemd service summary. Largest first window read was 0.662 ms; repeated
+reads were at most 0.004 ms. Cache/physical storage varied by environment, so the
+longer Linux preparation/save times are reported separately from preview and
+small-operation responsiveness.
+
+CPU time excludes fixture generation and includes saved-byte verification.
+Typical managed cache charge after a standard benchmark was 64.1 MiB. Logical
+private working storage was 1,073,741,839 text bytes plus 196,872 metadata bytes, excluding
+the input fixture, saved output and filesystem allocation overhead. The harness needs roughly 3 GiB of temporary
+filesystem capacity for the fixture, private copy and save output, plus configured
+free-space headroom. Cloning may reduce physical allocation but is not counted as
+free future write capacity. OS page cache is not included in process RSS; its
+charge is subject to the Linux cgroup limit.
+
+The first 256 MiB runs were OOM-killed with only end-of-file synchronization.
+Long writes now checkpoint data every 8 MiB in private copies, transaction spools,
+save staging and fixture generation. This allows dirty file pages to become
+reclaimable without synchronizing each small edit. The same 256 MiB workload then
+passed. The checkpoints trade preparation/save throughput for bounded dirty
+working sets on constrained systems; final save still performs full output and
+parent-directory synchronization.
 
 ### Implementation refinements
 
-- Modules separate resource admission, immutable source readers, document state,
-  disk transactions, snapshots, compaction and the service. The public API is
-  re-exported by `document`; the terminal shell remains unchanged.
+- `types` defines values/policy; `model` owns document state; `source` owns byte
+  arenas/read handles; `snapshot` and `transaction` own bounded leases/plans;
+  `resources`, `cache` and `bitmap` implement admission/paging; `compact` performs
+  collection. `tree`, `index`, `history`, `save`, `platform` and `service` keep their
+  stated responsibilities. `document` re-exports the public API; the shell is unchanged.
 - One worker owns all mutations, opens and saves; a second is reserved for
   foreground immutable-snapshot reads/line lookups. Snapshot handles duplicate
   positional-read file descriptors, so background work does not retain a lock
@@ -450,16 +543,46 @@ will be recorded here before stage completion is claimed.
   tree's byte/LF weights. Original longest-line information is recorded at open.
 - History roots are fixed-width, append-only disk records with backwards links.
   Failed edits append unreachable records instead of overwriting redo. Undo text
-  accounting uses a disk bitmap; partial current pages are conservatively charged.
-- Compaction copies live physical pages once using a disk remapping table, then
-  atomically swaps the document generation. It returns Busy while external leases
-  are held. Before more edits, compaction is requested after 64 MiB of node/history
+  accounting uses bounded-cache disk bitmaps and skips shared/already-visited tree
+  subtrees; partial current pages are conservatively charged.
+- Compaction first marks all current/history/baseline references with bounded-cache
+  disk bitmaps. It packs live text blocks in physical order and copies each shared
+  tree page once using disk remapping, preserving B+ shape rather than replaying
+  edits. When every text block is live, it retains the text/index through owned
+  handles instead of copying a large file merely to collect metadata. Old paths
+  may be unlinked; handles remain authoritative. The complete generation swap is
+  atomic. Compaction returns Busy while external leases are held. Before more
+  edits, compaction is requested after 64 MiB of node/history
   storage or text growth beyond the live-state/history allowance plus 1 MiB;
   callers release leases and retry when required.
 - macOS extended attributes up to a 64 KiB names/value/accounting envelope use
   native descriptor copying followed by exact verification. ACLs and file flags
   remain SaveAsRequired; Linux extended attributes, including ACLs, also require
-  Save As. New files retain OS-assigned metadata and mode 0600.
+  Save As. New files use mode 0600. Save staging lives in a same-filesystem 0700
+  directory, keeping final mode bits private until publication. Darwin inherited
+  directory ACLs that defeat privacy are rejected before private bytes are created.
 - Non-UTF-8 filenames are exercised on Linux. APFS rejects their creation; path
   handling throughout the core still uses OS strings rather than UTF-8 conversion.
+- A 32 KiB store-metadata reservation lasts until the last snapshot releases its
+  generation, including after tab close. Requests charge owned string/path capacity,
+  not only text length. Invalid buffers smaller than the fixed scratch/metadata
+  requirements return ResourceLimit before work starts.
 
+### Limits and deferred integration
+
+- Stage 02 storage is available as a Rust API and worker service. The terminal
+  shell still does not open/render/edit files; that is Stage 03. No later-stage
+  implementation or design is authorized by this delivery.
+- UTF-8 only; NUL is a binary heuristic. ACLs, special flags/permissions, hard
+  links and unsupported extended metadata require a new destination rather than
+  silently dropping metadata or modifying linked aliases.
+- Original longest-line information is exact at open; recomputing a current
+  longest line after arbitrary edits is left to the later highlighting policy.
+  Byte/line lookup and line counts remain exact after edits.
+- Whole-file private preparation is required before editing. Full-copy opening is
+  not an atomic point-in-time snapshot against an uncooperative writer; final
+  identity/content checks also cannot turn rename into portable compare-and-swap.
+- Temporary session files are not crash recovery. Filesystem/power-loss and
+  network-filesystem guarantees remain limited as stated above. No cold-cache,
+  reconnect/transport or end-to-end UI performance result is inferred here;
+  Stage 01's agreed manual transport deferrals remain recorded in its spec.
