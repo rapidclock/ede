@@ -116,11 +116,11 @@ impl Request {
     fn payload(&self) -> usize {
         match self {
             Self::Replace { text, .. } => text.capacity(),
-            Self::Open(path) => path.as_os_str().len(),
+            Self::Open(path) => path.capacity(),
             Self::Save {
                 target: SaveTarget::New(path),
                 ..
-            } => path.as_os_str().len(),
+            } => path.capacity(),
             _ => 0,
         }
     }

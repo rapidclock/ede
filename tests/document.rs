@@ -1147,3 +1147,20 @@ fn retained_closed_snapshots_keep_aggregate_metadata_reservations() {
     drop(job);
     service.shutdown().wait().unwrap();
 }
+
+/// Short path text cannot conceal an oversized owned queue allocation.
+#[test]
+fn queued_path_capacity_is_charged_before_admission() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut service = StorageService::new(options(directory.path())).unwrap();
+    let mut path = std::path::PathBuf::with_capacity(2 << 20);
+    path.push("short");
+    assert!(matches!(
+        service.submit(1, Request::Open(path)),
+        Err(SubmissionError {
+            error: Error::ResourceLimit(_),
+            ..
+        })
+    ));
+    service.shutdown().wait().unwrap();
+}
