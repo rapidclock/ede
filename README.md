@@ -81,6 +81,6 @@ Tests include isolated Unix pseudo-terminals and an interactive shell to exercis
 real bytes, kernel terminal settings, resize, signals, and suspend/resume. The
 GitHub Actions workflow runs these checks on Linux and macOS. Pseudo-terminal
 tests do not establish compatibility with every terminal app or remote transport.
-See the [Stage 01 validation record](specs/001_initial_mvp/01_validation.md) for
+See the [Stage 01 validation record](specs/001_initial_mvp/01_terminal_foundation.md#validation-record) for
 tested environments and agreed deferrals. Future stage specifications are written
 and reviewed one at a time, before separately authorized implementation.

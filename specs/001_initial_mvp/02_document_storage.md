@@ -429,3 +429,9 @@ authorized. Staging this draft does not authorize application changes or tests.
 - [Linux rename semantics and link behavior](https://man7.org/linux/man-pages/man2/rename.2.html)
 - [Rust file synchronization and errors](https://doc.rust-lang.org/std/fs/struct.File.html#method.sync_all)
 - [Directory synchronization requirements](https://man7.org/linux/man-pages/man2/fsync.2.html)
+
+## Validation record
+
+Pending. This stage is a design draft; implementation and validation have not
+been authorized. Record actual results, acceptance evidence, benchmark conditions,
+limitations, and any agreed deferrals here when validation is performed.

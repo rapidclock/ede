@@ -424,12 +424,15 @@ Dependencies below are minimum functional dependencies. The proposed delivery
 order is 01 through 10, with completed stages integrated into `feat/initial_mvp`
 through stage PRs. Tests and failure handling belong in every stage; stage 10 is
 the final integrated validation, not the first time correctness is checked.
+Each stage specification ends with its validation record, including actual
+results, tested environments, limitations, and agreed deferrals. Keep this
+evidence in the stage file rather than a separate validation document.
 
 ### 01 — Terminal foundation
 
 Design: [01_terminal_foundation.md](01_terminal_foundation.md). Depends on: none.
 Status: complete; [PR #1](https://github.com/rapidclock/ede/pull/1) merged into `feat/initial_mvp`.
-Evidence: [Stage 01 validation record](01_validation.md).
+Evidence: [Stage 01 validation record](01_terminal_foundation.md#validation-record).
 
 - Deliver a buildable Rust application shell with input, resize handling, focus,
   named command routing, and a place to report background work and errors.
