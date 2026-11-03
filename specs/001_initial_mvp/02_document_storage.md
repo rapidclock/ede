@@ -434,9 +434,9 @@ defaults. Material changes to requirements still need review.
 
 Implementation was authorized on 2026-11-02. Validation spans 2026-11-02/03.
 Package: `0.0.1-dev.2`, pinned Rust 1.99.1. Local formatting, Clippy with warnings
-as errors, and all **52 tests** pass: 17 library, 3 CLI, 27 document integration,
-and 5 terminal integration tests. Linux adds one non-UTF-8-filename check (53 total).
-[Final code CI](https://github.com/rapidclock/ede/actions/runs/41603574341) passes
+as errors, and all **53 tests** pass: 17 library, 3 CLI, 28 document integration,
+and 5 terminal integration tests. Linux adds one non-UTF-8-filename check (54 total).
+[Final code CI](https://github.com/rapidclock/ede/actions/runs/41604878400) passes
 on native Linux and macOS, including all four memory-capped benchmarks. The Linux
 measurement table below records the [benchmark run](https://github.com/rapidclock/ede/actions/runs/41600228777);
 the final compaction stress measurement was run separately on the local host.
@@ -449,7 +449,7 @@ The [stage PR](https://github.com/rapidclock/ede/pull/2) targets `feat/initial_m
 | D01 | Exact BOM, UTF-8, control-byte and mixed/final/no-final-newline round trips; distinct unsupported encoding, binary and type failures; OS-string paths and Linux non-UTF-8 filenames |
 | D02 | Provisional preview before whole-file validation, late invalid encoding/NUL, cancellation, observed source changes and preparation-sync failures; no Ready or leaked working directory on failure |
 | D03 | Forced-copy tests on both platforms; optional clone path on capable filesystems; external overwrite, truncate, unlink and rename preserve snapshots and undo |
-| D04–D05 | 1,500 deterministic reference-model edit/undo/redo operations; multi-replacement atomicity, scalar/CRLF bounds, stale epochs, failed edits retaining redo, no-ops and undo-to-save-point; older-revision save keeps newer edits dirty |
+| D04–D05 | 1,500 deterministic reference-model edit/undo/redo operations; multi-replacement atomicity, scalar/CRLF bounds, stale epochs, failed edits retaining redo, single-replacement/net-zero batch no-ops and undo-to-save-point; older-revision save keeps newer edits dirty |
 | D06 | More than a million short lines, a 1 MiB unbroken line, scalar/page/CRLF crossings, byte/line queries and continuations; 1 GiB dense/long workloads below |
 | D07 | Tiny-cache eviction, structural B+ occupancy/corruption checks, bounded snapshot/window/path admission, metadata retained after document close, explicit history pruning/newest-undo rejection, lease-safe compaction, shared-page metadata reclamation, source-hole packing and history preservation |
 | D08–D09 | Injected read/write/flush/sync/metadata/publish/directory-sync/verification failures; cancellation before/after commit; no-clobber creation races and final known conflicts; symlinks, hard links, modes and native xattr behavior |
