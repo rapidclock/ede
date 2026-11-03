@@ -203,6 +203,27 @@ pub struct SubmissionError {
     /// Original request; large staged transactions are not lost on backpressure.
     pub request: Box<Request>,
 }
+impl std::fmt::Debug for SubmissionError {
+    /// Show the failure and target without dumping text payloads or private snapshots.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SubmissionError")
+            .field("error", &self.error)
+            .field("document", &self.request.document())
+            .finish_non_exhaustive()
+    }
+}
+impl std::fmt::Display for SubmissionError {
+    /// Present the admission failure; the owned request remains available for retry.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt(f)
+    }
+}
+impl std::error::Error for SubmissionError {
+    /// Retain the underlying typed storage error in the standard error chain.
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
+    }
+}
 /// Global entry reservation, including queued, running, and unconsumed completions.
 struct Admission {
     entries: Arc<AtomicUsize>,

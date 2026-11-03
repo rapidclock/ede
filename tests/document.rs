@@ -1047,3 +1047,32 @@ fn newline_dense_and_very_long_lines_use_bounded_windows() {
     assert_eq!(stats.original_longest_line, 1 << 20);
     assert!(stats.cache_bytes <= 16384 + 2048);
 }
+
+/// Preparation writeback failure must not publish Ready or modify the source.
+#[test]
+fn long_copy_sync_failure_is_atomic() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("large");
+    use std::io::Write;
+    let mut file = fs::File::create(&path).unwrap();
+    let chunk = vec![b'a'; 65536];
+    for _ in 0..144 {
+        file.write_all(&chunk).unwrap();
+    }
+    drop(file);
+    let faults = Arc::new(Faults::default());
+    *faults.0.lock().unwrap() = Some(IoPoint::Sync);
+    let mut config = options(directory.path());
+    config.limits.text_page_bytes = 65536;
+    config.limits.text_cache_bytes = 1 << 20;
+    config.limits.buffer_bytes = 4 << 20;
+    config.faults = Some(faults);
+    let mut preview = false;
+    let result = Document::open(&path, config, &Cancellation::default(), |event| {
+        preview |= matches!(event, OpenProgress::Preview { .. });
+    });
+    assert!(preview);
+    assert!(matches!(result, Err(Error::Io(_))));
+    assert_eq!(fs::metadata(&path).unwrap().len(), 9 << 20);
+    assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
+}

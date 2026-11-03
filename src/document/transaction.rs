@@ -45,6 +45,7 @@ impl StagedTransaction {
             let mut validator = Validator::new();
             let mut buffer = vec![0; self.max_buffer];
             let mut written: u64 = 0;
+            let mut dirty_bytes = 0;
             loop {
                 cancel.check()?;
                 let count = text.read(&mut buffer)?;
@@ -66,6 +67,11 @@ impl StagedTransaction {
                 // Insertions are logical bytes; a BOM here is text, never removed.
                 platform::reserve(&self.file, count as u64 + 32, self.reserve)?;
                 self.file.write_all(&buffer[..count])?;
+                dirty_bytes += count;
+                if dirty_bytes >= 8 << 20 {
+                    self.file.sync_data()?;
+                    dirty_bytes = 0;
+                }
                 written = written
                     .checked_add(count as u64)
                     .ok_or(Error::ResourceLimit("transaction length overflow"))?;

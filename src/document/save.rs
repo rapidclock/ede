@@ -138,12 +138,26 @@ impl Document {
             .checked_add(if snapshot.format().bom { 3 } else { 0 })
             .ok_or(Error::ResourceLimit("save length overflow"))?;
         platform::reserve(&parent, raw_length, store.source.limits.disk_reserve_bytes)?;
-        let mut output = tempfile::Builder::new()
+        let staging = tempfile::Builder::new()
             .prefix(".ede-save-")
-            .tempfile_in(parent_path)?;
+            .tempdir_in(parent_path)?;
+        platform::secure_directory(staging.path())?;
+        let mut output = tempfile::Builder::new()
+            .prefix("output-")
+            .tempfile_in(staging.path())?;
+        output
+            .as_file()
+            .set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
+        let mut dirty_bytes = 0;
         stream(&store, *snapshot.state, cancel, |bytes| {
             store.source.check(IoPoint::Write)?;
             output.write_all(bytes)?;
+            dirty_bytes += bytes.len();
+            if dirty_bytes >= 8 << 20 {
+                store.source.check(IoPoint::Sync)?;
+                output.as_file().sync_data()?;
+                dirty_bytes = 0;
+            }
             Ok(())
         })?;
         store.source.check(IoPoint::Metadata)?;

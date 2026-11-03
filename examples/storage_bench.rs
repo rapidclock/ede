@@ -1,5 +1,5 @@
 //! Reproducible bounded-memory storage benchmark. Run with `cargo run --release
-//! --example storage_bench -- <ordinary|dense|long> <MiB> <copy|clone>`.
+//! --example storage_bench -- <ordinary|dense|long> <MiB> <copy|clone> [churn-edits]`.
 //! The input and output are real allocated text files in an isolated temp directory.
 
 use ede::document::{
@@ -20,10 +20,16 @@ fn generate(file: &mut File, pattern: &[u8], length: u64) -> std::io::Result<()>
         *byte = pattern[index % pattern.len()];
     }
     let mut remaining = length;
+    let mut dirty_bytes = 0;
     while remaining > 0 {
         let count = remaining.min(chunk.len() as u64) as usize;
         file.write_all(&chunk[..count])?;
         remaining -= count as u64;
+        dirty_bytes += count;
+        if dirty_bytes >= 8 << 20 {
+            file.sync_data()?;
+            dirty_bytes = 0;
+        }
     }
     file.sync_all()
 }
@@ -76,8 +82,12 @@ fn main() -> Result<(), Box<dyn Error>> {
         "long" => b"x",
         _ => return Err("unknown corpus".into()),
     };
+    let churn: usize = arguments.next().unwrap_or_else(|| "0".into()).parse()?;
     if !matches!(mode.as_str(), "copy" | "clone") || mib == 0 || arguments.next().is_some() {
-        return Err("usage: storage_bench <ordinary|dense|long> <MiB> <copy|clone>".into());
+        return Err(
+            "usage: storage_bench <ordinary|dense|long> <MiB> <copy|clone> [churn-edits<=1000]"
+                .into(),
+        );
     }
     let length = mib.checked_mul(1 << 20).ok_or("fixture length overflow")?;
     #[cfg(target_os = "linux")]
@@ -98,6 +108,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     );
     let path = directory.path().join("input");
     generate(&mut File::create(&path)?, pattern, length)?;
+    println!("fixture_generated_bytes={length}");
     let cancel = Cancellation::default();
     let options = OpenOptions {
         working_directory: Some(directory.path().to_owned()),
@@ -146,6 +157,31 @@ fn main() -> Result<(), Box<dyn Error>> {
         document.redo(document.revision())?;
         document.undo(document.revision())?;
         println!("undo_redo_undo_ms={:.3}", ms(started.elapsed()));
+    }
+    if churn > 0 {
+        let mut latencies = Vec::with_capacity(churn);
+        for _ in 0..churn {
+            let started = Instant::now();
+            document.apply(
+                document.revision(),
+                [Edit {
+                    range: TextRange::new(0, 0)?,
+                    text: "x",
+                }],
+                &cancel,
+            )?;
+            latencies.push(started.elapsed());
+        }
+        latencies.sort_unstable();
+        println!(
+            "churn_edits={churn} p50_edit_ms={:.3} p95_edit_ms={:.3} max_edit_ms={:.3}",
+            ms(latencies[churn / 2]),
+            ms(latencies[(churn * 95 / 100).min(churn - 1)]),
+            ms(latencies[churn - 1])
+        );
+        for _ in 0..churn {
+            document.undo(document.revision())?;
+        }
     }
     let snapshot = document.snapshot()?;
     let lines = snapshot.line_count();

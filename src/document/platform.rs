@@ -359,3 +359,18 @@ fn copy_xattrs(original: &File, output: &File) -> Result<(), Error> {
     }
     Ok(())
 }
+
+/// Restrict a newly created, empty owner directory before putting private bytes in it.
+/// Darwin inherited ACLs can grant access despite mode bits, so fail closed there.
+pub(super) fn secure_directory(path: &Path) -> Result<(), Error> {
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    #[cfg(target_os = "macos")]
+    if acl(&File::open(path)?)? {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "Private storage directory inherits an ACL; choose another working directory",
+        )
+        .into());
+    }
+    Ok(())
+}

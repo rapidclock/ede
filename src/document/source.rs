@@ -16,6 +16,7 @@ pub(super) struct Source {
     pub file: File,
     pub(super) index: LineIndex,
     pub(super) length: u64,
+    dirty_bytes: u64,
     pub generation: SourceId,
     pub limits: StorageLimits,
     pub resources: Arc<Resources>,
@@ -33,6 +34,7 @@ impl Source {
             file,
             index: LineIndex::new(index, options.limits.text_page_bytes)?,
             length: 0,
+            dirty_bytes: 0,
             generation: SourceId(identity()?),
             limits: options.limits.clone(),
             resources,
@@ -45,6 +47,7 @@ impl Source {
             file: self.file.try_clone()?,
             index: self.index.reader()?,
             length: self.length,
+            dirty_bytes: 0,
             generation: self.generation,
             limits: self.limits.clone(),
             resources: self.resources.clone(),
@@ -77,6 +80,14 @@ impl Source {
             .length
             .checked_add(bytes.len() as u64)
             .ok_or(Error::ResourceLimit("source offset overflow"))?;
+        if !cloned {
+            self.dirty_bytes += bytes.len() as u64;
+            if self.dirty_bytes >= 8 << 20 {
+                self.check(IoPoint::Sync)?;
+                self.file.sync_data()?;
+                self.dirty_bytes = 0;
+            }
+        }
         Ok(())
     }
     /// Discard an unpublished failed suffix without modifying previously referenced bytes.
@@ -89,6 +100,7 @@ impl Source {
         self.file.set_len(length)?;
         self.index.rollback(length, lines)?;
         self.length = length;
+        self.dirty_bytes = 0;
         Ok(())
     }
     /// Read a physical range using a shared cache; incomplete append pages are never cached.
@@ -202,6 +214,7 @@ impl Store {
             Some(parent) => tempfile::Builder::new().prefix("ede-").tempdir_in(parent)?,
             None => tempfile::Builder::new().prefix("ede-").tempdir()?,
         };
+        platform::secure_directory(directory.path())?;
         let path = directory.path().join("text");
         let cloned = if !options.force_copy {
             original
@@ -326,10 +339,12 @@ impl Reader {
 }
 /// Create a private read/write session file; no accidental reuse of stale paths.
 pub(super) fn private_file(path: &Path) -> Result<File, Error> {
-    Ok(FsOpenOptions::new()
+    let file = FsOpenOptions::new()
         .read(true)
         .write(true)
         .create_new(true)
         .mode(0o600)
-        .open(path)?)
+        .open(path)?;
+    file.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
+    Ok(file)
 }
