@@ -154,8 +154,10 @@ impl Source {
         let count = (offset % page) as usize;
         let mut bytes = vec![0; count];
         self.read(offset - count as u64, &mut bytes)?;
-        Ok(self.index.prefix(offset / page, self.length)?
-            + memchr::memchr_iter(b'\n', &bytes).count() as u64)
+        self.index
+            .prefix(offset / page, self.length)?
+            .checked_add(memchr::memchr_iter(b'\n', &bytes).count() as u64)
+            .ok_or(Error::CorruptStorage)
     }
     /// Exact range LF count, independent of a per-line object array.
     pub fn lines(&self, offset: u64, length: u64) -> Result<u64, Error> {

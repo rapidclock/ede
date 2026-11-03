@@ -43,8 +43,15 @@ impl LineIndex {
             return Err(Error::CorruptStorage);
         }
         let mut bytes = [0; 8];
-        self.file.read_exact_at(&mut bytes, block * 8)?;
-        Ok(u64::from_le_bytes(bytes))
+        self.file.read_exact_at(
+            &mut bytes,
+            block.checked_mul(8).ok_or(Error::CorruptStorage)?,
+        )?;
+        let count = u64::from_le_bytes(bytes);
+        if count > block * self.page {
+            return Err(Error::CorruptStorage);
+        }
+        Ok(count)
     }
     /// Reset failed unpublished appends to the previous accepted source length/count.
     pub fn rollback(&mut self, length: u64, total: u64) -> Result<(), Error> {

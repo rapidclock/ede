@@ -27,6 +27,13 @@ pub(super) struct Root {
     pub entry: Entry,
     pub height: u16,
 }
+/// Disk old-to-new IDs used during one atomic compaction attempt.
+pub(super) struct Remapping {
+    /// Old node page ID to new page ID plus one (zero means not copied).
+    pub nodes: File,
+    /// Old text block to new byte offset plus one; None means identity mapping.
+    pub text: Option<File>,
+}
 /// One transient decoded page; at most a bounded path and sibling set is resident.
 struct Node {
     height: u16,
@@ -111,7 +118,10 @@ impl Tree {
                 bytes: word(chunk, 8),
                 lines: word(chunk, 16),
             };
-            if entry.bytes == 0 || entry.lines > entry.bytes {
+            if entry.bytes == 0
+                || entry.lines > entry.bytes
+                || (height == 0 && entry.id.checked_add(entry.bytes).is_none())
+            {
                 return Err(Error::CorruptStorage);
             }
             entries.push(entry);
@@ -183,6 +193,10 @@ impl Tree {
                 height: node.height - 1,
             };
         }
+    }
+    /// Validate a retained descriptor before publishing it as current content.
+    pub fn check_root(&self, root: Root) -> Result<(), Error> {
+        self.read(root).map(|_| ())
     }
     /// Count line endings before a logical byte offset without indexing each line.
     pub fn lines_before(&self, root: Root, offset: u64, source: &Source) -> Result<u64, Error> {
@@ -471,6 +485,78 @@ impl Tree {
             }
         }
         Ok(())
+    }
+    /// Copy each reachable immutable node once, preserving B+ shape and shared history paths.
+    /// Text blocks are repacked in physical order, so every old piece remains one range.
+    pub fn copy_live(
+        &self,
+        root: Root,
+        target: &mut Tree,
+        source: &Source,
+        maps: &Remapping,
+        cancel: &Cancellation,
+    ) -> Result<Root, Error> {
+        cancel.check()?;
+        let mut encoded = [0; 8];
+        maps.nodes.read_exact_at(
+            &mut encoded,
+            root.entry.id.checked_mul(8).ok_or(Error::CorruptStorage)?,
+        )?;
+        let mapped = u64::from_le_bytes(encoded);
+        if mapped != 0 {
+            let result = Root {
+                entry: Entry {
+                    id: mapped - 1,
+                    ..root.entry
+                },
+                height: root.height,
+            };
+            target.read(result)?;
+            return Ok(result);
+        }
+        let mut node = self.read(root)?;
+        for entry in &mut node.entries {
+            if root.height > 0 {
+                *entry = self
+                    .copy_live(
+                        Root {
+                            entry: *entry,
+                            height: root.height - 1,
+                        },
+                        target,
+                        source,
+                        maps,
+                        cancel,
+                    )?
+                    .entry;
+            } else if let Some(text) = &maps.text {
+                let page = source.limits.text_page_bytes as u64;
+                text.read_exact_at(
+                    &mut encoded,
+                    (entry.id / page)
+                        .checked_mul(8)
+                        .ok_or(Error::CorruptStorage)?,
+                )?;
+                let location = u64::from_le_bytes(encoded);
+                if location == 0 {
+                    return Err(Error::CorruptStorage);
+                }
+                entry.id = (location - 1)
+                    .checked_add(entry.id % page)
+                    .ok_or(Error::CorruptStorage)?;
+                if entry
+                    .id
+                    .checked_add(entry.bytes)
+                    .is_none_or(|end| end > source.len())
+                {
+                    return Err(Error::CorruptStorage);
+                }
+            }
+        }
+        let result = target.write(node, source)?;
+        maps.nodes
+            .write_all_at(&(result.entry.id + 1).to_le_bytes(), root.entry.id * 8)?;
+        Ok(result)
     }
     /// Verify occupancy, source bounds and weights recursively; used by integrity tests.
     #[cfg(test)]

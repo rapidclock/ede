@@ -30,6 +30,14 @@ impl Bitmap {
             next: 0,
         })
     }
+    /// Read one identity flag, loading at most one bounded disk block.
+    pub fn get(&mut self, index: u64) -> Result<u8, Error> {
+        if index >= self.length {
+            return Err(Error::CorruptStorage);
+        }
+        let block = self.load(index / BLOCK as u64)?;
+        Ok(self.cache[block].bytes[(index % BLOCK as u64) as usize])
+    }
     /// Set selected bits on a range, counting entries that did not already have skip bits.
     pub fn mark(&mut self, mut start: u64, end: u64, mark: u8, skip: u8) -> Result<u64, Error> {
         if start > end || end > self.length {

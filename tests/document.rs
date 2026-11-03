@@ -1164,3 +1164,58 @@ fn queued_path_capacity_is_charged_before_admission() {
     ));
     service.shutdown().wait().unwrap();
 }
+
+/// History compaction must preserve sharing rather than replaying every retained edit.
+#[test]
+fn compaction_copies_shared_history_pages_once() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut configuration = options(directory.path());
+    configuration.limits.undo_transactions = 256;
+    let mut document = Document::new(configuration).unwrap();
+    replace(&mut document, 0, 0, &"a".repeat(4096));
+    for _ in 0..200 {
+        replace(&mut document, 0, 0, "x");
+    }
+    let before = document.stats().unwrap();
+    document.compact(&Cancellation::default()).unwrap();
+    let after = document.stats().unwrap();
+    assert!(
+        after.metadata_bytes <= before.metadata_bytes,
+        "compaction expanded metadata: {before:?} -> {after:?}"
+    );
+    for _ in 0..200 {
+        document.undo(document.revision()).unwrap();
+    }
+    assert_eq!(text(&document.snapshot().unwrap()), "a".repeat(4096));
+    for _ in 0..200 {
+        document.redo(document.revision()).unwrap();
+    }
+    assert_eq!(
+        text(&document.snapshot().unwrap()),
+        format!("{}{}", "x".repeat(200), "a".repeat(4096))
+    );
+}
+/// Packing source holes preserves byte/line semantics for current and undo roots.
+#[test]
+fn compaction_reclaims_unreachable_text_blocks() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut configuration = options(directory.path());
+    configuration.limits.undo_transactions = 1;
+    let mut document = Document::new(configuration).unwrap();
+    let count = 65536;
+    replace(&mut document, 0, 0, &"a".repeat(count));
+    replace(&mut document, 0, count as u64, &"b".repeat(count));
+    replace(&mut document, 0, count as u64, &"c".repeat(count));
+    let before = document.stats().unwrap();
+    document.compact(&Cancellation::default()).unwrap();
+    let after = document.stats().unwrap();
+    assert!(
+        after.text_bytes < before.text_bytes,
+        "{before:?} -> {after:?}"
+    );
+    assert_eq!(text(&document.snapshot().unwrap()), "c".repeat(count));
+    document.undo(document.revision()).unwrap();
+    assert_eq!(text(&document.snapshot().unwrap()), "b".repeat(count));
+    document.redo(document.revision()).unwrap();
+    assert_eq!(text(&document.snapshot().unwrap()), "c".repeat(count));
+}

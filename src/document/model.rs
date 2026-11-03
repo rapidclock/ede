@@ -407,6 +407,11 @@ impl Document {
         let revision = self.next_revision()?;
         let previous = self.history.previous(self.history.cursor)?;
         let state = self.history.read(previous)?;
+        self.store
+            .lock()
+            .map_err(|_| Error::CorruptStorage)?
+            .tree
+            .check_root(state.root)?;
         self.history.cursor = previous;
         self.current = state;
         self.revision = revision;
@@ -423,6 +428,11 @@ impl Document {
         let revision = self.next_revision()?;
         let next = self.history.successor(self.history.cursor)?;
         let state = self.history.read(next)?;
+        self.store
+            .lock()
+            .map_err(|_| Error::CorruptStorage)?
+            .tree
+            .check_root(state.root)?;
         self.history.cursor = next;
         self.current = state;
         self.revision = revision;

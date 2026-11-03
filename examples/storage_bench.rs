@@ -179,6 +179,19 @@ fn main() -> Result<(), Box<dyn Error>> {
             ms(latencies[(churn * 95 / 100).min(churn - 1)]),
             ms(latencies[churn - 1])
         );
+        let before = document.stats()?;
+        let started = Instant::now();
+        document.compact(&cancel)?;
+        let after = document.stats()?;
+        println!(
+            "compaction_ms={:.3} metadata_before={} metadata_after={}",
+            ms(started.elapsed()),
+            before.metadata_bytes,
+            after.metadata_bytes
+        );
+        if after.metadata_bytes > before.metadata_bytes {
+            return Err("compaction expanded retained history metadata".into());
+        }
         for _ in 0..churn {
             document.undo(document.revision())?;
         }
