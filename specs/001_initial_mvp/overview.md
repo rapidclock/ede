@@ -1,6 +1,6 @@
 # 001 — Initial MVP overview
 
-Status: **MVP scope and roadmap accepted — Stage 01 merged; Stage 02 design draft.**
+Status: **MVP scope and roadmap accepted — Stage 01 merged; Stage 02 implementation in progress.**
 
 Project: **ede**, a predominantly Rust terminal text editor for macOS and Linux.
 
@@ -411,11 +411,12 @@ the architectural proposals and unresolved decisions remain open as identified
 above. On 2026-11-01, the user approved the detailed Stage 01 design and explicitly
 authorized its implementation. Stage 01 is now squash-merged into `feat/initial_mvp`
 through [PR #1](https://github.com/rapidclock/ede/pull/1). The user authorized the
-Stage 02 design while reviewing Stage 01; Stage 02 implementation is not authorized.
+Stage 02 design while reviewing Stage 01, and explicitly authorized Stage 02
+implementation on 2026-11-02.
 
 The user accepted proceeding one stage at a time: detailed design, review,
 separately authorized implementation, validation, and stage PR before moving on.
-Stage 02 is now a design draft; later filenames identify future documents. Each
+Stage 02 implementation is now in progress; later filenames identify future documents. Each
 detailed design must resolve its prerequisite decisions and define behavior,
 interfaces, failure cases, and acceptance criteria before its implementation is
 authorized. The stages may be adjusted as we learn.
@@ -446,13 +447,14 @@ Evidence: [Stage 01 validation record](01_terminal_foundation.md#validation-reco
 ### 02 — Document storage and file integrity
 
 Design: [02_document_storage.md](02_document_storage.md). Depends on: 01.
-Status: draft for review; implementation not authorized.
+Status: implementation authorized on 2026-11-02; validation in progress.
+Evidence: [Stage 02 validation record](02_document_storage.md#validation-record).
 
-The draft recommends one paged piece tree with private stable source snapshots,
+The implementation uses one paged piece tree with private stable source snapshots,
 UTF-8 text with preserved BOM/newlines, bounded caches/history, and guarded atomic
-saves. These are proposals, including loading time before editing, resource
-budgets, permission/link policies, and external-writer limitations; they are not
-approved by inclusion here. It delivers a testable storage core; interactive
+saves. Loading time before editing, resource budgets, permission/link policies,
+and external-writer limitations are documented in the stage design and validation
+record. It delivers a testable storage core; interactive
 editing remains Stage 03.
 
 - Select the storage model and define document revisions, range access, edits,

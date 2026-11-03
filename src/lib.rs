@@ -2,6 +2,7 @@
 
 mod app;
 mod command;
+pub mod document;
 mod input;
 mod runtime;
 pub mod status;

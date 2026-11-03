@@ -1,13 +1,13 @@
 # 02 — Document storage and file integrity
 
-Status: **Design draft — awaiting review; implementation is not authorized.**
+Status: **Implementation authorized on 2026-11-02; validation in progress.**
 
 Parent: [MVP overview](overview.md). Depends on Stage 01, squash-merged into
 `feat/initial_mvp` through [PR #1](https://github.com/rapidclock/ede/pull/1).
 Branch: `stage/document_storage`. PR target: `feat/initial_mvp`.
-This branch includes the accepted Stage 01 baseline. This document proposes
-decisions rather than declaring them approved. Stage 02 implementation and later
-stage designs are outside the currently authorized scope.
+This branch includes the accepted Stage 01 baseline. The user authorized Stage 02 implementation on 2026-11-02. The design defaults
+below are the implementation baseline; refinements and actual evidence are
+recorded in the final validation section. Later stage designs remain outside scope.
 
 ## Outcome and boundary
 
@@ -53,9 +53,9 @@ Recheck versions/features/maintenance before implementation and record selection
 do not add a database, async runtime, Ropey, highlighting, or search engine merely
 for this stage. Keep any platform-specific snapshot/metadata calls in one adapter.
 
-## Text and path policy — proposed
+## Text and path policy
 
-| Case | Required behavior on design approval |
+| Case | Required behavior |
 | --- | --- |
 | UTF-8, including ASCII | Supported, without Unicode normalization |
 | Leading UTF-8 BOM | Record as format metadata, omit from logical text offsets, and preserve on save |
@@ -227,10 +227,9 @@ convert cancellation, pending indexing, or partial save commitment into success.
   atomic root/source swap. Retain every live lease/history root, or wait/cancel
   background work; do not compact by materializing the document or forgetting undo.
 
-## Scheduling and resource budgets — proposed starting values
+## Scheduling and resource budgets — initial defaults
 
-These are explicit, tunable implementation limits to benchmark, not previously
-approved user preferences. Use a `StorageLimits` value in core tests/API now;
+These are explicit, tunable implementation limits to benchmark. Use a `StorageLimits` value in core tests/API now;
 configuration-file/UI exposure comes in Stage 09. Caches are shared across open
 documents and leased snapshots rather than multiplied independently per tab.
 
@@ -280,7 +279,7 @@ to stop within 50 ms. No blocking disk operation or indefinite worker join may
 move into the terminal event loop. Stop accepting work on shutdown, cancel
 pre-commit work, and resolve any publishing save before releasing its resources.
 
-## Saving and external changes — proposed
+## Saving and external changes
 
 Use streamed, same-directory temporary output followed by guarded publication.
 Never truncate the destination in place and never fall back to that on failure.
@@ -345,7 +344,7 @@ across arbitrary applications. Approve this limitation or require a different
 coordination model before implementing persistence. Reload/recovery/conflict UI
 belongs to later interaction stages; the core already returns precise outcomes.
 
-## Implementation sequence after approval and authorization
+## Implementation sequence
 
 1. Integrate accepted Stage 01. Add document types, checked ranges, format policy,
    errors, and resource accounting; keep the shell/CLI behavior intact.
@@ -362,7 +361,7 @@ belongs to later interaction stages; the core already returns precise outcomes.
    limitations; PR into `feat/initial_mvp`. A failed feasibility goal requires a fix
    or an explicit reviewed design change, not quiet deferral to the final stage.
 
-Development package version after implementation: proposed `0.0.1-dev.2`.
+Development package version: `0.0.1-dev.2`.
 Rust/toolchain/UI dependency choices remain Stage 01's unless separately changed.
 
 ## Acceptance and evidence
@@ -405,7 +404,7 @@ an agreed deferral before claiming that requirement is verified. Report full-cop
 readiness separately from the 1-second preview goal. Stage 03 measures actual UI
 latency; Stage 10 validates the final integrated, larger-than-RAM experience.
 
-## Decisions to review
+## Implementation baseline decisions
 
 1. One paged engine and private snapshots, accepting temporary disk use and a
    loading interval before editing on filesystems without a fast clone.
@@ -414,8 +413,8 @@ latency; Stage 10 validates the final integrated, larger-than-RAM experience.
 4. Safe-save treatment of links/advanced metadata and the stated external-writer
    race/durability limits.
 
-Approval should resolve these choices before implementation is separately
-authorized. Staging this draft does not authorize application changes or tests.
+Implementation was explicitly authorized on 2026-11-02 using these design
+defaults. Material changes to requirements still need review.
 
 ## Research references
 
@@ -432,6 +431,35 @@ authorized. Staging this draft does not authorize application changes or tests.
 
 ## Validation record
 
-Pending. This stage is a design draft; implementation and validation have not
-been authorized. Record actual results, acceptance evidence, benchmark conditions,
-limitations, and any agreed deferrals here when validation is performed.
+Implementation and validation are in progress. Local macOS fmt, Clippy and the
+current automated suite pass. Linux/macOS CI and memory-constrained benchmarks
+will be recorded here before stage completion is claimed.
+
+### Implementation refinements
+
+- Modules separate resource admission, immutable source readers, document state,
+  disk transactions, snapshots, compaction and the service. The public API is
+  re-exported by `document`; the terminal shell remains unchanged.
+- One worker owns all mutations, opens and saves; a second is reserved for
+  foreground immutable-snapshot reads/line lookups. Snapshot handles duplicate
+  positional-read file descriptors, so background work does not retain a lock
+  needed by the reader worker. Both share aggregate caches and buffer admission.
+- Source indexes use a disk array of cumulative LF counts at fixed block
+  boundaries. Direct prefix lookup and binary search provide the source count-tree
+  operations without resident per-line offsets; edited logical order uses the B+
+  tree's byte/LF weights. Original longest-line information is recorded at open.
+- History roots are fixed-width, append-only disk records with backwards links.
+  Failed edits append unreachable records instead of overwriting redo. Undo text
+  accounting uses a disk bitmap; partial current pages are conservatively charged.
+- Compaction copies live physical pages once using a disk remapping table, then
+  atomically swaps the document generation. It returns Busy while external leases
+  are held. Before more edits, compaction is requested after 64 MiB of node/history
+  storage or text growth beyond the live-state/history allowance plus 1 MiB;
+  callers release leases and retry when required.
+- macOS extended attributes up to a 64 KiB names/value/accounting envelope use
+  native descriptor copying followed by exact verification. ACLs and file flags
+  remain SaveAsRequired; Linux extended attributes, including ACLs, also require
+  Save As. New files retain OS-assigned metadata and mode 0600.
+- Non-UTF-8 filenames are exercised on Linux. APFS rejects their creation; path
+  handling throughout the core still uses OS strings rather than UTF-8 conversion.
+
