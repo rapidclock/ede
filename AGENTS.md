@@ -22,6 +22,11 @@
 - Keep stage specifications concise, clear, and self-contained. Specify behavior,
   interfaces, failure cases, and acceptance criteria in enough detail for a human
   to implement the stage without relying on chat history.
+- End each stage specification with a `Validation record` section. Keep actual
+  check results, acceptance evidence, tested environments, limitations, and agreed
+  deferrals there; do not create a separate validation Markdown file. While a
+  stage is only a design draft, mark validation as pending. Link to this section
+  from the overview and other documentation, and update it as checks are run.
 
 - Approval of a specification does not itself authorize implementation. Follow the
   user's current scope; do not create application scaffolding, implementation,

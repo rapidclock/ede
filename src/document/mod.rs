@@ -1,0 +1,31 @@
+//! Disk-backed UTF-8 documents, independent of terminal state.
+//!
+//! [`Document`] and [`Snapshot`] perform blocking storage work and belong on a
+//! storage worker, never the terminal thread. [`StorageService`] is the bounded,
+//! nonblocking bridge. Logical offsets exclude a leading UTF-8 BOM.
+
+mod bitmap;
+mod cache;
+mod compact;
+mod history;
+mod index;
+mod model;
+mod platform;
+mod resources;
+mod save;
+mod service;
+mod snapshot;
+mod source;
+mod transaction;
+mod tree;
+mod types;
+
+pub use model::Document;
+pub use save::{SaveOutcome, SaveReport, SaveTarget};
+pub use service::{Completion, Job, Request, Response, Shutdown, StorageService, SubmissionError};
+pub use snapshot::{Snapshot, Window};
+pub use transaction::StagedTransaction;
+pub use types::{
+    ByteOffset, Cancellation, DocumentId, Edit, Error, FaultInjector, Format, IoPoint, JobId,
+    Newline, OpenOptions, OpenProgress, Revision, SourceId, StorageLimits, StorageStats, TextRange,
+};

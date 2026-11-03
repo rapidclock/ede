@@ -1,6 +1,6 @@
 # 001 — Initial MVP overview
 
-Status: **MVP scope and stage roadmap accepted — stage 01 complete; PR open for review.**
+Status: **MVP scope and roadmap accepted — Stage 01 merged; Stage 02 complete.**
 
 Project: **ede**, a predominantly Rust terminal text editor for macOS and Linux.
 
@@ -307,9 +307,10 @@ and background services. Route keyboard and mouse actions through the same named
 commands. Background work should use document revisions so stale results cannot
 overwrite current state. Changes should be expressed as undoable transactions.
 
-Ratatui with Crossterm is the leading TUI candidate; Tree-sitter is the leading
-highlighting candidate, with alternatives such as Syntect still open. These are
-research recommendations, not approved dependency or version selections. Compare
+Stage 01 selects Ratatui with Crossterm; its implementation is merged and dependency
+versions are recorded in the stage design. Tree-sitter remains the leading
+highlighting candidate, with alternatives such as Syntect still open. Highlighting
+dependencies are research recommendations, not approved selections. Compare
 runtime/build weight, performance, maintenance, language coverage, compatibility,
 and licenses with the user before choosing. Record any agreed highlighting scope
 deferrals explicitly.
@@ -408,12 +409,15 @@ scratch checkpoints, and responsiveness goals. The user subsequently approved
 proceeding from the overview to the stage breakdown. The MVP scope is approved;
 the architectural proposals and unresolved decisions remain open as identified
 above. On 2026-11-01, the user approved the detailed Stage 01 design and explicitly
-authorized its implementation. Later stages are not authorized for implementation.
+authorized its implementation. Stage 01 is now squash-merged into `feat/initial_mvp`
+through [PR #1](https://github.com/rapidclock/ede/pull/1). The user authorized the
+Stage 02 design while reviewing Stage 01, and explicitly authorized Stage 02
+implementation on 2026-11-02.
 
 The user accepted proceeding one stage at a time: detailed design, review,
 separately authorized implementation, validation, and stage PR before moving on.
-Stage 01 is implemented; the later filenames identify future documents.
-Each detailed design must resolve its prerequisite decisions and define behavior,
+Stage 02 is complete as of 2026-11-03; later filenames identify future documents. Each
+detailed design must resolve its prerequisite decisions and define behavior,
 interfaces, failure cases, and acceptance criteria before its implementation is
 authorized. The stages may be adjusted as we learn.
 
@@ -421,12 +425,15 @@ Dependencies below are minimum functional dependencies. The proposed delivery
 order is 01 through 10, with completed stages integrated into `feat/initial_mvp`
 through stage PRs. Tests and failure handling belong in every stage; stage 10 is
 the final integrated validation, not the first time correctness is checked.
+Each stage specification ends with its validation record, including actual
+results, tested environments, limitations, and agreed deferrals. Keep this
+evidence in the stage file rather than a separate validation document.
 
 ### 01 — Terminal foundation
 
 Design: [01_terminal_foundation.md](01_terminal_foundation.md). Depends on: none.
-Status: complete; [PR #1](https://github.com/rapidclock/ede/pull/1) targets `feat/initial_mvp`.
-Evidence: [Stage 01 validation record](01_validation.md).
+Status: complete; [PR #1](https://github.com/rapidclock/ede/pull/1) merged into `feat/initial_mvp`.
+Evidence: [Stage 01 validation record](01_terminal_foundation.md#validation-record).
 
 - Deliver a buildable Rust application shell with input, resize handling, focus,
   named command routing, and a place to report background work and errors.
@@ -439,7 +446,17 @@ Evidence: [Stage 01 validation record](01_validation.md).
 
 ### 02 — Document storage and file integrity
 
-Planned file: `02_document_storage.md`. Depends on: 01.
+Design: [02_document_storage.md](02_document_storage.md). Depends on: 01.
+Status: complete; [PR #2](https://github.com/rapidclock/ede/pull/2) ready for review.
+Implementation was authorized on 2026-11-02 and completed on 2026-11-03.
+Evidence: [Stage 02 validation record](02_document_storage.md#validation-record).
+
+The implementation uses one paged piece tree with private stable source snapshots,
+UTF-8 text with preserved BOM/newlines, bounded caches/history, and guarded atomic
+saves. Loading time before editing, resource budgets, permission/link policies,
+and external-writer limitations are documented in the stage design and validation
+record. It delivers a testable storage core; interactive
+editing remains Stage 03.
 
 - Select the storage model and define document revisions, range access, edits,
   undo/redo, stable source content, and resource budgets before UI features depend
