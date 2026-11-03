@@ -270,7 +270,7 @@ impl StorageLimits {
             || self.node_page_bytes > 1 << 20
             || self.text_cache_bytes < self.text_page_bytes * 2
             || self.node_cache_bytes < self.node_page_bytes * 4
-            || self.buffer_bytes < self.text_page_bytes * 8
+            || self.buffer_bytes < self.text_page_bytes * 8 + self.node_page_bytes * 8 + (256 << 10)
             || self.undo_transactions == 0
             || self.leases == 0
             || self.queue_entries == 0

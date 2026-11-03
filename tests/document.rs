@@ -694,6 +694,7 @@ fn asynchronous_ownership_backpressure_and_close() {
         .unwrap_or_else(|e| panic!("{}", e.error));
     let completion = receive(&mut service);
     assert_eq!(completion.request, 101);
+    assert_eq!(completion.revision, Some(Revision(0)));
     assert_eq!(completion.job, job.id);
     assert!(matches!(completion.result, Ok(Response::Ready { .. })));
     drop(completion);
@@ -1075,4 +1076,74 @@ fn long_copy_sync_failure_is_atomic() {
     assert!(matches!(result, Err(Error::Io(_))));
     assert_eq!(fs::metadata(&path).unwrap().len(), 9 << 20);
     assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
+}
+
+/// Clone-capable filesystems get independent inodes; fallback preserves the same semantics.
+#[test]
+fn optional_clone_is_stable_under_in_place_writes() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("source");
+    fs::write(&path, b"original").unwrap();
+    let mut configuration = options(directory.path());
+    configuration.force_copy = false;
+    let document = Document::open(&path, configuration, &Cancellation::default(), |_| {}).unwrap();
+    fs::write(&path, b"external").unwrap();
+    assert_eq!(text(&document.snapshot().unwrap()), "original");
+}
+/// Pruning publishes a visible whole-transaction count and never silently removes newest undo.
+#[test]
+fn history_pruning_is_explicit_and_keeps_newest_undo() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut configuration = options(directory.path());
+    configuration.limits.undo_transactions = 2;
+    let mut document = Document::new(configuration).unwrap();
+    for _ in 0..4 {
+        replace(&mut document, 0, 0, "x");
+    }
+    assert_eq!(document.take_history_pruned(), 2);
+    assert_eq!(document.take_history_pruned(), 0);
+    document.undo(document.revision()).unwrap();
+    document.undo(document.revision()).unwrap();
+    assert_eq!(text(&document.snapshot().unwrap()), "xx");
+    let revision = document.revision();
+    assert_eq!(document.undo(revision).unwrap(), revision);
+}
+
+/// Closing tabs cannot evade metadata admission while callers retain old snapshot leases.
+#[test]
+fn retained_closed_snapshots_keep_aggregate_metadata_reservations() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut service = StorageService::new(options(directory.path())).unwrap();
+    let mut held = Vec::new();
+    let mut exhausted = false;
+    for request in 0..64 {
+        let job = service.submit(request * 2, Request::New).unwrap();
+        let completion = receive(&mut service);
+        let id = completion.document;
+        if matches!(completion.result, Err(Error::ResourceLimit(_))) {
+            exhausted = true;
+            break;
+        }
+        assert!(matches!(completion.result, Ok(Response::Ready { .. })));
+        drop(completion);
+        drop(job);
+        let job = service
+            .submit(request * 2 + 1, Request::Snapshot(id))
+            .unwrap();
+        match receive(&mut service).result {
+            Ok(Response::Snapshot(snapshot)) => held.push(snapshot),
+            _ => panic!("expected snapshot"),
+        }
+        service.close(id);
+        drop(job);
+    }
+    assert!(exhausted);
+    assert!(!held.is_empty());
+    drop(held);
+    let job = service.submit(1000, Request::New).unwrap();
+    let completion = receive(&mut service);
+    assert!(matches!(completion.result, Ok(Response::Ready { .. })));
+    drop(completion);
+    drop(job);
+    service.shutdown().wait().unwrap();
 }

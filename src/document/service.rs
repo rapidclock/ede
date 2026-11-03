@@ -483,6 +483,15 @@ fn worker(
             &options,
             resources.clone(),
         );
+        let revision = match &result {
+            Ok(Response::Ready { revision, .. } | Response::Changed { revision, .. }) => {
+                Some(*revision)
+            }
+            Ok(Response::Snapshot(snapshot)) => Some(snapshot.revision()),
+            Ok(Response::Transaction(transaction)) => Some(transaction.expected),
+            Ok(Response::Saved(report)) => Some(report.revision),
+            _ => revision,
+        };
         let completion = Completion {
             job: envelope.job,
             request: envelope.request_id,
@@ -530,7 +539,7 @@ fn execute(
             snapshot.locate_line(line, &envelope.cancel)?,
         )),
         Request::Open(_) | Request::New => {
-            let permit = resources.buffers.acquire(16 << 10)?;
+            let permit = resources.buffers.acquire(4096)?;
             let mut document = if let Request::Open(path) = request {
                 Document::open_shared(
                     &path,
@@ -571,14 +580,6 @@ fn execute(
                 .document;
             match request {
                 Request::Snapshot(_) => Ok(Response::Snapshot(document.snapshot()?)),
-                Request::Read {
-                    snapshot,
-                    start,
-                    max_bytes,
-                } => Ok(Response::Window(snapshot.read_window(start, max_bytes)?)),
-                Request::LocateLine { snapshot, line } => Ok(Response::Line(
-                    snapshot.locate_line(line, &envelope.cancel)?,
-                )),
                 Request::BeginTransaction { expected, .. } => {
                     Ok(Response::Transaction(document.transaction(expected)?))
                 }
@@ -622,7 +623,10 @@ fn execute(
                     document.compact(&envelope.cancel)?;
                     Ok(Response::Compacted)
                 }
-                Request::Open(_) | Request::New => unreachable!("creation handled above"),
+                Request::Read { .. }
+                | Request::LocateLine { .. }
+                | Request::Open(_)
+                | Request::New => unreachable!("reads and creation handled above"),
             }
         }
     }

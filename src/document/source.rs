@@ -1,7 +1,13 @@
 //! Private immutable-prefix text arenas, block indexes and independent read handles.
 use super::{
-    Cancellation, Error, FaultInjector, IoPoint, OpenOptions, SourceId, StorageLimits, cache::Key,
-    history::State, index::LineIndex, platform, resources::Resources, tree::Tree, types::identity,
+    Cancellation, Error, FaultInjector, IoPoint, OpenOptions, SourceId, StorageLimits,
+    cache::Key,
+    history::State,
+    index::LineIndex,
+    platform,
+    resources::{Permit, Resources},
+    tree::Tree,
+    types::identity,
 };
 use std::{
     fs::{File, OpenOptions as FsOpenOptions},
@@ -197,6 +203,7 @@ impl Source {
 
 /// A generation of private working files. Dropping the last reference removes only its directory.
 pub(super) struct Store {
+    _permit: Permit,
     pub source: Source,
     pub tree: Tree,
     pub directory: TempDir,
@@ -243,6 +250,7 @@ impl Store {
         );
         Ok((
             Self {
+                _permit: resources.buffers.acquire(32 << 10)?,
                 source,
                 tree,
                 directory,
@@ -259,40 +267,13 @@ impl Store {
             tree: self.tree.reader()?,
         })
     }
-    /// Read logical bytes through piece boundaries without materializing a line or document.
-    pub fn read(&self, state: State, mut offset: u64, mut out: &mut [u8]) -> Result<(), Error> {
-        if offset
-            .checked_add(out.len() as u64)
-            .is_none_or(|end| end > state.root.entry.bytes)
-        {
-            return Err(Error::InvalidRange);
-        }
-        while !out.is_empty() {
-            let (piece, origin) = self.tree.piece_at(state.root, offset)?;
-            let within = offset - origin;
-            let count = (piece.bytes - within).min(out.len() as u64) as usize;
-            let (target, remaining) = out.split_at_mut(count);
-            self.source.read(piece.id + within, target)?;
-            offset += count as u64;
-            out = remaining;
-        }
-        Ok(())
+    /// Read a logical range through immutable pieces without materializing a line.
+    pub fn read(&self, state: State, offset: u64, out: &mut [u8]) -> Result<(), Error> {
+        read_text(&self.source, &self.tree, state, offset, out)
     }
-    /// Scalar boundary check, optionally also protecting a CRLF editing boundary.
+    /// Validate a scalar endpoint, optionally requiring CRLF edit atomicity.
     pub(super) fn boundary(&self, state: State, offset: u64, editing: bool) -> Result<(), Error> {
-        let length = state.root.entry.bytes;
-        if offset > length {
-            return Err(Error::InvalidRange);
-        }
-        if offset == 0 || offset == length {
-            return Ok(());
-        }
-        let mut pair = [0; 2];
-        self.read(state, offset - 1, &mut pair)?;
-        if pair[1] & 0xc0 == 0x80 || (editing && pair == *b"\r\n") {
-            return Err(Error::InvalidRange);
-        }
-        Ok(())
+        boundary(&self.source, &self.tree, state, offset, editing)
     }
 }
 /// Independent immutable-prefix read handles; the snapshot also pins its owner directory.
@@ -301,42 +282,16 @@ pub(super) struct Reader {
     pub tree: Tree,
 }
 impl Reader {
-    /// Read logical bytes through piece boundaries without materializing a line or document.
-    pub fn read(&self, state: State, mut offset: u64, mut out: &mut [u8]) -> Result<(), Error> {
-        if offset
-            .checked_add(out.len() as u64)
-            .is_none_or(|end| end > state.root.entry.bytes)
-        {
-            return Err(Error::InvalidRange);
-        }
-        while !out.is_empty() {
-            let (piece, origin) = self.tree.piece_at(state.root, offset)?;
-            let within = offset - origin;
-            let count = (piece.bytes - within).min(out.len() as u64) as usize;
-            let (target, remaining) = out.split_at_mut(count);
-            self.source.read(piece.id + within, target)?;
-            offset += count as u64;
-            out = remaining;
-        }
-        Ok(())
+    /// Read a logical range through immutable pieces without materializing a line.
+    pub fn read(&self, state: State, offset: u64, out: &mut [u8]) -> Result<(), Error> {
+        read_text(&self.source, &self.tree, state, offset, out)
     }
-    /// Scalar boundary check, optionally also protecting a CRLF editing boundary.
+    /// Validate a scalar endpoint, optionally requiring CRLF edit atomicity.
     pub(super) fn boundary(&self, state: State, offset: u64, editing: bool) -> Result<(), Error> {
-        let length = state.root.entry.bytes;
-        if offset > length {
-            return Err(Error::InvalidRange);
-        }
-        if offset == 0 || offset == length {
-            return Ok(());
-        }
-        let mut pair = [0; 2];
-        self.read(state, offset - 1, &mut pair)?;
-        if pair[1] & 0xc0 == 0x80 || (editing && pair == *b"\r\n") {
-            return Err(Error::InvalidRange);
-        }
-        Ok(())
+        boundary(&self.source, &self.tree, state, offset, editing)
     }
 }
+
 /// Create a private read/write session file; no accidental reuse of stale paths.
 pub(super) fn private_file(path: &Path) -> Result<File, Error> {
     let file = FsOpenOptions::new()
@@ -347,4 +302,52 @@ pub(super) fn private_file(path: &Path) -> Result<File, Error> {
         .open(path)?;
     file.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
     Ok(file)
+}
+
+/// Traverse logical pieces into an already bounded caller buffer.
+fn read_text(
+    source: &Source,
+    tree: &Tree,
+    state: State,
+    mut offset: u64,
+    mut out: &mut [u8],
+) -> Result<(), Error> {
+    if offset
+        .checked_add(out.len() as u64)
+        .is_none_or(|end| end > state.root.entry.bytes)
+    {
+        return Err(Error::InvalidRange);
+    }
+    while !out.is_empty() {
+        let (piece, origin) = tree.piece_at(state.root, offset)?;
+        let within = offset - origin;
+        let count = (piece.bytes - within).min(out.len() as u64) as usize;
+        let (target, remaining) = out.split_at_mut(count);
+        source.read(piece.id + within, target)?;
+        offset += count as u64;
+        out = remaining;
+    }
+    Ok(())
+}
+/// Validate a logical UTF-8 endpoint and, for edits, an indivisible CRLF pair.
+fn boundary(
+    source: &Source,
+    tree: &Tree,
+    state: State,
+    offset: u64,
+    editing: bool,
+) -> Result<(), Error> {
+    let length = state.root.entry.bytes;
+    if offset > length {
+        return Err(Error::InvalidRange);
+    }
+    if offset == 0 || offset == length {
+        return Ok(());
+    }
+    let mut pair = [0; 2];
+    read_text(source, tree, state, offset - 1, &mut pair)?;
+    if pair[1] & 0xc0 == 0x80 || (editing && pair == *b"\r\n") {
+        return Err(Error::InvalidRange);
+    }
+    Ok(())
 }

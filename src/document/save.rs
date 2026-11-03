@@ -97,7 +97,7 @@ impl Document {
             .source
             .resources
             .buffers
-            .acquire(store.source.limits.text_page_bytes * 4 + 512)?;
+            .acquire(store.source.limits.text_page_bytes * 4 + (256 << 10))?;
         let expected = match &target {
             SaveTarget::Current => Some(
                 self.baseline
