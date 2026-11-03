@@ -1219,3 +1219,33 @@ fn compaction_reclaims_unreachable_text_blocks() {
     document.redo(document.revision()).unwrap();
     assert_eq!(text(&document.snapshot().unwrap()), "c".repeat(count));
 }
+
+/// A multi-replacement batch with no net byte change must preserve revision, save point and redo.
+#[test]
+fn net_zero_transaction_preserves_clean_state_and_redo() {
+    let (_directory, mut document) = fixture("aé\r\n".as_bytes());
+    replace(&mut document, 0, 1, "A");
+    document.undo(document.revision()).unwrap();
+    let revision = document.revision();
+    document
+        .apply(
+            revision,
+            [
+                Edit {
+                    range: TextRange::new(0, 1).unwrap(),
+                    text: "",
+                },
+                Edit {
+                    range: TextRange::new(1, 1).unwrap(),
+                    text: "a",
+                },
+            ],
+            &Cancellation::default(),
+        )
+        .unwrap();
+    assert_eq!(document.revision(), revision);
+    assert!(!document.is_dirty());
+    assert_eq!(text(&document.snapshot().unwrap()), "aé\r\n");
+    document.redo(revision).unwrap();
+    assert_eq!(text(&document.snapshot().unwrap()), "Aé\r\n");
+}

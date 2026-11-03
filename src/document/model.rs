@@ -299,7 +299,18 @@ impl Document {
                 return Err(error);
             }
         };
-        if !changed {
+        let same = if changed && root.entry.bytes == self.current.root.entry.bytes {
+            match same_text(&store, self.current.root, root, cancel) {
+                Ok(same) => same,
+                Err(error) => {
+                    store.source.rollback(old_len, old_lines)?;
+                    return Err(error);
+                }
+            }
+        } else {
+            !changed
+        };
+        if same {
             store.source.rollback(old_len, old_lines)?;
             return Ok(self.revision);
         }
@@ -469,6 +480,39 @@ impl Document {
             original_longest_line: store.original_longest,
         })
     }
+}
+/// Compare equal-length candidate text exactly, skipping unchanged physical ranges.
+/// Buffers stay page-sized; cancelling a net-zero batch still cannot publish a root.
+fn same_text(
+    store: &Store,
+    before: Root,
+    after: Root,
+    cancel: &Cancellation,
+) -> Result<bool, Error> {
+    let mut offset = 0;
+    let mut a = vec![0; store.source.limits.text_page_bytes];
+    let mut b = vec![0; a.len()];
+    while offset < before.entry.bytes {
+        cancel.check()?;
+        let (left, left_origin) = store.tree.piece_at(before, offset)?;
+        let (right, right_origin) = store.tree.piece_at(after, offset)?;
+        let left_start = left.id + (offset - left_origin);
+        let right_start = right.id + (offset - right_origin);
+        let remaining =
+            (left.bytes - (offset - left_origin)).min(right.bytes - (offset - right_origin));
+        if left_start == right_start {
+            offset += remaining;
+            continue;
+        }
+        let count = remaining.min(a.len() as u64) as usize;
+        store.source.read(left_start, &mut a[..count])?;
+        store.source.read(right_start, &mut b[..count])?;
+        if a[..count] != b[..count] {
+            return Ok(false);
+        }
+        offset += count as u64;
+    }
+    Ok(true)
 }
 /// Make a supplied relative path stable against later process cwd changes.
 pub(super) fn absolute(path: &Path) -> Result<PathBuf, Error> {
