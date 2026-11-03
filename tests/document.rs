@@ -852,3 +852,198 @@ fn foreground_reads_progress_during_background_open() {
     drop(read);
     service.shutdown().wait().unwrap();
 }
+
+/// A final-boundary interleaving injects either another writer or cancellation.
+#[derive(Debug)]
+struct PublishHook {
+    point: IoPoint,
+    path: Option<std::path::PathBuf>,
+    cancel: Option<Cancellation>,
+}
+impl FaultInjector for PublishHook {
+    /// Interleave once at the selected boundary without replacing the save's I/O implementation.
+    fn check(&self, point: IoPoint) -> io::Result<()> {
+        if point == self.point {
+            if let Some(path) = &self.path {
+                fs::write(path, b"other writer")?;
+            }
+            if let Some(cancel) = &self.cancel {
+                cancel.cancel();
+            }
+        }
+        Ok(())
+    }
+}
+/// Atomic no-clobber must preserve a path created after save preflight, and known final conflicts.
+#[test]
+fn final_publish_races_never_overwrite_known_changes() {
+    for existing in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("target");
+        if existing {
+            fs::write(&path, b"original").unwrap();
+        }
+        let mut configuration = options(directory.path());
+        configuration.faults = Some(Arc::new(PublishHook {
+            point: IoPoint::Publish,
+            path: Some(path.clone()),
+            cancel: None,
+        }));
+        let mut document = if existing {
+            Document::open(&path, configuration, &Cancellation::default(), |_| {}).unwrap()
+        } else {
+            Document::new(configuration).unwrap()
+        };
+        let target = if existing {
+            SaveTarget::Current
+        } else {
+            SaveTarget::New(path.clone())
+        };
+        let report = document.save(
+            &document.snapshot().unwrap(),
+            target,
+            &Cancellation::default(),
+        );
+        assert_eq!(report.outcome, SaveOutcome::NotCommitted);
+        assert!(matches!(report.error, Some(Error::SaveConflict)));
+        assert_eq!(fs::read(path).unwrap(), b"other writer");
+    }
+}
+/// Cancellation before commit leaves the name untouched; cancellation afterwards cannot deny a save.
+#[test]
+fn save_cancellation_respects_commit_point() {
+    for point in [IoPoint::Publish, IoPoint::DirectorySync] {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("target");
+        let cancel = Cancellation::default();
+        let mut configuration = options(directory.path());
+        configuration.faults = Some(Arc::new(PublishHook {
+            point,
+            path: None,
+            cancel: Some(cancel.clone()),
+        }));
+        let mut document = Document::new(configuration).unwrap();
+        replace(&mut document, 0, 0, "content");
+        let report = document.save(
+            &document.snapshot().unwrap(),
+            SaveTarget::New(path.clone()),
+            &cancel,
+        );
+        if point == IoPoint::Publish {
+            assert_eq!(report.outcome, SaveOutcome::NotCommitted);
+            assert!(!path.exists());
+        } else {
+            assert_eq!(report.outcome, SaveOutcome::Saved, "{:?}", report.error);
+            assert_eq!(fs::read(path).unwrap(), b"content");
+        }
+    }
+}
+/// Native extended metadata is either preserved exactly or rejected before replacement.
+#[test]
+fn extended_metadata_is_preserved_or_requires_save_as() {
+    use std::{ffi::CString, os::fd::AsRawFd};
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("source");
+    fs::write(&path, b"before").unwrap();
+    let original = fs::File::open(&path).unwrap();
+    let name = CString::new("user.ede-storage-test").unwrap();
+    let value = b"metadata\0value";
+    #[cfg(target_os = "macos")]
+    // SAFETY: live descriptor, NUL-terminated name and valid immutable value bytes.
+    let result = unsafe {
+        nix::libc::fsetxattr(
+            original.as_raw_fd(),
+            name.as_ptr(),
+            value.as_ptr().cast(),
+            value.len(),
+            0,
+            0,
+        )
+    };
+    #[cfg(target_os = "linux")]
+    // SAFETY: live descriptor, NUL-terminated name and valid immutable value bytes.
+    let result = unsafe {
+        nix::libc::fsetxattr(
+            original.as_raw_fd(),
+            name.as_ptr(),
+            value.as_ptr().cast(),
+            value.len(),
+            0,
+        )
+    };
+    assert_eq!(result, 0, "{}", io::Error::last_os_error());
+    let mut document = Document::open(
+        &path,
+        options(directory.path()),
+        &Cancellation::default(),
+        |_| {},
+    )
+    .unwrap();
+    replace(&mut document, 0, 6, "after");
+    let report = document.save(
+        &document.snapshot().unwrap(),
+        SaveTarget::Current,
+        &Cancellation::default(),
+    );
+    #[cfg(target_os = "macos")]
+    {
+        assert_eq!(report.outcome, SaveOutcome::Saved, "{:?}", report.error);
+        let file = fs::File::open(&path).unwrap();
+        let mut bytes = [0u8; 256];
+        // SAFETY: valid output buffer, descriptor, name and Darwin positional/flag arguments.
+        let count = unsafe {
+            nix::libc::fgetxattr(
+                file.as_raw_fd(),
+                name.as_ptr(),
+                bytes.as_mut_ptr().cast(),
+                bytes.len(),
+                0,
+                0,
+            )
+        };
+        assert_eq!(count as usize, value.len());
+        assert_eq!(&bytes[..value.len()], value);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        assert_eq!(report.outcome, SaveOutcome::NotCommitted);
+        assert!(matches!(report.error, Some(Error::SaveAsRequired(_))));
+        assert_eq!(fs::read(&path).unwrap(), b"before");
+    }
+}
+/// Eviction-heavy line queries keep exact results for millions of very short lines and one long line.
+#[test]
+fn newline_dense_and_very_long_lines_use_bounded_windows() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("source");
+    use std::io::Write;
+    let mut file = fs::File::create(&path).unwrap();
+    let chunk = b"x\n".repeat(32768);
+    for _ in 0..32 {
+        file.write_all(&chunk).unwrap();
+    } // 1,048,576 terminators, no line-offset array.
+    file.write_all(&vec![b'z'; 1 << 20]).unwrap();
+    drop(file);
+    let mut configuration = options(directory.path());
+    configuration.limits.text_page_bytes = 4096;
+    configuration.limits.text_cache_bytes = 16384;
+    let document = Document::open(path, configuration, &Cancellation::default(), |_| {}).unwrap();
+    let snapshot = document.snapshot().unwrap();
+    assert_eq!(snapshot.line_count(), 1_048_577);
+    for line in [0, 1, 4095, 4096, 500_000, 1_048_576] {
+        let offset = snapshot
+            .locate_line(line, &Cancellation::default())
+            .unwrap();
+        assert_eq!(offset.0, line * 2);
+        assert_eq!(snapshot.line_of_offset(offset).unwrap(), line);
+    }
+    let last = snapshot
+        .locate_line(1_048_576, &Cancellation::default())
+        .unwrap();
+    let window = snapshot.read_window(last, 4096).unwrap();
+    assert_eq!(window.text().len(), 4096);
+    assert_eq!(window.continuation(), Some(ByteOffset(last.0 + 4096)));
+    let stats = document.stats().unwrap();
+    assert_eq!(stats.original_longest_line, 1 << 20);
+    assert!(stats.cache_bytes <= 16384 + 2048);
+}

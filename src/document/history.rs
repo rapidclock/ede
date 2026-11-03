@@ -158,18 +158,31 @@ impl Document {
         candidate: State,
         cancel: &Cancellation,
     ) -> Result<u64, Error> {
-        let bitmap = tempfile::tempfile_in(store.directory.path())?;
+        let mut ranges = super::bitmap::Bitmap::new(
+            store.directory.path(),
+            store
+                .source
+                .length
+                .div_ceil(store.source.limits.text_page_bytes as u64),
+        )?;
+        let mut nodes = super::bitmap::Bitmap::new(store.directory.path(), store.tree.pages)?;
         let page = store.source.limits.text_page_bytes as u64;
-        bitmap.set_len(store.source.length.div_ceil(page))?;
-        let mut offset = 0;
-        while offset < candidate.root.entry.bytes {
-            cancel.check()?;
-            let (piece, _) = store.tree.piece_at(candidate.root, offset)?;
-            let first = piece.id.div_ceil(page);
-            let last = (piece.id + piece.bytes) / page;
-            bitmap_range(&bitmap, first, last, 1, 0)?;
-            offset += piece.bytes;
-        }
+        store.tree.visit(
+            candidate.root,
+            cancel,
+            &mut |id| {
+                nodes.mark(id, id + 1, 1, 0)?;
+                Ok(true)
+            },
+            &mut |piece| {
+                let first = piece.id.div_ceil(page);
+                let last = (piece.id + piece.bytes) / page;
+                if first < last {
+                    ranges.mark(first, last, 1, 0)?;
+                }
+                Ok(())
+            },
+        )?;
         let mut retained = 0u64;
         let mut count = 0;
         let mut index = self.history.cursor;
@@ -177,21 +190,23 @@ impl Document {
         loop {
             cancel.check()?;
             let state = self.history.read(index)?;
-            let mut offset = 0;
-            while offset < state.root.entry.bytes {
-                let (piece, _) = store.tree.piece_at(state.root, offset)?;
-                let pages = bitmap_range(
-                    &bitmap,
-                    piece.id / page,
-                    (piece.id + piece.bytes).div_ceil(page),
-                    2,
-                    3,
-                )?;
-                retained = retained
-                    .checked_add(pages.saturating_mul(page))
-                    .ok_or(Error::ResourceLimit("undo accounting overflow"))?;
-                offset += piece.bytes;
-            }
+            store.tree.visit(
+                state.root,
+                cancel,
+                &mut |id| Ok(nodes.mark(id, id + 1, 2, 3)? != 0),
+                &mut |piece| {
+                    let pages = ranges.mark(
+                        piece.id / page,
+                        (piece.id + piece.bytes).div_ceil(page),
+                        2,
+                        3,
+                    )?;
+                    retained = retained
+                        .checked_add(pages.saturating_mul(page))
+                        .ok_or(Error::ResourceLimit("undo accounting overflow"))?;
+                    Ok(())
+                },
+            )?;
             if retained > store.source.limits.undo_bytes {
                 if count == 0 {
                     return Err(Error::ResourceLimit(
@@ -209,22 +224,4 @@ impl Document {
         }
         Ok(begin)
     }
-}
-/// Bounded disk bitmap range update. Count newly marked bytes not covered by skip bits.
-fn bitmap_range(file: &File, mut start: u64, end: u64, mark: u8, skip: u8) -> Result<u64, Error> {
-    let mut buffer = [0u8; 4096];
-    let mut changed = 0;
-    while start < end {
-        let count = (end - start).min(buffer.len() as u64) as usize;
-        file.read_exact_at(&mut buffer[..count], start)?;
-        for byte in &mut buffer[..count] {
-            if *byte & skip == 0 {
-                *byte |= mark;
-                changed += 1;
-            }
-        }
-        file.write_all_at(&buffer[..count], start)?;
-        start += count as u64;
-    }
-    Ok(changed)
 }

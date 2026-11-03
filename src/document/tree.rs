@@ -440,6 +440,38 @@ impl Tree {
             )?,
         ])
     }
+    /// Traverse a root while allowing shared/already-accounted subtrees to be skipped.
+    pub fn visit(
+        &self,
+        root: Root,
+        cancel: &Cancellation,
+        admit: &mut impl FnMut(u64) -> Result<bool, Error>,
+        piece: &mut impl FnMut(Entry) -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        cancel.check()?;
+        if !admit(root.entry.id)? {
+            return Ok(());
+        }
+        let node = self.read(root)?;
+        if root.height == 0 {
+            for entry in node.entries {
+                piece(entry)?;
+            }
+        } else {
+            for entry in node.entries {
+                self.visit(
+                    Root {
+                        entry,
+                        height: root.height - 1,
+                    },
+                    cancel,
+                    admit,
+                    piece,
+                )?;
+            }
+        }
+        Ok(())
+    }
     /// Verify occupancy, source bounds and weights recursively; used by integrity tests.
     #[cfg(test)]
     pub fn validate(&self, root: Root, source: &Source, is_root: bool) -> Result<(), Error> {

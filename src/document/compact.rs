@@ -24,7 +24,9 @@ impl Document {
         let old_arc = self.store.clone();
         let old = old_arc.lock().map_err(|_| Error::CorruptStorage)?;
         let _buffers = old.source.resources.buffers.acquire(
-            old.source.limits.text_page_bytes * 6 + old.source.limits.node_page_bytes * 8,
+            old.source.limits.text_page_bytes * 6
+                + old.source.limits.node_page_bytes * 8
+                + (128 << 10),
         )?;
         let options = OpenOptions {
             limits: old.source.limits.clone(),

@@ -284,7 +284,9 @@ impl Document {
         }
         let mut store = self.store.lock().map_err(|_| Error::CorruptStorage)?;
         let _buffers = store.source.resources.buffers.acquire(
-            store.source.limits.text_page_bytes * 6 + store.source.limits.node_page_bytes * 8,
+            store.source.limits.text_page_bytes * 6
+                + store.source.limits.node_page_bytes * 8
+                + (128 << 10),
         )?;
         store.source.reserve(transaction.length)?;
         let old_len = store.source.length;
@@ -551,5 +553,47 @@ mod tests {
             .tree
             .validate(document.current.root, &store.source, true)
             .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod integrity_tests {
+    use super::*;
+    use crate::document::ByteOffset;
+
+    /// Corrupt private node headers are reported rather than trusted or interpreted as text.
+    #[test]
+    fn corrupt_node_is_a_typed_error() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("input");
+        fs::write(&path, b"safe text").unwrap();
+        let document = Document::open(
+            path,
+            OpenOptions {
+                working_directory: Some(directory.path().to_owned()),
+                ..OpenOptions::default()
+            },
+            &Cancellation::default(),
+            |_| {},
+        )
+        .unwrap();
+        let store = document.store.lock().unwrap();
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .open(store.directory.path().join("tree"))
+            .unwrap();
+        file.write_all_at(b"badmagic", 0).unwrap();
+        store
+            .source
+            .resources
+            .nodes
+            .lock()
+            .unwrap()
+            .discard_generation(store.source.generation.0);
+        drop(store);
+        assert!(matches!(
+            document.snapshot().unwrap().read_window(ByteOffset(0), 8),
+            Err(Error::CorruptStorage)
+        ));
     }
 }

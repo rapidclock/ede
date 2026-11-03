@@ -4,6 +4,7 @@
 //! storage worker, never the terminal thread. [`StorageService`] is the bounded,
 //! nonblocking bridge. Logical offsets exclude a leading UTF-8 BOM.
 
+mod bitmap;
 mod cache;
 mod compact;
 mod history;

@@ -48,6 +48,22 @@ fn usage() -> Result<(u64, f64), std::io::Error> {
         + (raw.ru_utime.tv_usec + raw.ru_stime.tv_usec) as f64 / 1e6;
     Ok((rss, cpu))
 }
+/// Describe enforced Linux memory limits; page cache is included in the cgroup charge.
+#[cfg(target_os = "linux")]
+fn memory_environment() -> Result<(), Box<dyn Error>> {
+    let membership = std::fs::read_to_string("/proc/self/cgroup")?;
+    if let Some(path) = membership.lines().find_map(|line| line.strip_prefix("0::")) {
+        let directory = std::path::Path::new("/sys/fs/cgroup").join(path.trim_start_matches('/'));
+        let maximum = std::fs::read_to_string(directory.join("memory.max"))?;
+        let swap = std::fs::read_to_string(directory.join("memory.swap.max"))?;
+        println!(
+            "cgroup_memory_max={} cgroup_swap_max={}",
+            maximum.trim(),
+            swap.trim()
+        );
+    }
+    Ok(())
+}
 /// Parse benchmark parameters, run open/read/edit/undo/save, and verify streamed output bytes.
 fn main() -> Result<(), Box<dyn Error>> {
     let mut arguments = std::env::args().skip(1);
@@ -64,7 +80,22 @@ fn main() -> Result<(), Box<dyn Error>> {
         return Err("usage: storage_bench <ordinary|dense|long> <MiB> <copy|clone>".into());
     }
     let length = mib.checked_mul(1 << 20).ok_or("fixture length overflow")?;
+    #[cfg(target_os = "linux")]
+    memory_environment()?;
     let directory = tempfile::tempdir()?;
+    let filesystem = nix::sys::statfs::statfs(directory.path())?;
+    #[cfg(target_os = "linux")]
+    println!(
+        "working_filesystem_type={:#x} temporary_directory={}",
+        filesystem.filesystem_type().0,
+        directory.path().display()
+    );
+    #[cfg(target_os = "macos")]
+    println!(
+        "working_filesystem_type={} temporary_directory={}",
+        filesystem.filesystem_type_name(),
+        directory.path().display()
+    );
     let path = directory.path().join("input");
     generate(&mut File::create(&path)?, pattern, length)?;
     let cancel = Cancellation::default();
@@ -159,7 +190,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let stats = document.stats()?;
     let (rss, cpu) = usage()?;
     println!(
-        "corpus={kind} bytes={length} mode={mode} actual_clone={} cache=warm-generated preview_ms={:.3} ready_index_ms={:.3} max_first_read_ms={:.3} max_edit_ms={:.3} save_ms={:.3} peak_rss_bytes={rss} managed_cache_bytes={} working_text_bytes={} working_metadata_bytes={} cpu_seconds={:.3}",
+        "corpus={kind} bytes={length} mode={mode} actual_clone={} cache=generated-no-flush preview_ms={:.3} ready_index_ms={:.3} max_first_read_ms={:.3} max_edit_ms={:.3} save_ms={:.3} peak_rss_bytes={rss} managed_cache_bytes={} working_text_bytes={} working_metadata_bytes={} cpu_seconds={:.3}",
         stats.snapshot_cloned,
         ms(preview.ok_or("missing preview")?),
         ms(ready),

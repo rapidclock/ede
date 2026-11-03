@@ -42,13 +42,19 @@ jobs:
       - name: Validate large-file storage with constrained memory (Linux)
         if: runner.os == 'Linux'
         run: |
+          findmnt -T /tmp -o TARGET,SOURCE,FSTYPE
+          findmnt -T "$RUNNER_TEMP" -o TARGET,SOURCE,FSTYPE
+          lscpu
+          free -h
           for corpus in ordinary dense long; do
-            sudo systemd-run --quiet --wait --pipe --collect \
+            sudo systemd-run --wait --pipe --collect \
               --property=MemoryMax=8G --property=MemorySwapMax=0 \
+              --setenv="TMPDIR=$RUNNER_TEMP" \
               --property="WorkingDirectory=$GITHUB_WORKSPACE" --uid="$(id -u)" \
               "$GITHUB_WORKSPACE/target/release/examples/storage_bench" "$corpus" 1024 copy
           done
-          sudo systemd-run --quiet --wait --pipe --collect \
+          sudo systemd-run --wait --pipe --collect \
             --property=MemoryMax=256M --property=MemorySwapMax=0 \
+            --setenv="TMPDIR=$RUNNER_TEMP" \
             --property="WorkingDirectory=$GITHUB_WORKSPACE" --uid="$(id -u)" \
             "$GITHUB_WORKSPACE/target/release/examples/storage_bench" ordinary 1024 copy
