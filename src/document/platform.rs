@@ -46,6 +46,17 @@ impl Version {
     pub fn same_object(&self, other: &Self) -> bool {
         self.dev == other.dev && self.ino == other.ino
     }
+    /// Publication may update ctime; all other captured output fields must stay unchanged.
+    pub fn unchanged_after_rename(&self, before: &Self) -> bool {
+        self.same_object(before)
+            && self.len == before.len
+            && self.mode == before.mode
+            && self.uid == before.uid
+            && self.gid == before.gid
+            && self.links == before.links
+            && self.modified == before.modified
+            && self.flags == before.flags
+    }
 }
 /// macOS file flags are metadata that atomic replacement must not silently drop.
 #[cfg(target_os = "macos")]

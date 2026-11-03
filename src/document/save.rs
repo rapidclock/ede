@@ -189,6 +189,8 @@ impl Document {
         if let Some(baseline) = expected {
             check_destination(baseline, &store, cancel)?;
         }
+        cancel.check()?;
+        let staged_version = Version::of(&output.as_file().metadata()?);
         let published = if expected.is_some() {
             output
                 .persist(&destination)
@@ -207,17 +209,23 @@ impl Document {
         parent.sync_all()?;
         store.source.check(IoPoint::Verify)?;
         let version = Version::of(&published.metadata()?);
-        if Version::of(&fs::metadata(&destination)?) != version
+        if !version.unchanged_after_rename(&staged_version)
+            || Version::of(&fs::metadata(&destination)?) != version
             || fs::canonicalize(&supplied)? != destination
         {
             return Err(Error::SaveConflict);
         }
-        Ok(Baseline {
+        let baseline = Baseline {
             state: *snapshot.state,
             supplied,
             resolved: destination,
             version,
-        })
+        };
+        // The published descriptor is externally writable. Its freshly observed metadata
+        // cannot by itself prove that it still contains the state we serialized. Compare
+        // against private bytes too, ignoring cancellation after name publication.
+        check_destination(&baseline, &store, &Cancellation::default())?;
+        Ok(baseline)
     }
 }
 /// Stream preserved BOM followed by logical text using one bounded buffer.

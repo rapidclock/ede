@@ -389,6 +389,171 @@ fn randomized_transactions_match_reference_model() {
         }
     }
 }
+/// Mixed Unicode/CRLF batches, branching history, saves and collection share one reference model.
+#[test]
+fn mixed_text_batches_and_compaction_match_reference_model() {
+    let cancel = Cancellation::default();
+    for seed in [17u64, 91, 527] {
+        let initial = "abé\r\n😀\n".repeat(80);
+        let (directory, mut document) = fixture(initial.as_bytes());
+        let mut states = vec![(0u64, initial)];
+        let mut cursor = 0;
+        let mut saved = 0;
+        let mut identity = 0;
+        let mut random = seed;
+        let mut next_random = || {
+            random = random.wrapping_mul(6364136223846793005).wrapping_add(1);
+            random
+        };
+        for iteration in 0..250 {
+            match next_random() % 12 {
+                0 if cursor > 0 => {
+                    document.undo(document.revision()).unwrap();
+                    cursor -= 1;
+                }
+                1 if cursor + 1 < states.len() => {
+                    document.redo(document.revision()).unwrap();
+                    cursor += 1;
+                }
+                2 => {
+                    let report =
+                        document.save(&document.snapshot().unwrap(), SaveTarget::Current, &cancel);
+                    assert_eq!(report.outcome, SaveOutcome::Saved, "{:?}", report.error);
+                    saved = states[cursor].0;
+                    assert_eq!(
+                        fs::read(directory.path().join("source")).unwrap(),
+                        states[cursor].1.as_bytes()
+                    );
+                }
+                3 => document.compact(&cancel).unwrap(),
+                _ => {
+                    let before = document.snapshot().unwrap();
+                    let current = &states[cursor].1;
+                    let boundaries: Vec<_> = current
+                        .char_indices()
+                        .map(|(i, _)| i)
+                        .chain(std::iter::once(current.len()))
+                        .filter(|&i| {
+                            i == 0
+                                || i == current.len()
+                                || &current.as_bytes()[i - 1..i + 1] != b"\r\n"
+                        })
+                        .collect();
+                    let mut edits = Vec::new();
+                    for _ in 0..3 {
+                        let start = next_random() as usize % boundaries.len();
+                        let end = (start + next_random() as usize % 4).min(boundaries.len() - 1);
+                        let insertion =
+                            ["β", "😀\n", "\r\n", "", "x", "\u{feff}"][next_random() as usize % 6];
+                        edits.push((boundaries[start], boundaries[end], insertion));
+                    }
+                    edits.sort_by_key(|&(start, end, _)| (start, end));
+                    let mut last_end = 0;
+                    edits.retain(|&(start, end, _)| {
+                        if start < last_end {
+                            return false;
+                        }
+                        last_end = end;
+                        true
+                    });
+                    let mut next = current.clone();
+                    for &(start, end, insertion) in edits.iter().rev() {
+                        next.replace_range(start..end, insertion);
+                    }
+                    let revision = document.revision();
+                    document
+                        .apply(
+                            revision,
+                            edits.iter().map(|&(start, end, insertion)| Edit {
+                                range: TextRange::new(start as u64, end as u64).unwrap(),
+                                text: insertion,
+                            }),
+                            &cancel,
+                        )
+                        .unwrap();
+                    assert_eq!(text(&before), *current);
+                    if next != *current {
+                        identity += 1;
+                        states.truncate(cursor + 1);
+                        states.push((identity, next));
+                        cursor += 1;
+                        while states.len() > 33 {
+                            states.remove(0);
+                            cursor -= 1;
+                        }
+                    } else {
+                        assert_eq!(document.revision(), revision);
+                    }
+                }
+            }
+            let snapshot = document.snapshot().unwrap();
+            let expected = &states[cursor].1;
+            assert_eq!(
+                text(&snapshot),
+                *expected,
+                "seed {seed}, iteration {iteration}"
+            );
+            assert_eq!(document.is_dirty(), states[cursor].0 != saved);
+            let line_starts: Vec<_> = std::iter::once(0)
+                .chain(expected.match_indices('\n').map(|(i, _)| i + 1))
+                .collect();
+            assert_eq!(snapshot.line_count(), line_starts.len() as u64);
+            for (line, &offset) in line_starts.iter().enumerate() {
+                assert_eq!(
+                    snapshot.locate_line(line as u64, &cancel).unwrap(),
+                    ByteOffset(offset as u64)
+                );
+                assert_eq!(
+                    snapshot.line_of_offset(ByteOffset(offset as u64)).unwrap(),
+                    line as u64
+                );
+            }
+            assert_eq!(
+                snapshot
+                    .line_of_offset(ByteOffset(expected.len() as u64))
+                    .unwrap(),
+                line_starts.len() as u64 - 1
+            );
+        }
+    }
+}
+
+/// Failed/cancelled collection cannot publish a partial generation or discard any retained state.
+#[test]
+fn failed_compaction_preserves_current_baseline_undo_and_redo() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("source");
+    fs::write(&path, b"baseline").unwrap();
+    let faults = Arc::new(Faults::default());
+    let mut config = options(directory.path());
+    config.faults = Some(faults.clone());
+    let mut document = Document::open(&path, config, &Cancellation::default(), |_| {}).unwrap();
+    replace(&mut document, 0, 8, "first\r\nβ");
+    replace(&mut document, 0, 5, "second");
+    document.undo(document.revision()).unwrap();
+    let revision = document.revision();
+    *faults.0.lock().unwrap() = Some(IoPoint::Write);
+    assert!(matches!(
+        document.compact(&Cancellation::default()),
+        Err(Error::Io(_))
+    ));
+    *faults.0.lock().unwrap() = None;
+    let cancel = Cancellation::default();
+    cancel.cancel();
+    assert!(matches!(document.compact(&cancel), Err(Error::Cancelled)));
+    assert_eq!(document.revision(), revision);
+    assert_eq!(text(&document.snapshot().unwrap()), "first\r\nβ");
+    document.redo(document.revision()).unwrap();
+    assert_eq!(text(&document.snapshot().unwrap()), "second\r\nβ");
+    document.undo(document.revision()).unwrap();
+    document.undo(document.revision()).unwrap();
+    assert_eq!(text(&document.snapshot().unwrap()), "baseline");
+    assert!(!document.is_dirty());
+    document.compact(&Cancellation::default()).unwrap();
+    document.redo(document.revision()).unwrap();
+    assert_eq!(text(&document.snapshot().unwrap()), "first\r\nβ");
+    assert_eq!(fs::read(path).unwrap(), b"baseline");
+}
 /// Hundreds of simultaneous pieces force multiple B+ levels and wide deletion repair.
 #[test]
 fn fragmented_batches_compact_without_losing_history() {
@@ -768,12 +933,17 @@ fn non_utf8_filename_is_supported() {
 #[derive(Debug, Default)]
 struct Gate {
     armed: std::sync::atomic::AtomicBool,
+    reads: std::sync::atomic::AtomicUsize,
     state: Mutex<(bool, bool)>,
     wake: std::sync::Condvar,
 }
 impl FaultInjector for Gate {
     /// Block only the first armed read; independently readable snapshots remain available.
     fn check(&self, point: IoPoint) -> io::Result<()> {
+        if point == IoPoint::Read {
+            self.reads
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         if point == IoPoint::Read && self.armed.swap(false, std::sync::atomic::Ordering::AcqRel) {
             let mut state = self.state.lock().unwrap();
             state.0 = true;
@@ -791,6 +961,61 @@ impl FaultInjector for Gate {
         }
         Ok(())
     }
+}
+/// Cancelling an in-flight multi-page window must be observed before returning text.
+#[test]
+fn foreground_window_read_observes_in_flight_cancellation() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("input");
+    fs::write(&path, vec![b'a'; 4096]).unwrap();
+    let gate = Arc::new(Gate::default());
+    let mut config = options(directory.path());
+    config.faults = Some(gate.clone());
+    let mut service = StorageService::new(config).unwrap();
+    let opened = service.submit(1, Request::Open(path)).unwrap();
+    assert!(matches!(
+        receive(&mut service).result,
+        Ok(Response::Ready { .. })
+    ));
+    let capture = service
+        .submit(2, Request::Snapshot(opened.document))
+        .unwrap();
+    let snapshot = match receive(&mut service).result {
+        Ok(Response::Snapshot(snapshot)) => snapshot,
+        _ => panic!("expected snapshot"),
+    };
+    let reads_before = gate.reads.load(std::sync::atomic::Ordering::Relaxed);
+    gate.armed.store(true, std::sync::atomic::Ordering::Release);
+    let read = service
+        .submit(
+            3,
+            Request::Read {
+                snapshot,
+                start: ByteOffset(0),
+                max_bytes: 4096,
+            },
+        )
+        .unwrap();
+    let state = gate.state.lock().unwrap();
+    let (state, _) = gate
+        .wake
+        .wait_timeout_while(state, Duration::from_secs(5), |s| !s.0)
+        .unwrap();
+    assert!(state.0);
+    drop(state);
+    read.cancel();
+    gate.state.lock().unwrap().1 = true;
+    gate.wake.notify_all();
+    let completion = receive(&mut service);
+    assert_eq!(completion.job, read.id);
+    assert!(matches!(completion.result, Err(Error::Cancelled)));
+    assert_eq!(
+        gate.reads.load(std::sync::atomic::Ordering::Relaxed),
+        reads_before + 1
+    );
+    drop(completion);
+    drop((opened, capture, read));
+    service.shutdown().wait().unwrap();
 }
 /// A blocked copy must not hold the foreground reader worker or its document lock.
 #[test]
@@ -908,6 +1133,122 @@ fn final_publish_races_never_overwrite_known_changes() {
         assert_eq!(report.outcome, SaveOutcome::NotCommitted);
         assert!(matches!(report.error, Some(Error::SaveConflict)));
         assert_eq!(fs::read(path).unwrap(), b"other writer");
+    }
+}
+/// An observed writer after publication must not turn different disk bytes into a clean save.
+#[test]
+fn post_publish_changes_report_uncertainty_and_keep_edits() {
+    for existing in [false, true] {
+        for point in [IoPoint::DirectorySync, IoPoint::Verify] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("target");
+            if existing {
+                fs::write(&path, b"original").unwrap();
+            }
+            let mut configuration = options(directory.path());
+            configuration.faults = Some(Arc::new(PublishHook {
+                point,
+                path: Some(path.clone()),
+                cancel: None,
+            }));
+            let mut document = if existing {
+                Document::open(&path, configuration, &Cancellation::default(), |_| {}).unwrap()
+            } else {
+                Document::new(configuration).unwrap()
+            };
+            let end = document.snapshot().unwrap().len();
+            replace(&mut document, 0, end, "editor text");
+            let snapshot = document.snapshot().unwrap();
+            let target = if existing {
+                SaveTarget::Current
+            } else {
+                SaveTarget::New(path.clone())
+            };
+            let report = document.save(&snapshot, target, &Cancellation::default());
+            assert_eq!(report.outcome, SaveOutcome::CommittedDurabilityUncertain);
+            assert!(matches!(report.error, Some(Error::SaveConflict)));
+            assert!(document.is_dirty());
+            assert_eq!(text(&snapshot), "editor text");
+            assert_eq!(fs::read(&path).unwrap(), b"other writer");
+            document.undo(document.revision()).unwrap();
+            assert_eq!(
+                text(&document.snapshot().unwrap()),
+                if existing { "original" } else { "" }
+            );
+        }
+    }
+}
+/// Interleave subtle content/metadata changes after the save's final pre-publication checks.
+#[derive(Debug)]
+struct PublishedChange {
+    path: std::path::PathBuf,
+    permissions_only: bool,
+}
+impl FaultInjector for PublishedChange {
+    /// Preserve length/mtime for the text case so checking output metadata alone cannot pass.
+    fn check(&self, point: IoPoint) -> io::Result<()> {
+        if point == IoPoint::Verify {
+            if self.permissions_only {
+                fs::set_permissions(&self.path, fs::Permissions::from_mode(0o777))?;
+            } else {
+                use std::os::unix::fs::FileExt;
+                let file = fs::OpenOptions::new().write(true).open(&self.path)?;
+                let modified = file.metadata()?.modified()?;
+                file.write_all_at(b"other text!", 0)?;
+                file.set_times(fs::FileTimes::new().set_modified(modified))?;
+            }
+        }
+        Ok(())
+    }
+}
+/// Verification checks private bytes and staged metadata rather than trusting a fresh stat.
+#[test]
+fn post_publish_verification_checks_content_and_expected_metadata() {
+    for existing in [false, true] {
+        for permissions_only in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("target");
+            if existing {
+                fs::write(&path, b"original").unwrap();
+            }
+            let mut config = options(directory.path());
+            config.faults = Some(Arc::new(PublishedChange {
+                path: path.clone(),
+                permissions_only,
+            }));
+            let mut document = if existing {
+                Document::open(&path, config, &Cancellation::default(), |_| {}).unwrap()
+            } else {
+                Document::new(config).unwrap()
+            };
+            let end = document.snapshot().unwrap().len();
+            replace(&mut document, 0, end, "editor text");
+            let target = if existing {
+                SaveTarget::Current
+            } else {
+                SaveTarget::New(path.clone())
+            };
+            let report = document.save(
+                &document.snapshot().unwrap(),
+                target,
+                &Cancellation::default(),
+            );
+            assert_eq!(report.outcome, SaveOutcome::CommittedDurabilityUncertain);
+            assert!(matches!(report.error, Some(Error::SaveConflict)));
+            assert!(document.is_dirty());
+            assert_eq!(text(&document.snapshot().unwrap()), "editor text");
+            assert_eq!(
+                fs::read(&path).unwrap(),
+                if permissions_only {
+                    b"editor text"
+                } else {
+                    b"other text!"
+                }
+            );
+            if permissions_only {
+                assert_eq!(fs::metadata(path).unwrap().mode() & 0o777, 0o777);
+            }
+        }
     }
 }
 /// Cancellation before commit leaves the name untouched; cancellation afterwards cannot deny a save.

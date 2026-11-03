@@ -46,6 +46,16 @@ impl fmt::Display for Failure {
 
 impl std::error::Error for Failure {}
 
+impl From<io::Error> for Failure {
+    /// Startup/runtime I/O failures use the ordinary error exit status.
+    fn from(error: io::Error) -> Self {
+        Self {
+            message: error.to_string(),
+            code: 1,
+        }
+    }
+}
+
 /// Start the empty editor shell after validating stdin, stdout, and TERM.
 pub fn run() -> Result<Exit, Failure> {
     let (_sender, inbox) = status::mailbox();
@@ -59,10 +69,11 @@ pub fn run() -> Result<Exit, Failure> {
 /// diagnostics while it is active; the binary suppresses the default panic hook so
 /// panic diagnostics are printed after restoration as well.
 pub fn run_with_status(inbox: StatusInbox) -> Result<Exit, Failure> {
+    terminal::validate()?;
+    // Keep signal subscriptions alive through explicit restoration and the Drop retry.
+    let signals = Signals::register()?;
     let mut session = TerminalSession::new(UnixTerminal);
     guarded(&mut session, |session| {
-        terminal::validate()?;
-        let signals = Signals::register()?;
         session.acquire()?;
         runtime::run(session, &signals, inbox)
     })
@@ -76,10 +87,7 @@ fn guarded<D: TerminalDriver>(
     let result = panic::catch_unwind(AssertUnwindSafe(|| operation(session)));
     let cleanup = session.restore();
     let result = match result {
-        Ok(result) => result.map_err(|error| Failure {
-            message: error.to_string(),
-            code: 1,
-        }),
+        Ok(result) => result.map_err(Failure::from),
         Err(payload) => {
             let text = payload
                 .downcast_ref::<&str>()

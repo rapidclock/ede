@@ -355,3 +355,18 @@ capture are checked as emitted control sequences, without a human visual check.
   integration, highlighting, stream input, and user key remapping remain future
   work. Existing process/global terminal restrictions and upstream shortcut
   interception are documented in the README.
+
+### Review pass — 2026-11-03
+
+Reviewed A01–A11 against the reducer, input bindings, shared layout, bounded
+mailbox, event scheduling, terminal owner, and executable PTY tests. Signal
+subscriptions now outlive both explicit terminal restoration and the session's
+Drop retry, keeping lifecycle ownership clear on error/unwind paths. No new
+Stage 01 acceptance gap was found beyond the already approved manual-environment
+deferrals above. No remote/frontend verification is inferred from this review.
+
+The complete Stage 01 CLI, lifecycle, geometry, scheduler, input and PTY coverage
+passes locally alongside the expanded Stage 02 suite. Formatting, Clippy with
+warnings denied, and Rust API documentation with warnings denied also pass.
+Native Linux/macOS review-fix CI results are recorded in
+[Stage 02's review record](02_document_storage.md#review-pass--2026-11-03).

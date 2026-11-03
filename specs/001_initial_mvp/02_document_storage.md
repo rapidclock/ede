@@ -323,7 +323,11 @@ decision; do not add an unconditional force-overwrite path in Stage 02.
    for an expected existing target, or a tested atomic no-clobber name-creation
    primitive for a new path. Do not implement no-clobber as `exists()` then rename.
 5. After successful name publication, cancellation can no longer mean “not saved.”
-   Attempt parent-directory synchronization and establish the new destination
+   Attempt parent-directory synchronization. Verify the published name/identity,
+   metadata against the staged output (allowing rename's ctime change), and
+   complete bytes against the immutable serialized state. Do not acknowledge an
+   observed external change during this verification or use a fresh stat alone
+   as evidence of success. Establish the new destination
    baseline from the immutable content state serialized, with the newly published
    file's identity/version metadata. Never use the published, externally mutable
    file as the only record of expected baseline bytes. Report one of:
@@ -586,3 +590,50 @@ parent-directory synchronization.
   network-filesystem guarantees remain limited as stated above. No cold-cache,
   reconnect/transport or end-to-end UI performance result is inferred here;
   Stage 01's agreed manual transport deferrals remain recorded in its spec.
+
+### Review pass — 2026-11-03
+
+Reviewed D01–D12 and Stage 01's acceptance criteria against the implementation,
+failure paths and actual test coverage. This review found and fixed:
+
+- **Incorrect save acknowledgement:** an in-place writer after publication could
+  be accepted as the new baseline because verification compared two fresh stats
+  without checking the published bytes. Saves now compare staged output metadata
+  and complete immutable bytes before acknowledging success. Observed post-commit
+  changes retain edits/undo and return `CommittedDurabilityUncertain` with
+  `SaveConflict`; another writer's contents are never rolled back. Cancellation
+  is checked again immediately before publication and ignored for verification
+  after commitment. This adds one bounded sequential read to successful saves.
+- **Missing in-flight window cancellation:** the foreground worker checked
+  cancellation only before a potentially multi-page read. The cancellable window
+  API now checks between text pages (at most 1 MiB by validated policy), and before
+  returning. The service uses this API; its gated test proves it stops after the
+  current read rather than reading the remaining pages.
+- **Incomplete shutdown after panic:** a failed first worker join returned early,
+  detaching later workers. Shutdown now waits for every worker before reporting
+  failure. A gated second worker verifies the lifetime guarantee.
+
+Both the save acknowledgement and in-flight cancellation regressions failed
+against the prior code and pass after correction. Further tests cover post-commit
+permission changes and same-length changed bytes with restored mtime, 750 seeded
+Unicode/CRLF multi-replacement/history/save/compaction operations, and failed or
+cancelled compaction preserving current state, baseline, undo and redo. Stage 01
+also keeps signal subscriptions alive throughout terminal restoration.
+
+Local macOS: fmt, Clippy with warnings denied, all **59 tests** (18 library,
+3 CLI, 33 document integration, 5 PTY), and Rust API documentation with warnings
+denied pass. Native Linux/macOS review-fix CI is pending publication.
+
+The release 1 GiB ordinary-text forced-copy benchmark with 1,000 retained edits
+passes on the same local APFS host described above: preview 0.547 ms,
+Ready/index 1,913.039 ms, three-position edit maximum 1.085 ms, churn median
+5.467 ms / p95 9.988 ms / maximum 10.821 ms, compaction 234.191 ms, and Save As
+including post-publication byte verification 1,956.229 ms. Peak RSS is 173.7 MiB
+(below the 256 MiB target), managed caches 96.0 MiB, working metadata 21,871,176
+bytes. All 1,000 undos and complete saved-byte verification pass. Cache condition
+is generated/no flush; these are single-host measurements, not UI guarantees.
+
+No outstanding acceptance-blocking defect was identified in the reviewed paths.
+The documented concurrent-writer/filesystem limits and user-approved Stage 01
+manual compatibility deferrals remain; this review does not establish absence of
+all bugs or verify unavailable terminal/remote environments.

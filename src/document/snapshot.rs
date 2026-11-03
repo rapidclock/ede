@@ -46,6 +46,17 @@ impl Snapshot {
     }
     /// Blocking scalar-aligned window read. Use a storage worker, never a UI handler.
     pub fn read_window(&self, start: ByteOffset, max_bytes: usize) -> Result<Window, Error> {
+        self.read_window_with_cancel(start, max_bytes, &Cancellation::default())
+    }
+    /// Read a bounded window, checking cancellation between text pages and before returning.
+    /// An in-progress filesystem call must finish before cancellation can be observed.
+    pub fn read_window_with_cancel(
+        &self,
+        start: ByteOffset,
+        max_bytes: usize,
+        cancel: &Cancellation,
+    ) -> Result<Window, Error> {
+        cancel.check()?;
         let store = &self.reader;
         if max_bytes < 4 {
             return Err(Error::InvalidRange);
@@ -58,7 +69,13 @@ impl Snapshot {
         store.boundary(*self.state, start.0, false)?;
         let count = (self.len() - start.0).min(max_bytes as u64) as usize;
         let mut bytes = vec![0; count];
-        store.read(*self.state, start.0, &mut bytes)?;
+        let mut offset = start.0;
+        for chunk in bytes.chunks_mut(store.source.limits.text_page_bytes) {
+            cancel.check()?;
+            store.read(*self.state, offset, chunk)?;
+            offset += chunk.len() as u64;
+        }
+        cancel.check()?;
         let valid = match std::str::from_utf8(&bytes) {
             Ok(_) => count,
             Err(error) if error.error_len().is_none() => error.valid_up_to(),

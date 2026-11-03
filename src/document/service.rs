@@ -270,12 +270,17 @@ pub struct Shutdown {
 impl Shutdown {
     /// Resolve in-flight publishing saves and release owner-scoped working storage.
     pub fn wait(self) -> Result<(), Error> {
+        let mut panicked = false;
         for worker in self.workers {
-            worker
-                .join()
-                .map_err(|_| Error::Io(std::io::Error::other("storage worker panicked")))?;
+            // Join every owner even if an earlier one panicked. Returning early would
+            // detach later workers while they still own in-flight operations/resources.
+            panicked |= worker.join().is_err();
         }
-        Ok(())
+        if panicked {
+            Err(Error::Io(std::io::Error::other("storage worker panicked")))
+        } else {
+            Ok(())
+        }
     }
 }
 impl StorageService {
@@ -534,7 +539,11 @@ fn execute(
             snapshot,
             start,
             max_bytes,
-        } => Ok(Response::Window(snapshot.read_window(start, max_bytes)?)),
+        } => Ok(Response::Window(snapshot.read_window_with_cancel(
+            start,
+            max_bytes,
+            &envelope.cancel,
+        )?)),
         Request::LocateLine { snapshot, line } => Ok(Response::Line(
             snapshot.locate_line(line, &envelope.cancel)?,
         )),
@@ -629,5 +638,47 @@ fn execute(
                 | Request::New => unreachable!("reads and creation handled above"),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A panicked owner cannot cause shutdown to detach a second still-running worker.
+    #[test]
+    fn shutdown_joins_every_worker_after_a_panic() {
+        let finished = Arc::new(AtomicBool::new(false));
+        let worker_finished = finished.clone();
+        let (release, gate) = mpsc::channel();
+        let failing = thread::spawn(|| panic!("injected worker panic"));
+        let later = thread::spawn(move || {
+            gate.recv().unwrap();
+            worker_finished.store(true, Ordering::Release);
+        });
+        let (result_sender, result_receiver) = mpsc::channel();
+        let waiter = thread::spawn(move || {
+            let outcome = Shutdown {
+                workers: vec![failing, later],
+            }
+            .wait();
+            result_sender
+                .send((outcome, finished.load(Ordering::Acquire)))
+                .unwrap();
+        });
+        // An early-return implementation completes while the later worker is gated.
+        let early = result_receiver.recv_timeout(Duration::from_millis(50)).ok();
+        release.send(()).unwrap();
+        let (outcome, finished_at_return) = early.unwrap_or_else(|| {
+            result_receiver
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+        });
+        waiter.join().unwrap();
+        assert!(outcome.is_err());
+        assert!(
+            finished_at_return,
+            "shutdown returned before every worker finished"
+        );
     }
 }
