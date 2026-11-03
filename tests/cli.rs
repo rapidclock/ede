@@ -28,7 +28,7 @@ fn informational_flags_and_argument_errors() {
     for flag in ["--help", "-h", "--version", "-V"] {
         let output = command().arg(flag).env_remove("TERM").output().unwrap();
         assert!(output.status.success());
-        assert!(String::from_utf8_lossy(&output.stdout).contains("0.0.1-dev.1"));
+        assert!(String::from_utf8_lossy(&output.stdout).contains(env!("CARGO_PKG_VERSION")));
         assert!(output.stderr.is_empty());
         assert_plain(&output.stdout);
     }

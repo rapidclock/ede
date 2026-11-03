@@ -1,11 +1,13 @@
 # ede
 
 A Rust terminal text editor for macOS and Linux, built in reviewed stages.
-Current version: **0.0.1-dev.1**.
+Current version: **0.0.1-dev.2**.
 
 Stage 01 provides the terminal shell: keyboard/mouse controls, help, focus,
 resize handling, suspend/resume, and terminal restoration. Opening/editing files
-and piped input arrive in later stages. See the [MVP overview](specs/001_initial_mvp/overview.md).
+and piped input arrive in later stages. Stage 02 adds a separately testable storage
+library; it is not connected to the terminal shell yet.
+See the [MVP overview](specs/001_initial_mvp/overview.md).
 
 ## Build and run
 
@@ -64,10 +66,40 @@ broken connections can prevent cleanup. Scratch recovery is a later stage.
 | `app` | State and command reduction, without terminal I/O |
 | `ui` | Geometry shared by rendering, focus order, and hit-testing |
 | `status` | Bounded/coalesced notifications from future background services |
+| `document` | Private paged text, revisions, transactions, undo/redo, line indexes and guarded saves |
 
 Ratatui and Crossterm provide rendering/input; signal-hook and nix handle Unix
 signals/job control. No async runtime is needed. `vt100` is a test-only dependency
 for inspecting rendered terminal output. `Cargo.lock` fixes the resolved versions.
+The storage core uses `tempfile` for private working/save files and `memchr` for
+bounded text scanning.
+
+## Storage core
+
+`ede::document::Document` offers blocking open, disk-staged edits, undo/redo,
+snapshots, compaction and safe saves. It supports UTF-8 and preserves BOM/newline
+bytes; binary and unsupported encodings fail explicitly. `Snapshot` owns a bounded
+immutable revision lease and returns scalar-aligned windows rather than whole
+lines. Release leases before compaction.
+
+Use `StorageService` from an interactive client: submission, cancellation, close
+and completion polling do not wait on filesystem work. One worker serializes
+mutations; another serves immutable snapshot reads. The direct document API and
+`shutdown().wait()` belong outside the terminal event loop.
+
+Run the reproducible storage benchmark with a real allocated text fixture:
+
+```sh
+cargo run --release --locked --example storage_bench -- ordinary 1024 copy
+```
+
+Corpus choices are `ordinary`, `dense`, and `long`; size is MiB. `clone` attempts a
+filesystem clone with a copy fallback; output reports whether cloning was used.
+An optional fourth argument, up to `1000`, measures repeated edits with default
+undo history (for example `ordinary 1024 copy 1000`). Fixtures live in an isolated
+temporary directory and are removed afterwards.
+Results identify warm generated-file conditions; they do not claim cold-cache or
+end-to-end UI latency. See the [Stage 02 validation record](specs/001_initial_mvp/02_document_storage.md#validation-record).
 
 ## Development checks
 
@@ -81,6 +113,6 @@ Tests include isolated Unix pseudo-terminals and an interactive shell to exercis
 real bytes, kernel terminal settings, resize, signals, and suspend/resume. The
 GitHub Actions workflow runs these checks on Linux and macOS. Pseudo-terminal
 tests do not establish compatibility with every terminal app or remote transport.
-See the [Stage 01 validation record](specs/001_initial_mvp/01_validation.md) for
+See the [Stage 01 validation record](specs/001_initial_mvp/01_terminal_foundation.md#validation-record) for
 tested environments and agreed deferrals. Future stage specifications are written
 and reviewed one at a time, before separately authorized implementation.
