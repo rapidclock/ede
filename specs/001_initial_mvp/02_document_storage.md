@@ -622,7 +622,11 @@ also keeps signal subscriptions alive throughout terminal restoration.
 
 Local macOS: fmt, Clippy with warnings denied, all **59 tests** (18 library,
 3 CLI, 33 document integration, 5 PTY), and Rust API documentation with warnings
-denied pass. Native Linux/macOS review-fix CI is pending publication.
+denied pass. [Review-fix CI](https://github.com/rapidclock/ede/actions/runs/41720605707)
+for runtime commit `cba98ce` passes native Linux fmt, Clippy, all **60 tests**
+(including the Linux-only filename case), and all four swapless 1 GiB benchmarks:
+ordinary/dense/long under the 8 GiB cap, plus ordinary under 256 MiB. The hosted
+macOS job remains queued; the local native macOS checks above are complete.
 
 The release 1 GiB ordinary-text forced-copy benchmark with 1,000 retained edits
 passes on the same local APFS host described above: preview 0.547 ms,
