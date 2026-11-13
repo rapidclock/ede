@@ -1,118 +1,174 @@
 # ede
 
 A Rust terminal text editor for macOS and Linux, built in reviewed stages.
-Current version: **0.0.1-dev.2**.
-
-Stage 01 provides the terminal shell: keyboard/mouse controls, help, focus,
-resize handling, suspend/resume, and terminal restoration. Opening/editing files
-and piped input arrive in later stages. Stage 02 adds a separately testable storage
-library; it is not connected to the terminal shell yet.
-See the [MVP overview](specs/001_initial_mvp/overview.md).
+Current version: **0.0.1-dev.2**. Stage 3 editing is implemented on
+`stage/editing_and_mouse` and has completed local code review; unavailable terminal
+compatibility and CI validation remain pending. See the [MVP overview](specs/001_initial_mvp/overview.md) and
+[Stage 3 validation record](specs/001_initial_mvp/03_editing_and_mouse.md#validation-record).
 
 ## Build and run
 
-Install Rust through rustup. The repository pins Rust 1.99.1 and installs its
-formatting/linting components through `rust-toolchain.toml`.
+Install Rust through rustup. `rust-toolchain.toml` pins the toolchain and its
+formatting/linting components.
 
 ```sh
 cargo build --locked
 cargo run --locked
+cargo run --locked -- path/to/file.txt
+cargo run --locked -- -- -filename.txt
 ```
 
-Run inside a terminal with a usable `TERM`, ideally at least 40 columns by 8 rows.
-Smaller windows show a resize prompt; Ctrl+Q still quits. Informational flags work
-without a terminal:
+Run in a terminal with a usable `TERM`, at least 40 columns by 8 rows. Smaller
+windows preserve work and show a resize prompt; return to a supported size to
+answer unsaved-change prompts. `--help` and `--version` work without a terminal.
+Pipes, tabs, recovery, search, and highlighting belong to later stages.
 
-```sh
-cargo run --locked -- --help
-cargo run --locked -- --version
-```
+Opening validates a private UTF-8 snapshot in the background. Its initial preview
+is read-only; Escape cancels preparation. Once ready, files remain editable
+regardless of total size. Lines do not wrap; horizontal scrolling follows the
+caret. Enter preserves the document's suggested LF/CRLF style, Tab inserts a
+literal tab, and existing bytes are not normalized. Unsupported encodings and
+binary data report errors.
 
 ## Controls
 
-| Action | Control |
-| --- | --- |
-| Help | F1 or Help button |
-| Quit | Ctrl+Q or Quit button |
-| Close help | Escape or Close button |
-| Move focus | Tab / Shift+Tab |
-| Activate focused control | Enter |
-| Suspend / resume | Help → Suspend, then the shell's `fg` command |
-| Save feedback | Ctrl+S reports “No document open” |
-| Copy feedback | Ctrl+C reports “No selection” |
+| Action | Portable shortcut | Additional shortcut when Cmd is delivered |
+| --- | --- | --- |
+| New / Open | Ctrl+N / Ctrl+O | Cmd+N / Cmd+O |
+| Save / Save As | Ctrl+S / F4 | Cmd+S / Cmd+Shift+S |
+| Quit | Ctrl+Q | Cmd+Q |
+| Select all | Ctrl+A | Cmd+A |
+| Cut / Copy / internal paste | Ctrl+X / Ctrl+C / Ctrl+V | Cmd+X / Cmd+C / Cmd+V |
+| Undo / Redo | Ctrl+Z / Ctrl+Y | Cmd+Z / Cmd+Shift+Z |
+| Move / extend selection | Arrows, Home, End, Page Up/Down; Shift extends | Same |
+| Document start / end | Ctrl+Home / Ctrl+End | Same |
+| Go to line or line:cell | Ctrl+G; numbers start at 1 | Same |
+| Help / actions | F1 / F2 | Same |
+| Leave text / previous control | F6 / Shift+F6 | Same |
+| Activate / cancel | Enter / Escape | Same |
 
-Click buttons to activate them. Clicking the empty content area focuses it;
-dragging/wheeling there demonstrates input delivery without editing or scrolling.
-Help is modal. Characters and paste are discarded while no document exists.
-Cmd shortcuts and enhanced keyboard protocols are not required.
+Buttons and the action menu provide alternatives for shortcuts intercepted by a
+terminal. Tab cycles controls in dialogs/help and inserts text in the editor.
+Help scrolls with Up/Down or the wheel; the action menu also scrolls with the wheel. Suspend is available through Help or Actions; resume
+with the shell's `fg` command.
 
-Inside the application, raw input lets Ctrl+S reach Save and Ctrl+C reach Copy.
-The terminal's original settings return on quit or suspension. OS, terminal,
-tmux, and connection software may intercept shortcuts before they reach ede;
-ede does not change those applications' settings.
+Click to place the caret, Shift-click to extend, or drag to select. Dragging beyond
+the text area autoscrolls while the terminal continues reporting pointer events.
+The wheel scrolls the view without moving the caret. Actions → Toggle mouse
+capture pauses capture for terminal-native selection; F2 gives a keyboard route
+to turn it back on. Native-selection modifiers depend on the terminal; use tmux's
+copy mode inside tmux.
 
-SIGINT, SIGTERM, and SIGHUP request cleanup; their exit code is `128 + signal`.
-Suspension requires foreground shell job control. SIGKILL, external SIGSTOP, and
-broken connections can prevent cleanup. Scratch recovery is a later stage.
+Copy/cut use **ede's private internal clipboard**, retained until process exit.
+Ctrl+V, or a directly delivered Cmd+V key, inserts that clipboard. A terminal's
+Paste command sends its external clipboard text through bracketed paste; this is
+a different input path. Both support large contents using disk staging, with no
+arbitrary paste-size cutoff. A paste commits as one undoable edit or leaves the
+document unchanged on validation, staging, space, or pre-commit cancellation
+failure. Bytes within bracketed paste are always data, including Escape. While
+the status shows `Receiving paste`, run the displayed `kill -USR1 PID` command
+from another shell on the editor host to cancel reception. The reader discards
+the rest of that frame through its closing marker. Escape can cancel an admitted
+paste before it commits once the terminal has sent the closing marker.
 
-## Structure
+Save As creates a new destination; it does not overwrite an existing path. Normal
+Save checks the previously acknowledged destination for external changes. Editing
+can continue during saving; a save of older content leaves newer edits unsaved.
+New/Open/Quit prompt before dropping changes, with Cancel selected initially.
+An uncertain save explicitly reports that the destination may have changed.
+
+## Cmd delivery
+
+On a terminal that reports enhanced keyboard support, ede requests disambiguated
+key events and accepts Cmd as Super. Detection does not block startup; unanswered
+or late capability replies retain portable operation. Acquired keyboard/mouse
+modes are restored on exit and suspension.
+
+A terminal can still consume individual Cmd shortcuts. Terminal capability alone
+is insufficient evidence that a particular key reaches ede. A manually configured
+mapping such as Cmd+S → byte `0x13` invokes portable Save instead. ede never changes
+terminal, macOS, or tmux settings automatically. Terminal-specific mapping recipes
+and direct Cmd compatibility are **pending real-terminal validation**; synthetic
+PTY coverage does not establish a tested setup. See the Stage 3 validation record.
+
+For an **unverified candidate iTerm2 mapping**, use a separate test profile and
+add Cmd+S under Settings → Profiles → Keys → Key Mappings, with **Send Hex Code**
+set to `0x13`. The resulting Ctrl+S input is covered by ede's protocol tests;
+physical delivery through iTerm2 still needs a manual check. See iTerm2's
+[key mapping documentation](https://iterm2.com/documentation-preferences-profiles-keys.html).
+iTerm2 recommends the [Kitty protocol over its older CSI-u mode](https://iterm2.com/documentation-csiu.html),
+which matches ede's negotiation. Do not infer all Cmd aliases from one mapping:
+record each shortcut, terminal version, profile and direct/tmux/remote path.
+
+The agreed compatibility scope includes macOS and Linux, direct terminals, tmux,
+and the agreed remote transports. The user's iTerm2 setup is one target within
+that matrix. Local iTerm2 3.7.6 was identified, but this environment blocks GUI
+control of iTerm2, so its real key delivery remains unverified.
+
+## Storage and architecture
 
 | Module | Responsibility |
 | --- | --- |
-| `src/bin/ede.rs` / `lib` | CLI, entry point, deferred error/panic reporting |
-| `terminal` | Acquired modes, restoration, signal flags, job control |
-| `runtime` | One event reader, frame scheduling, side effects |
-| `input` / `command` | Event normalization and shared command identities/bindings |
-| `app` | State and command reduction, without terminal I/O |
-| `ui` | Geometry shared by rendering, focus order, and hit-testing |
-| `status` | Bounded/coalesced notifications from future background services |
-| `document` | Private paged text, revisions, transactions, undo/redo, line indexes and guarded saves |
+| `src/bin/ede.rs` / `lib` | CLI, lifecycle boundary, deferred diagnostics |
+| `terminal` | Terminal modes, signals, suspend/resume |
+| `ingress` / `spool` | Sole stdin reader, bounded VT parsing, streamed paste files |
+| `runtime` | Frame scheduling, worker polling, effects |
+| `input` / `command` | Text/modifier normalization and shared bindings |
+| `app` / `ui` | Modal routing, focus, controls, prepared-frame rendering/hits |
+| `editor` / `text` | Ordered storage coordination, clipboard/history positions, chunked Unicode layout |
+| `document` | Paged text, immutable snapshots, edits, undo/redo, guarded saves |
+| `status` | Bounded notifications |
 
-Ratatui and Crossterm provide rendering/input; signal-hook and nix handle Unix
-signals/job control. No async runtime is needed. `vt100` is a test-only dependency
-for inspecting rendered terminal output. `Cargo.lock` fixes the resolved versions.
-The storage core uses `tempfile` for private working/save files and `memchr` for
-bounded text scanning.
+`ede::document::Document` is a blocking storage API. Interactive clients use
+`StorageService`: bounded submit/poll/cancel operations, a document owner, an
+immutable-read worker, and at most one independent save worker. Saves reconcile
+on the owner before acknowledgement. Snapshot leases pin their storage generation;
+release them before compaction. Terminal restoration precedes worker shutdown
+waits. SIGINT/SIGTERM/SIGHUP use best-effort cleanup and exit `128 + signal`;
+scratch recovery remains Stage 5.
 
-## Storage core
+Ratatui/Crossterm provide rendering and mode commands. A dedicated bounded VT
+reader avoids Crossterm's whole-string paste allocation. The Unicode segmentation
+and width dependencies match Ratatui's resolved versions. Temporary files are
+private and removed when their owners exit. The design uses deliberate disk
+storage rather than depending on OS swap.
 
-`ede::document::Document` offers blocking open, disk-staged edits, undo/redo,
-snapshots, compaction and safe saves. It supports UTF-8 and preserves BOM/newline
-bytes; binary and unsupported encodings fail explicitly. `Snapshot` owns a bounded
-immutable revision lease and returns scalar-aligned windows rather than whole
-lines. Release leases before compaction.
-
-Use `StorageService` from an interactive client: submission, cancellation, close
-and completion polling do not wait on filesystem work. One worker serializes
-mutations; another serves immutable snapshot reads. The direct document API and
-`shutdown().wait()` belong outside the terminal event loop.
-
-Run the reproducible storage benchmark with a real allocated text fixture:
-
-```sh
-cargo run --release --locked --example storage_bench -- ordinary 1024 copy
-```
-
-Corpus choices are `ordinary`, `dense`, and `long`; size is MiB. `clone` attempts a
-filesystem clone with a copy fallback; output reports whether cloning was used.
-An optional fourth argument, up to `1000`, measures repeated edits with default
-undo history (for example `ordinary 1024 copy 1000`). Fixtures live in an isolated
-temporary directory and are removed afterwards.
-Results identify warm generated-file conditions; they do not claim cold-cache or
-end-to-end UI latency. See the [Stage 02 validation record](specs/001_initial_mvp/02_document_storage.md#validation-record).
-
-## Development checks
+## Development and benchmarks
 
 ```sh
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
+cargo run --release --locked --example storage_bench -- ordinary 1024 copy
+EDE_BENCH_MIB=1024 EDE_BENCH_CORPUS=ordinary cargo test --release --locked \
+  --test terminal large_file_interactive_benchmark -- --ignored --exact --nocapture
+EDE_PASTE_MIB=64 cargo test --release --locked --test terminal \
+  large_paste_memory_benchmark -- --ignored --exact --nocapture
+EDE_RESOURCE_MIB=256 cargo test --release --locked --lib \
+  interactive_resource_and_incorporation_measurements -- --ignored --nocapture
+cargo test --locked --test terminal isolated_tmux_editing_and_suspend_smoke \
+  -- --ignored --exact --nocapture
 ```
 
-Tests include isolated Unix pseudo-terminals and an interactive shell to exercise
-real bytes, kernel terminal settings, resize, signals, and suspend/resume. The
-GitHub Actions workflow runs these checks on Linux and macOS. Pseudo-terminal
-tests do not establish compatibility with every terminal app or remote transport.
-See the [Stage 01 validation record](specs/001_initial_mvp/01_terminal_foundation.md#validation-record) for
-tested environments and agreed deferrals. Future stage specifications are written
-and reviewed one at a time, before separately authorized implementation.
+The opt-in interactive benchmark generates an allocated file, opens it in a real
+PTY, measures first displayed text separately from editable Ready, samples
+ordinary event-to-visible latency and editor RSS, navigates/edits beginning,
+middle and end, and checks saving during edits. Corpus choices are `ordinary`,
+`dense`, and `long`; sizes are MiB. Fixtures are isolated and removed afterwards.
+Generated files are warm, and a PTY observer does not measure a graphical terminal
+or remote transport. Linux CI includes a 256 MiB, swap-disabled interactive run;
+its results remain pending until that workflow executes.
+
+The resource probe runs the coordinator and UI against ordinary, dense, long-line
+and mixed Unicode files. It records managed allocation high waters, working-file
+sizes/allocated blocks, and reducer/update/render CPU time separately from terminal
+transport. These counters do not represent total process memory or physical disk
+ownership of shared filesystem-clone blocks.
+For the executable benchmarks, `EDE_BENCH_PEAK_RSS=1` also reports the kernel's
+lifetime peak RSS using `/usr/bin/time` (`-l` on macOS, `-v` on Linux), separately
+from live samples. That tool is needed only for this opt-in measurement.
+
+The storage benchmark also accepts `clone` with a copy fallback and optional
+churn edits (up to 1000). Earlier evidence and agreed deferrals remain in the
+[Stage 1](specs/001_initial_mvp/01_terminal_foundation.md#validation-record) and
+[Stage 2](specs/001_initial_mvp/02_document_storage.md#validation-record) records.

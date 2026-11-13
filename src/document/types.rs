@@ -92,23 +92,47 @@ pub struct Format {
 
 /// Cooperative cancellation; an in-progress OS call may finish before observing it.
 #[derive(Clone, Default, Debug)]
-pub struct Cancellation(Arc<AtomicBool>, Option<Arc<AtomicBool>>);
+pub struct Cancellation {
+    requested: Arc<AtomicBool>,
+    closed: Option<Arc<AtomicBool>>,
+    stopping: Option<Arc<AtomicBool>>,
+    epoch: Option<(Arc<AtomicU64>, u64)>,
+}
 impl Cancellation {
     /// Request cancellation. After save publication this cannot undo the commit.
     pub fn cancel(&self) {
-        self.0.store(true, Ordering::Release);
+        self.requested.store(true, Ordering::Release);
     }
     /// Whether a cancellation request has been issued.
     pub fn is_cancelled(&self) -> bool {
-        self.0.load(Ordering::Acquire)
+        self.requested.load(Ordering::Acquire)
             || self
-                .1
+                .epoch
+                .as_ref()
+                .is_some_and(|(epoch, expected)| epoch.load(Ordering::Acquire) != *expected)
+            || self
+                .closed
+                .as_ref()
+                .is_some_and(|flag| flag.load(Ordering::Acquire))
+            || self
+                .stopping
                 .as_ref()
                 .is_some_and(|flag| flag.load(Ordering::Acquire))
     }
-    /// Attach a document-close flag without allocating per-document job lists.
-    pub(super) fn linked(parent: Arc<AtomicBool>) -> Self {
-        Self(Arc::new(AtomicBool::new(false)), Some(parent))
+    /// Link document close and runtime shutdown without maintaining job lists.
+    pub(crate) fn linked(closed: Arc<AtomicBool>, stopping: Arc<AtomicBool>) -> Self {
+        Self {
+            closed: Some(closed),
+            stopping: Some(stopping),
+            ..Self::default()
+        }
+    }
+    /// Share explicit cancellation while rejecting a superseded background view generation.
+    pub(crate) fn for_epoch(&self, epoch: Arc<AtomicU64>, expected: u64) -> Self {
+        Self {
+            epoch: Some((epoch, expected)),
+            ..self.clone()
+        }
     }
     /// Return a typed cancellation failure at a safe operation boundary.
     pub(super) fn check(&self) -> Result<(), Error> {
@@ -146,6 +170,8 @@ pub enum Error {
     SaveConflict,
     /// This destination cannot safely be replaced under the current policy.
     SaveAsRequired(&'static str),
+    /// A save worker panicked; publication may have occurred and needs explicit user attention.
+    SaveWorkerPanicked,
     /// No additional bounded request/lease can currently be admitted.
     Busy,
     /// A private storage page failed validation.
@@ -171,6 +197,9 @@ impl fmt::Display for Error {
             Self::ResourceLimit(reason) => write!(f, "Storage resource limit: {reason}"),
             Self::SaveConflict => f.write_str("Destination changed; save conflict"),
             Self::SaveAsRequired(reason) => write!(f, "Save As required: {reason}"),
+            Self::SaveWorkerPanicked => {
+                f.write_str("Save worker stopped; destination may have changed")
+            }
             Self::Busy => f.write_str("Storage busy; retry after releasing work"),
             Self::CorruptStorage => f.write_str("Invalid private storage page"),
             Self::Closed => f.write_str("Document closed"),
@@ -294,6 +323,10 @@ pub struct StorageStats {
     pub snapshot_cloned: bool,
     /// Resident cache allocations including cache-key/accounting allowance.
     pub cache_bytes: usize,
+    /// Sum of the individual text/node cache-pool peaks (a conservative aggregate high water).
+    pub cache_high_water_bytes: usize,
+    /// Highest admitted aggregate storage buffer charge, including queued/in-flight jobs.
+    pub buffer_high_water_bytes: usize,
     /// Current immutable source bytes allocated in the working store.
     pub text_bytes: u64,
     /// Tree, index, and history working bytes.

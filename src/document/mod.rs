@@ -22,7 +22,9 @@ mod types;
 
 pub use model::Document;
 pub use save::{SaveOutcome, SaveReport, SaveTarget};
-pub use service::{Completion, Job, Request, Response, Shutdown, StorageService, SubmissionError};
+pub use service::{
+    Completion, DocumentInfo, Job, Request, Response, Shutdown, StorageService, SubmissionError,
+};
 pub use snapshot::{Snapshot, Window};
 pub use transaction::StagedTransaction;
 pub use types::{

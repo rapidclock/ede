@@ -32,7 +32,10 @@ impl StatusMessage {
     pub fn new(severity: Severity, text: &str) -> Self {
         Self {
             severity,
-            text: text.chars().filter(|c| !c.is_control()).take(256).collect(),
+            text: crate::text::safe(&text.chars().take(256).collect::<String>())
+                .chars()
+                .take(256)
+                .collect(),
         }
     }
 

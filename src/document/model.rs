@@ -456,23 +456,32 @@ impl Document {
     /// Current measured disk/cache/line state without an unbounded metadata walk.
     pub fn stats(&self) -> Result<StorageStats, Error> {
         let store = self.store.lock().map_err(|_| Error::CorruptStorage)?;
-        Ok(StorageStats {
-            snapshot_cloned: store.cloned,
-            cache_bytes: store
+        // End each cache lock before taking another. Temporary guards inside a
+        // struct initializer otherwise live to its end and can relock the same mutex.
+        let (text_bytes, text_peak) = {
+            let cache = store
                 .source
                 .resources
                 .text
                 .lock()
-                .map_err(|_| Error::CorruptStorage)?
-                .bytes()
-                + store
-                    .source
-                    .resources
-                    .nodes
-                    .lock()
-                    .map_err(|_| Error::CorruptStorage)?
-                    .bytes(),
+                .map_err(|_| Error::CorruptStorage)?;
+            (cache.bytes(), cache.high_water())
+        };
+        let (node_bytes, node_peak) = {
+            let cache = store
+                .source
+                .resources
+                .nodes
+                .lock()
+                .map_err(|_| Error::CorruptStorage)?;
+            (cache.bytes(), cache.high_water())
+        };
+        Ok(StorageStats {
+            snapshot_cloned: store.cloned,
+            cache_bytes: text_bytes + node_bytes,
             text_bytes: store.source.len(),
+            cache_high_water_bytes: text_peak + node_peak,
+            buffer_high_water_bytes: store.source.resources.buffers.high_water(),
             metadata_bytes: store.tree.disk_bytes()
                 + store.source.index.disk_bytes(store.source.length)
                 + self.history.disk_bytes()?,

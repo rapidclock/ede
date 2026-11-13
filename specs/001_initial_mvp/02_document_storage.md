@@ -1,6 +1,6 @@
 # 02 — Document storage and file integrity
 
-Status: **Complete — ready for review in [PR #2](https://github.com/rapidclock/ede/pull/2).**
+Status: **Complete — squash-merged into `feat/initial_mvp` through [PR #2](https://github.com/rapidclock/ede/pull/2).**
 
 Parent: [MVP overview](overview.md). Depends on Stage 01, squash-merged into
 `feat/initial_mvp` through [PR #1](https://github.com/rapidclock/ede/pull/1).
