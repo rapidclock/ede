@@ -5,13 +5,17 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crossterm::event;
+use crate::{
+    editor::{Action, After, Editor},
+    ingress::Ingress,
+};
 use ratatui::{Terminal, TerminalOptions, Viewport, backend::CrosstermBackend, layout::Rect};
+use std::path::PathBuf;
 
 use crate::{
     Exit,
     app::{AppState, Intent},
-    input::{self, Input},
+    input::Input,
     status::{Severity, StatusInbox, StatusMessage},
     terminal::{Signals, TerminalSession, UnixTerminal},
     ui::{self, LayoutSnapshot},
@@ -38,10 +42,22 @@ trait Host {
     fn suspend_requested(&self) -> bool;
     /// Take a SIGCONT notification requiring a fresh frame.
     fn continued(&self) -> bool;
+    /// Take a paste cancellation that arrived outside the terminal byte stream.
+    fn cancel_paste_requested(&self) -> bool {
+        false
+    }
     /// Restore/suspend/reacquire, returning false when job control is unavailable.
     fn suspend(&mut self) -> io::Result<bool>;
     /// Clear backend state so the next frame fully redraws after continuation.
     fn clear(&mut self) -> io::Result<()>;
+    /// Acquire an enhanced keyboard mode after asynchronous capability detection.
+    fn keyboard(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+    /// Toggle mouse reporting without altering the user's terminal settings.
+    fn mouse(&mut self, _enabled: bool) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 /// Concrete session adapter; backend rendering and lifecycle ownership remain separate.
@@ -50,6 +66,7 @@ struct TerminalHost<'a> {
     session: &'a mut TerminalSession<UnixTerminal>,
     signals: &'a Signals,
     started: Instant,
+    ingress: Ingress,
 }
 
 impl Host for TerminalHost<'_> {
@@ -57,13 +74,9 @@ impl Host for TerminalHost<'_> {
     fn now(&self) -> Duration {
         self.started.elapsed()
     }
-    /// Crossterm poll/read are called on this thread only.
+    /// Receive normalized events from the sole bounded terminal reader.
     fn input(&mut self, timeout: Duration) -> io::Result<Option<Input>> {
-        if event::poll(timeout)? {
-            Ok(input::normalize(event::read()?))
-        } else {
-            Ok(None)
-        }
+        self.ingress.input(timeout)
     }
     /// Render the same geometry later used for mouse routing.
     fn draw(&mut self, app: &AppState, layout: &LayoutSnapshot) -> io::Result<()> {
@@ -90,9 +103,20 @@ impl Host for TerminalHost<'_> {
     fn continued(&self) -> bool {
         self.signals.continued()
     }
+    fn cancel_paste_requested(&self) -> bool {
+        self.signals.cancel_paste_requested()
+    }
     /// Restore and stop outside the reducer and signal handler.
     fn suspend(&mut self) -> io::Result<bool> {
         self.session.suspend()
+    }
+    /// Enhanced input state belongs to the same lifecycle guard as raw/mouse modes.
+    fn keyboard(&mut self) -> io::Result<()> {
+        self.session.set_keyboard()
+    }
+    /// Preserve capture choice across suspension and restore it on exit.
+    fn mouse(&mut self, enabled: bool) -> io::Result<()> {
+        self.session.set_mouse(enabled)
     }
     /// Invalidate Ratatui's previous buffer following re-entry.
     fn clear(&mut self) -> io::Result<()> {
@@ -108,6 +132,7 @@ pub(crate) fn run(
     session: &mut TerminalSession<UnixTerminal>,
     signals: &Signals,
     inbox: StatusInbox,
+    path: Option<PathBuf>,
 ) -> io::Result<Exit> {
     let (width, height) = crossterm::terminal::size()?;
     // The event loop owns resize/layout changes. A fixed viewport prevents Ratatui
@@ -118,24 +143,80 @@ pub(crate) fn run(
             viewport: Viewport::Fixed(Rect::new(0, 0, width, height)),
         },
     )?;
+    let mut editor = Editor::new(path)?;
     let mut host = TerminalHost {
         terminal,
         session,
         signals,
         started: Instant::now(),
+        ingress: Ingress::new()?,
     };
-    event_loop(&mut host, inbox)
+    let result = event_loop_impl(&mut host, inbox, Some(&mut editor));
+    host.ingress.stop();
+    let worker = editor.shutdown();
+    let restoration = host.session.restore();
+    host.ingress.join();
+    drop(host);
+    if let Some(worker) = worker {
+        let _ = worker.join();
+    }
+    restoration?;
+    result
 }
 
 /// Own UI state, checking signals between individual events even during an input flood.
-fn event_loop(host: &mut impl Host, inbox: StatusInbox) -> io::Result<Exit> {
+fn event_loop_impl(
+    host: &mut impl Host,
+    inbox: StatusInbox,
+    mut editor: Option<&mut Editor>,
+) -> io::Result<Exit> {
     let mut app = AppState::new();
     let mut area = host.area()?;
     let mut layout = LayoutSnapshot::new(area, app.help, 0);
     let mut rendered_generation = None;
     let mut last_draw = None;
+    let mut requested_geometry = None;
+    let mut drag_scroll = false;
 
     loop {
+        if let Some(signal) = host.termination() {
+            return Ok(Exit { code: 128 + signal });
+        }
+        if host.cancel_paste_requested()
+            && !app.cancel_receiving_paste()
+            && let Some(bridge) = editor.as_deref()
+        {
+            bridge.cancel_paste();
+        }
+        if let Some(bridge) = editor.as_deref_mut() {
+            if bridge.failed() {
+                return Err(io::Error::other(
+                    "Editor worker stopped unexpectedly; terminal restored on exit",
+                ));
+            }
+            if let Some(screen) = bridge.screen() {
+                let pending = bridge.pending(screen.acknowledged);
+                app.update(screen, pending);
+                if drag_scroll && !pending {
+                    drag_scroll = false;
+                    if let Some(intent) = app.drag_hit(&layout)
+                        && effect(intent, host, &mut app, Some(bridge))?
+                    {
+                        return Ok(Exit { code: 0 });
+                    }
+                }
+            }
+            for _ in 0..16 {
+                let Ok(event) = bridge.events.try_recv() else {
+                    break;
+                };
+                if let Some(intent) = app.event(event)
+                    && effect(intent, host, &mut app, Some(bridge))?
+                {
+                    return Ok(Exit { code: 0 });
+                }
+            }
+        }
         if let Some(signal) = host.termination() {
             return Ok(Exit { code: 128 + signal });
         }
@@ -157,10 +238,27 @@ fn event_loop(host: &mut impl Host, inbox: StatusInbox) -> io::Result<Exit> {
             };
             app.notify(message);
         }
-        if layout.area != area || layout.help_open != app.help {
-            layout = LayoutSnapshot::new(area, app.help, layout.generation.wrapping_add(1));
+        reconcile_layout(area, &mut app, &mut layout);
+        if let Some(intent) = app.tick(host.now(), &layout) {
+            drag_scroll = true;
+            if effect(intent, host, &mut app, editor.as_deref_mut())? {
+                return Ok(Exit { code: 0 });
+            }
         }
-        app.sync_layout(&layout);
+        // A timer can submit a pasted path and close its dialog. Reconcile that
+        // change before drawing or reading another key, just like input effects.
+        reconcile_layout(area, &mut app, &mut layout);
+        let geometry = (area.width, area.height.saturating_sub(2), layout.generation);
+        if requested_geometry != Some(geometry) {
+            if let Some(bridge) = editor.as_deref_mut() {
+                if bridge.submit(Action::Size(geometry.0, geometry.1, geometry.2)) {
+                    requested_geometry = Some(geometry);
+                    app.pending = true;
+                }
+            } else {
+                requested_geometry = Some(geometry);
+            }
+        }
         let now = host.now();
         let elapsed = last_draw.map(|last| now.saturating_sub(last));
         if rendered_generation.is_none()
@@ -181,11 +279,26 @@ fn event_loop(host: &mut impl Host, inbox: StatusInbox) -> io::Result<Exit> {
         } else {
             POLL_INTERVAL
         };
+        // A pending interaction may finish just after the previous poll. Check its
+        // result promptly; idle sessions retain the longer low-overhead wait.
+        let timeout = if app.pending {
+            timeout.min(Duration::from_millis(2))
+        } else {
+            timeout
+        };
         let Some(input) = host.input(timeout)? else {
             continue;
         };
+        if matches!(input, Input::KeyboardSupported) {
+            if host.now() <= Duration::from_millis(500) {
+                host.keyboard()?;
+            }
+            continue;
+        }
         // Coalesced resize/overlay changes must reach the screen before pointer hit-testing.
-        if matches!(input, Input::Pointer(_)) && rendered_generation != Some(layout.generation) {
+        if matches!(input, Input::Pointer(_))
+            && (app.dirty || rendered_generation != Some(layout.generation))
+        {
             draw(
                 host,
                 &mut app,
@@ -197,16 +310,82 @@ fn event_loop(host: &mut impl Host, inbox: StatusInbox) -> io::Result<Exit> {
         if let Input::Resize(width, height) = input {
             area = Rect::new(0, 0, width, height);
         }
-        match app.input(input, &layout) {
-            Some(Intent::Quit) => return Ok(Exit { code: 0 }),
-            Some(Intent::Suspend) => {
-                suspend(host, &mut app)?;
+        if let Some(intent) = app.input(input, &layout) {
+            let suspended = matches!(intent, Intent::Suspend);
+            if effect(intent, host, &mut app, editor.as_deref_mut())? {
+                return Ok(Exit { code: 0 });
+            }
+            if suspended {
                 area = host.area()?;
                 rendered_generation = None;
             }
-            None => {}
         }
     }
+}
+
+/// Keep displayed controls and focus consistent after asynchronous or timer-driven transitions.
+fn reconcile_layout(area: Rect, app: &mut AppState, layout: &mut LayoutSnapshot) {
+    if layout.area != area || layout.signature != LayoutSnapshot::signature(app) {
+        *layout = LayoutSnapshot::for_app(area, app, layout.generation.wrapping_add(1));
+    }
+    app.sync_layout(layout);
+}
+
+/// Apply effects outside the reducer. Queue exhaustion is explicit and never drops accepted text.
+fn effect(
+    intent: Intent,
+    host: &mut impl Host,
+    app: &mut AppState,
+    editor: Option<&mut Editor>,
+) -> io::Result<bool> {
+    match intent {
+        Intent::Quit => return Ok(true),
+        Intent::Suspend => suspend(host, app)?,
+        Intent::MouseCapture(enabled) => host.mouse(enabled)?,
+        Intent::CancelWork => {
+            if let Some(editor) = editor {
+                editor.cancel();
+            }
+        }
+        Intent::Editor(action) => {
+            if let Some(editor) = editor {
+                if matches!(action, Action::Guard(_)) && app.screen.loading {
+                    editor.cancel();
+                }
+                let save_dialog = matches!(action, Action::Save(None));
+                let guard = matches!(action, Action::Guard(_) | Action::Discard(..));
+                let replacing = matches!(action, Action::New | Action::Open(_));
+                if editor.submit(action) {
+                    if guard {
+                        app.expect_guard(editor.sequence());
+                    }
+                    if replacing {
+                        app.screen.loading = true;
+                    }
+                    if save_dialog {
+                        app.expect_save_dialog(editor.sequence());
+                    }
+                    app.pending = true;
+                    app.dirty = true;
+                } else {
+                    let message = "Busy: input rejected; retry when ready";
+                    // Keep rejection visible even when a pending worker immediately
+                    // replaces the status row with its next ordinary completion.
+                    app.event(crate::editor::Event::Failure(message.into()));
+                    app.notify(StatusMessage::new(Severity::Warning, message));
+                }
+            } else if matches!(action, Action::Guard(After::Quit)) {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+#[cfg(test)]
+/// Exercise the scheduler independently of real storage or worker timing.
+fn event_loop(host: &mut impl Host, inbox: StatusInbox) -> io::Result<Exit> {
+    event_loop_impl(host, inbox, None)
 }
 
 /// Draw and update scheduler bookkeeping in one place, including forced pointer-layout frames.
@@ -249,12 +428,52 @@ mod tests {
     use crossterm::event::{KeyModifiers, MouseEvent, MouseEventKind};
     use std::{cell::Cell, collections::VecDeque};
 
+    /// Deferred field submission must replace dialog geometry/focus before the next key.
+    #[test]
+    fn deferred_path_submission_reconciles_focus_and_geometry() {
+        use crate::{
+            app::{Modal, PathKind},
+            editor::Event,
+            spool::Spool,
+            ui::Control,
+        };
+        use std::sync::Arc;
+        let area = Rect::new(0, 0, 80, 24);
+        let mut app = AppState::new();
+        app.screen.loading = false;
+        app.modal = Some(Modal::Path(PathKind::Save, String::new()));
+        app.focus = Some(Control::PathField);
+        let mut layout = LayoutSnapshot::for_app(area, &app, 1);
+        let mut spool = Spool::new().unwrap();
+        spool.append(b"destination").unwrap();
+        assert!(matches!(
+            app.input(Input::Paste(Arc::new(spool)), &layout),
+            Some(Intent::Editor(Action::FieldPaste(_, 0)))
+        ));
+        app.input(Input::Command(Command::Newline), &layout);
+        app.event(Event::FieldPaste(0, Ok("destination".into())));
+        reconcile_layout(area, &mut app, &mut layout);
+        assert!(matches!(
+            app.tick(Duration::ZERO, &layout),
+            Some(Intent::Editor(Action::Save(Some(_))))
+        ));
+        reconcile_layout(area, &mut app, &mut layout);
+        assert_eq!(layout.signature, LayoutSnapshot::signature(&app));
+        assert!(layout.overlay.is_none());
+        assert_eq!(app.focus, Some(Control::Content));
+        assert!(
+            matches!(app.input(Input::Text("x".into()), &layout), Some(Intent::Editor(Action::Insert(text))) if text == "x")
+        );
+    }
+
     /// Scripted runtime advances virtual time during polls; no sleeps or real terminal needed.
     struct Fake {
         now: Cell<Duration>,
         events: VecDeque<Input>,
         frames: Vec<(Duration, u64, Rect)>,
         fail_draw: bool,
+        keyboards: usize,
+        terminate_at: Duration,
     }
 
     impl Fake {
@@ -265,6 +484,8 @@ mod tests {
                 events: events.into(),
                 frames: Vec::new(),
                 fail_draw: false,
+                keyboards: 0,
+                terminate_at: Duration::from_millis(100),
             }
         }
     }
@@ -302,7 +523,7 @@ mod tests {
         }
         /// Stop idle runs, also guarding against starvation during a flood.
         fn termination(&self) -> Option<u8> {
-            (self.now() >= Duration::from_millis(100)).then_some(15)
+            (self.now() >= self.terminate_at).then_some(15)
         }
         /// No synthetic signals beyond virtual termination.
         fn suspend_requested(&self) -> bool {
@@ -315,6 +536,11 @@ mod tests {
         /// No actual process stopping in deterministic tests.
         fn suspend(&mut self) -> io::Result<bool> {
             Ok(false)
+        }
+        /// Observe capability acceptance without acquiring a real terminal mode.
+        fn keyboard(&mut self) -> io::Result<()> {
+            self.keyboards += 1;
+            Ok(())
         }
         /// Nothing to clear on the fake renderer.
         fn clear(&mut self) -> io::Result<()> {
@@ -341,8 +567,12 @@ mod tests {
             row: 1,
             modifiers: KeyModifiers::NONE,
         });
-        let mut events = vec![motion; 500];
-        events.extend([Input::Resize(40, 8), motion, Input::Command(Command::Quit)]);
+        let mut events = vec![motion.clone(); 500];
+        events.extend([
+            Input::Resize(40, 8),
+            motion.clone(),
+            Input::Command(Command::Quit),
+        ]);
         let mut host = Fake::new(events);
         let (_, inbox) = status::mailbox();
         assert_eq!(event_loop(&mut host, inbox).unwrap().code, 0);
@@ -350,7 +580,7 @@ mod tests {
         assert!(host.frames.len() <= 3);
         // An open but hidden help overlay at tiny sizes must not regenerate layout on every event.
         let mut events = vec![Input::Command(Command::Help), Input::Resize(20, 4)];
-        events.extend(vec![motion; 500]);
+        events.extend(vec![motion.clone(); 500]);
         events.push(Input::Command(Command::Quit));
         let mut host = Fake::new(events);
         let (_, inbox) = status::mailbox();
@@ -360,6 +590,28 @@ mod tests {
         let (_, inbox) = status::mailbox();
         assert_eq!(event_loop(&mut host, inbox).unwrap().code, 143);
         assert!(!host.events.is_empty());
+    }
+
+    /// Detection is bounded; late/absent replies preserve portable quit and never become text.
+    #[test]
+    fn keyboard_detection_timeout_and_fallback() {
+        for late in [false, true] {
+            let mut host = Fake::new(vec![
+                Input::KeyboardSupported,
+                Input::Command(Command::Quit),
+            ]);
+            if late {
+                host.now.set(Duration::from_millis(501));
+                host.terminate_at = Duration::from_secs(1);
+            }
+            let (_, inbox) = status::mailbox();
+            assert_eq!(event_loop(&mut host, inbox).unwrap().code, 0);
+            assert_eq!(host.keyboards, usize::from(!late));
+        }
+        let mut host = Fake::new(vec![Input::Command(Command::Quit)]);
+        let (_, inbox) = status::mailbox();
+        assert_eq!(event_loop(&mut host, inbox).unwrap().code, 0);
+        assert_eq!(host.keyboards, 0);
     }
 
     /// Backend failures propagate out of the event loop to the terminal cleanup boundary.

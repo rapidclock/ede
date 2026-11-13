@@ -19,6 +19,7 @@ pub(super) struct Cache {
     ring: Vec<Key>,
     hand: usize,
     bytes: usize,
+    peak: usize,
     limit: usize,
 }
 impl Cache {
@@ -29,12 +30,17 @@ impl Cache {
             ring: Vec::new(),
             hand: 0,
             bytes: 0,
+            peak: 0,
             limit,
         }
     }
     /// Resident allocation charge, including ring/hash entry allowance.
     pub fn bytes(&self) -> usize {
         self.bytes
+    }
+    /// Highest conservative allocation charge observed for this cache pool.
+    pub fn high_water(&self) -> usize {
+        self.peak
     }
     /// Copy a disk page into a caller buffer without exposing/pinning cache allocations.
     pub fn read(
@@ -59,6 +65,7 @@ impl Cache {
             self.entries.insert(key, Entry { bytes, used: true });
             self.ring.push(key);
             self.bytes += charge;
+            self.peak = self.peak.max(self.bytes);
         }
         let entry = self.entries.get_mut(&key).ok_or(Error::CorruptStorage)?;
         entry.used = true;
@@ -90,6 +97,7 @@ impl Cache {
             self.evict();
         }
         self.bytes += charge;
+        self.peak = self.peak.max(self.bytes);
         self.entries.insert(key, Entry { bytes, used: true });
         self.ring.push(key);
     }

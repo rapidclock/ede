@@ -41,6 +41,10 @@ jobs:
         if: runner.os == 'Linux'
         run: cargo build --release --locked --example storage_bench
 
+      - name: Build interactive benchmark (Linux)
+        if: runner.os == 'Linux'
+        run: cargo test --release --locked --test terminal --no-run
+
       - name: Validate large-file storage with constrained memory (Linux)
         if: runner.os == 'Linux'
         run: |
@@ -60,3 +64,20 @@ jobs:
             --setenv="TMPDIR=$RUNNER_TEMP" \
             --property="WorkingDirectory=$GITHUB_WORKSPACE" --uid="$(id -u)" \
             "$GITHUB_WORKSPACE/target/release/examples/storage_bench" ordinary 1024 copy
+
+      - name: Validate large-file editing with constrained memory (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          for binary in "$GITHUB_WORKSPACE"/target/release/deps/terminal-*; do
+            if [ ! -f "$binary" ] || [ ! -x "$binary" ]; then
+              continue
+            fi
+            for corpus in ordinary dense long; do
+              sudo systemd-run --wait --pipe --collect \
+                --property=MemoryMax=256M --property=MemorySwapMax=0 \
+                --setenv="TMPDIR=$RUNNER_TEMP" \
+                --setenv="EDE_BENCH_MIB=1024" --setenv="EDE_BENCH_CORPUS=$corpus" \
+                --property="WorkingDirectory=$GITHUB_WORKSPACE" --uid="$(id -u)" \
+                "$binary" --ignored --exact large_file_interactive_benchmark --nocapture
+            done
+          done

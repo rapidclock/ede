@@ -193,6 +193,8 @@ dependencies = [
  "ratatui",
  "signal-hook 0.4.6",
  "tempfile",
+ "unicode-segmentation",
+ "unicode-width",
  "vt100",
 ]
 

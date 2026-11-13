@@ -1,6 +1,6 @@
 # 001 — Initial MVP overview
 
-Status: **MVP scope and roadmap accepted — Stage 01 merged; Stage 02 complete.**
+Status: **MVP scope and roadmap accepted — Stages 01–02 merged; Stage 03 local implementation reviewed, environment validation pending.**
 
 Project: **ede**, a predominantly Rust terminal text editor for macOS and Linux.
 
@@ -412,12 +412,16 @@ above. On 2026-11-01, the user approved the detailed Stage 01 design and explici
 authorized its implementation. Stage 01 is now squash-merged into `feat/initial_mvp`
 through [PR #1](https://github.com/rapidclock/ede/pull/1). The user authorized the
 Stage 02 design while reviewing Stage 01, and explicitly authorized Stage 02
-implementation on 2026-11-02.
+implementation on 2026-11-02. Stage 02 is squash-merged through
+[PR #2](https://github.com/rapidclock/ede/pull/2). On 2026-11-03, the user authorized
+beginning the Stage 03 specification on a new stage branch, then explicitly
+authorized Stage 03 implementation after the Cmd and large-paste clarifications.
 
 The user accepted proceeding one stage at a time: detailed design, review,
 separately authorized implementation, validation, and stage PR before moving on.
-Stage 02 is complete as of 2026-11-03; later filenames identify future documents. Each
-detailed design must resolve its prerequisite decisions and define behavior,
+Stage 02 is merged as of 2026-11-03; Stage 03 local implementation is reviewed, environment validation remains pending, and later filenames
+identify future documents. Each detailed design must resolve its prerequisite
+decisions and define behavior,
 interfaces, failure cases, and acceptance criteria before its implementation is
 authorized. The stages may be adjusted as we learn.
 
@@ -447,7 +451,7 @@ Evidence: [Stage 01 validation record](01_terminal_foundation.md#validation-reco
 ### 02 — Document storage and file integrity
 
 Design: [02_document_storage.md](02_document_storage.md). Depends on: 01.
-Status: complete; [PR #2](https://github.com/rapidclock/ede/pull/2) ready for review.
+Status: complete; [PR #2](https://github.com/rapidclock/ede/pull/2) merged into `feat/initial_mvp`.
 Implementation was authorized on 2026-11-02 and completed on 2026-11-03.
 Evidence: [Stage 02 validation record](02_document_storage.md#validation-record).
 
@@ -470,7 +474,11 @@ editing remains Stage 03.
 
 ### 03 — Interactive editing and mouse selection
 
-Planned file: `03_editing_and_mouse.md`. Depends on: 01–02.
+Design: [03_editing_and_mouse.md](03_editing_and_mouse.md). Depends on: 01–02.
+Status: local implementation reviewed on 2026-11-03, with an independent follow-up
+and regression fixes on 2026-11-04; unavailable environment validation remains pending.
+Branch: `stage/editing_and_mouse`; PR target: `feat/initial_mvp`.
+Evidence: [Stage 03 validation record](03_editing_and_mouse.md#validation-record) (local evidence recorded; remaining checks pending).
 
 - Deliver single-document editing: cursor movement, insertion/deletion, selection,
   cut/copy/paste, undo/redo, save/save-as, and unsaved-change protection.
@@ -479,6 +487,9 @@ Planned file: `03_editing_and_mouse.md`. Depends on: 01–02.
   horizontal navigation preserve selection and document content.
 - Resolve mouse gestures and clipboard fallbacks here. Verify responsive viewport
   rendering over paged storage. Covers FR-02/FR-03 and interactive FR-06 behavior.
+- Support macOS Cmd aliases where delivered, retain portable Ctrl bindings, and
+  validate enhanced input, terminal mappings and intercepted-key fallbacks here.
+  User remapping remains Stage 09.
 
 ### 04 — Tabs and file selection
 

@@ -8,6 +8,7 @@ use std::sync::{
 /// Shared reservations for all owned buffers/windows in a storage service.
 pub(super) struct Budget {
     used: AtomicUsize,
+    peak: AtomicUsize,
     limit: usize,
 }
 impl Budget {
@@ -15,20 +16,27 @@ impl Budget {
     fn new(limit: usize) -> Arc<Self> {
         Arc::new(Self {
             used: AtomicUsize::new(0),
+            peak: AtomicUsize::new(0),
             limit,
         })
     }
     /// Admission precedes allocation; a failed reservation has no side effects.
     pub fn acquire(self: &Arc<Self>, bytes: usize) -> Result<Permit, Error> {
-        self.used
+        let previous = self
+            .used
             .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
                 used.checked_add(bytes).filter(|n| *n <= self.limit)
             })
             .map_err(|_| Error::ResourceLimit("aggregate buffer budget"))?;
+        self.peak.fetch_max(previous + bytes, Ordering::AcqRel);
         Ok(Permit {
             budget: self.clone(),
             bytes,
         })
+    }
+    /// Highest admitted aggregate buffer charge, including active and queued jobs.
+    pub fn high_water(&self) -> usize {
+        self.peak.load(Ordering::Acquire)
     }
 }
 /// RAII aggregate buffer charge, released only when the owning result is dropped.
