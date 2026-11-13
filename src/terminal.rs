@@ -22,6 +22,7 @@ pub(crate) enum Mode {
     Mouse,
     Paste,
     Focus,
+    Keyboard,
 }
 
 /// Ordered acquisition; each operation has a corresponding independent restoration attempt.
@@ -38,6 +39,10 @@ const MODES: [Mode; 6] = [
 pub(crate) trait TerminalDriver {
     /// Enable or disable a single resource; disabling must be idempotent.
     fn set(&mut self, mode: Mode, enabled: bool) -> io::Result<()>;
+    /// Ask for keyboard enhancement support without waiting for a reply.
+    fn query_keyboard(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 /// Production driver. Crossterm captures/restores the original termios state for raw mode.
@@ -60,7 +65,21 @@ impl TerminalDriver for UnixTerminal {
             (Mode::Paste, false) => execute!(out, event::DisableBracketedPaste),
             (Mode::Focus, true) => execute!(out, event::EnableFocusChange),
             (Mode::Focus, false) => execute!(out, event::DisableFocusChange),
+            (Mode::Keyboard, true) => execute!(
+                out,
+                event::PushKeyboardEnhancementFlags(
+                    event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                )
+            ),
+            (Mode::Keyboard, false) => execute!(out, event::PopKeyboardEnhancementFlags),
         }
+    }
+    /// Query only; the sole input reader consumes any response asynchronously.
+    fn query_keyboard(&mut self) -> io::Result<()> {
+        use std::io::Write;
+        let mut output = io::stdout();
+        output.write_all(b"\x1b[?u")?;
+        output.flush()
     }
 }
 
@@ -68,6 +87,8 @@ impl TerminalDriver for UnixTerminal {
 pub(crate) struct TerminalSession<D: TerminalDriver> {
     driver: D,
     acquired: Vec<Mode>,
+    mouse: bool,
+    keyboard: bool,
 }
 
 impl<D: TerminalDriver> TerminalSession<D> {
@@ -76,6 +97,8 @@ impl<D: TerminalDriver> TerminalSession<D> {
         Self {
             driver,
             acquired: Vec::new(),
+            mouse: true,
+            keyboard: false,
         }
     }
 
@@ -85,8 +108,38 @@ impl<D: TerminalDriver> TerminalSession<D> {
             return Err(io::Error::other("terminal session is already acquired"));
         }
         for mode in MODES {
+            if mode == Mode::Mouse && !self.mouse {
+                continue;
+            }
             self.acquired.push(mode);
             self.driver.set(mode, true)?;
+        }
+        if self.keyboard {
+            self.set_keyboard()?;
+        }
+        self.driver.query_keyboard()?;
+        Ok(())
+    }
+    /// Acquire enhanced keyboard state only after a timely positive capability reply.
+    pub(crate) fn set_keyboard(&mut self) -> io::Result<()> {
+        self.keyboard = true;
+        if !self.acquired.contains(&Mode::Keyboard) {
+            self.acquired.push(Mode::Keyboard);
+            self.driver.set(Mode::Keyboard, true)?;
+        }
+        Ok(())
+    }
+    /// Pause application mouse capture and preserve that preference across suspension.
+    pub(crate) fn set_mouse(&mut self, enabled: bool) -> io::Result<()> {
+        self.mouse = enabled;
+        if enabled && !self.acquired.contains(&Mode::Mouse) {
+            self.acquired.push(Mode::Mouse);
+            self.driver.set(Mode::Mouse, true)?;
+        } else if !enabled
+            && let Some(index) = self.acquired.iter().position(|mode| *mode == Mode::Mouse)
+        {
+            self.driver.set(Mode::Mouse, false)?;
+            self.acquired.remove(index);
         }
         Ok(())
     }
@@ -159,6 +212,7 @@ pub(crate) struct Signals {
     termination: Arc<AtomicUsize>,
     suspend: Arc<AtomicBool>,
     continued: Arc<AtomicBool>,
+    cancel_paste: Arc<AtomicBool>,
     registrations: Vec<SigId>,
 }
 
@@ -169,6 +223,7 @@ impl Signals {
             termination: Arc::new(AtomicUsize::new(0)),
             suspend: Arc::new(AtomicBool::new(false)),
             continued: Arc::new(AtomicBool::new(false)),
+            cancel_paste: Arc::new(AtomicBool::new(false)),
             registrations: Vec::new(),
         };
         for signal in [SIGINT, SIGTERM, SIGHUP] {
@@ -184,6 +239,9 @@ impl Signals {
         signals
             .registrations
             .push(flag::register(SIGCONT, signals.continued.clone())?);
+        signals
+            .registrations
+            .push(flag::register(SIGUSR1, signals.cancel_paste.clone())?);
         Ok(signals)
     }
 
@@ -201,6 +259,10 @@ impl Signals {
     /// Take a continuation notification, including an externally stopped process resuming.
     pub(crate) fn continued(&self) -> bool {
         self.continued.swap(false, Ordering::Relaxed)
+    }
+    /// Take an out-of-band paste cancellation without decoding terminal payload bytes.
+    pub(crate) fn cancel_paste_requested(&self) -> bool {
+        self.cancel_paste.swap(false, Ordering::Relaxed)
     }
 }
 
@@ -279,6 +341,41 @@ mod tests {
         assert!(session.restore().is_err());
         assert!(trace.borrow().contains(&(Mode::Raw, false)));
         assert_eq!(session.acquired, [Mode::Mouse]);
+        session.restore().unwrap();
+        assert!(session.acquired.is_empty());
+    }
+
+    /// Dynamic keyboard/capture resources restore independently and preserve user choices on re-entry.
+    #[test]
+    fn enhanced_modes_and_paused_capture_survive_reentry() {
+        let trace = Trace::default();
+        let mut session = TerminalSession::new(Driver {
+            trace: trace.clone(),
+            fail: None,
+        });
+        session.acquire().unwrap();
+        session.set_keyboard().unwrap();
+        session.set_mouse(false).unwrap();
+        session.restore().unwrap();
+        let before = trace.borrow().len();
+        session.acquire().unwrap();
+        assert!(trace.borrow()[before..].contains(&(Mode::Keyboard, true)));
+        assert!(!trace.borrow()[before..].contains(&(Mode::Mouse, true)));
+        session.restore().unwrap();
+        assert_eq!(
+            trace
+                .borrow()
+                .iter()
+                .filter(|entry| **entry == (Mode::Keyboard, false))
+                .count(),
+            2
+        );
+        let mut session = TerminalSession::new(Driver {
+            trace: trace.clone(),
+            fail: Some((Mode::Keyboard, true)),
+        });
+        session.acquire().unwrap();
+        assert!(session.set_keyboard().is_err());
         session.restore().unwrap();
         assert!(session.acquired.is_empty());
     }

@@ -120,7 +120,11 @@ impl PtyChild {
 
     /// Wait for actual displayed text; cursor positioning can split words in the raw stream.
     fn expect(&mut self, text: &str) {
-        let deadline = Instant::now() + TIMEOUT;
+        self.expect_with_timeout(text, TIMEOUT);
+    }
+    /// Larger fixture preparation and long-line seeks have separately measured deadlines.
+    fn expect_with_timeout(&mut self, text: &str, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
         loop {
             self.drain();
             if self.parser.screen().contents().contains(text) {
@@ -135,6 +139,30 @@ impl PtyChild {
         }
     }
 
+    /// Observe document rows rather than a matching filename, help label or status message.
+    fn expect_body(&mut self, text: &str, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        loop {
+            self.drain();
+            let height = self.parser.screen().size().0.get();
+            if self
+                .parser
+                .screen()
+                .rows(0, 80)
+                .skip(1)
+                .take(height.saturating_sub(2) as usize)
+                .any(|row| row.contains(text))
+            {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "missing document text {text:?}: {}",
+                self.parser.screen().contents()
+            );
+            thread::sleep(Duration::from_millis(2));
+        }
+    }
     /// Wait for plain shell output or a synchronization marker produced after application exit.
     fn expect_raw(&mut self, text: &str) {
         let deadline = Instant::now() + TIMEOUT;
@@ -188,7 +216,20 @@ impl PtyChild {
 
     /// Send actual bytes a conventional terminal would transmit.
     fn send(&mut self, bytes: &[u8]) {
-        self.master.write_all(bytes).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut remaining = bytes;
+        while !remaining.is_empty() {
+            match self.master.write(&remaining[..remaining.len().min(8192)]) {
+                Ok(count) => remaining = &remaining[count..],
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    self.drain();
+                    thread::sleep(Duration::from_millis(1));
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) => panic!("PTY write: {error}"),
+            }
+            assert!(Instant::now() < deadline, "terminal input stalled");
+        }
     }
 
     /// The foreground launcher reports its PID before exec; no cross-session ioctl is needed.
@@ -200,6 +241,36 @@ impl PtyChild {
             .take_while(char::is_ascii_digit)
             .collect();
         Pid::from_raw(digits.parse().unwrap())
+    }
+    /// Optional kernel-reported lifetime RSS peak, distinct from live ps samples.
+    fn report_peak_rss(&self) {
+        if std::env::var_os("EDE_BENCH_PEAK_RSS").is_none() {
+            return;
+        }
+        let output = String::from_utf8_lossy(&self.output);
+        let line = output
+            .lines()
+            .find(|line| {
+                line.contains("maximum resident set size")
+                    || line.contains("Maximum resident set size (kbytes)")
+            })
+            .expect("time resource report");
+        let value = if cfg!(target_os = "macos") {
+            line.split_whitespace()
+                .next()
+                .unwrap()
+                .parse::<u64>()
+                .unwrap()
+                / 1024
+        } else {
+            line.split(':')
+                .next_back()
+                .unwrap()
+                .trim()
+                .parse::<u64>()
+                .unwrap()
+        };
+        eprintln!("kernel_lifetime_peak_editor_RSS_KiB={value}");
     }
 
     /// Change kernel dimensions and notify the foreground application.
@@ -287,25 +358,26 @@ impl Drop for PtyChild {
 #[test]
 fn real_shortcuts_paste_and_cleanup() {
     let mut process = PtyChild::editor();
-    process.expect("No document open");
+    process.expect("Ready");
     assert!(
         !termios::tcgetattr(&process.slave)
             .unwrap()
             .input_flags
             .contains(InputFlags::IXON)
     );
-    process.reset_output();
     process.send(b"\x13");
-    process.expect_status("No document open");
-    process.reset_output();
+    process.expect("Save As (new path)");
+    process.send(b"\x1b");
+    thread::sleep(Duration::from_millis(60));
     process.send(b"\x03");
     process.expect_status("No selection");
-    process.reset_output();
     process.send(b"\x1b[200~\x11\x13secret\x1b[201~");
-    process.expect_status("No document open");
-    assert!(!String::from_utf8_lossy(&process.output).contains("secret"));
+    process.expect("secret");
+    process.expect("<U+0011>");
     assert!(process.child.try_wait().unwrap().is_none());
-    process.send(b"q\x11");
+    process.send(b"\x11");
+    process.expect("Unsaved changes");
+    process.send(b"\t\t\r");
     assert!(process.wait().success());
     process.assert_restored();
 }
@@ -314,24 +386,29 @@ fn real_shortcuts_paste_and_cleanup() {
 #[test]
 fn real_mouse_overlay_and_resize() {
     let mut process = PtyChild::editor();
-    process.expect("No document open");
+    process.expect("Ready");
     process.reset_output();
     process.send(b"\x1bOP");
-    process.expect("app.quit");
+    process.expect("Cmd aliases require");
     // Header Quit is underneath the overlay and must not be activated.
-    process.send(b"\x1b[<0;74;1M\x1b[<0;74;1m\x13");
-    process.expect_status("No document open");
+    process.send(b"\x1b[<0;74;1M\x1b[<0;74;1mtext");
+    process.expect("Cmd aliases require");
     assert!(process.child.try_wait().unwrap().is_none());
     process.reset_output();
     process.resize(20, 4);
     process.expect("Resize");
     process.reset_output();
     process.resize(80, 24);
-    process.expect("app.quit");
+    process.expect("Cmd aliases require");
     process.send(b"\x1b");
     // Wait for the overlay to disappear before sending another escape-prefixed sequence.
     let deadline = Instant::now() + TIMEOUT;
-    while process.parser.screen().contents().contains("app.quit") {
+    while process
+        .parser
+        .screen()
+        .contents()
+        .contains("Cmd aliases require")
+    {
         process.drain();
         assert!(Instant::now() < deadline);
         thread::sleep(Duration::from_millis(5));
@@ -346,7 +423,7 @@ fn real_mouse_overlay_and_resize() {
 fn external_signals_restore_terminal() {
     for signal in [Signal::SIGINT, Signal::SIGTERM, Signal::SIGHUP] {
         let mut process = PtyChild::editor();
-        process.expect("No document open");
+        process.expect("Ready");
         kill(process.editor_pid(), signal).unwrap();
         assert_eq!(process.wait().code(), Some(128 + signal as i32));
         process.assert_restored();
@@ -367,18 +444,39 @@ fn unusable_term_is_a_plain_error() {
 impl PtyChild {
     /// Override TERM after the harness sets up TTY handles, testing the actual child environment.
     fn editor_with_term(term: Option<&str>) -> Self {
+        Self::editor_with_path(term, None)
+    }
+    /// Supply an optional OS-native path through positional shell arguments, without interpolation.
+    fn editor_with_path(term: Option<&str>, path: Option<&std::path::Path>) -> Self {
         // The interactive parent supplies job control and stays alive after ede exits,
         // allowing exact post-exit termios capture before Darwin revokes the slave PTY.
         let mut command = Command::new("/bin/sh");
+        let script = "# The nested shell expands its own PID and positional parameters.\n# shellcheck disable=SC2016\nif [ \"$1\" = unset ]; then unset TERM; else TERM=$2; export TERM; fi; /bin/sh -c 'printf \"EDE_PID:%s\\n\" \"$$\"; program=$1; shift; exec \"$program\" \"$@\"' ede-child \"$3\" ${4+\"$4\"}; result=$?; printf '\\nEDE_EXIT:%s\\n' \"$result\"; read -r _completion; exit \"$result\"";
+        let script = if std::env::var_os("EDE_BENCH_PEAK_RSS").is_some() {
+            script.replacen(
+                "; /bin/sh -c",
+                if cfg!(target_os = "macos") {
+                    "; /usr/bin/time -l /bin/sh -c"
+                } else {
+                    "; /usr/bin/time -v /bin/sh -c"
+                },
+                1,
+            )
+        } else {
+            script.into()
+        };
         command.args([
             "-i",
             "-c",
-            "if [ \"$1\" = unset ]; then unset TERM; else TERM=$2; export TERM; fi; /bin/sh -c 'printf \"EDE_PID:%s\\n\" \"$$\"; exec \"$1\"' ede-child \"$3\"; result=$?; printf '\\nEDE_EXIT:%s\\n' \"$result\"; read -r completion; exit \"$result\"",
+            script.as_str(),
             "ede-term-test",
             if term.is_none() { "unset" } else { "set" },
             term.unwrap_or(""),
             env!("CARGO_BIN_EXE_ede"),
         ]);
+        if let Some(path) = path {
+            command.arg(path);
+        }
         let mut child = Self::spawn(command);
         child.keep_alive = true;
         child
@@ -402,18 +500,18 @@ fn suspend_and_resume_under_job_control() {
         )
         .as_bytes(),
     );
-    process.expect("No document open");
+    process.expect("Ready");
     let foreground = process.editor_pid();
     process.reset_output();
     process.send(b"\x1bOP");
-    process.expect("app.quit");
+    process.expect("Cmd aliases require");
     process.send(b"\t\r");
     process.expect_raw("EDE_TEST_PROMPT>");
     process.assert_restored();
     process.resize(60, 16);
     process.reset_output();
     process.send(b"fg\n");
-    process.expect("app.quit");
+    process.expect("Cmd aliases require");
     assert!(kill(foreground, None).is_ok());
     process.reset_output();
     // External SIGTSTP follows the same cleanup route as the help action.
@@ -422,11 +520,624 @@ fn suspend_and_resume_under_job_control() {
     process.assert_restored();
     process.reset_output();
     process.send(b"fg\n");
-    process.expect("app.quit");
+    process.expect("Cmd aliases require");
     process.reset_output();
     process.send(b"\x11");
     process.expect_raw("EDE_TEST_PROMPT>");
     process.assert_restored();
     process.send(b"exit\n");
+    assert!(process.wait().success());
+}
+
+/// File edits, Unicode, guarded quit, undo and acknowledged save points work through actual input.
+#[test]
+fn open_edit_save_and_dirty_quit_round_trip() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("file with spaces.txt");
+    std::fs::write(&path, b"start\r\nsecond").unwrap();
+    let mut process = PtyChild::editor_with_path(Some("xterm-256color"), Some(&path));
+    process.expect("Ready");
+    process.expect("start");
+    process.send("\x1b[F界e\u{301}".as_bytes());
+    process.expect("start界e\u{301}");
+    process.send(b"\x13");
+    let deadline = Instant::now() + TIMEOUT;
+    while std::fs::read(&path).unwrap() != "start界e\u{301}\r\nsecond".as_bytes() {
+        process.drain();
+        assert!(Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(5));
+    }
+    process.expect_status("Saved");
+    process.send(b"!\x11");
+    process.expect("Unsaved changes");
+    process.send(b"\r");
+    thread::sleep(Duration::from_millis(30));
+    assert!(process.child.try_wait().unwrap().is_none());
+    process.send(b"\x1a\x11");
+    assert!(process.wait().success());
+    process.assert_restored();
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        "start界e\u{301}\r\nsecond".as_bytes()
+    );
+}
+
+/// The terminal parser and document path accept a multi-megabyte paste with one undo unit.
+#[test]
+fn external_large_paste_save_undo_and_redo() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("pasted.txt");
+    let mut process = PtyChild::editor();
+    process.expect("Ready");
+    let mut payload = "line界\r\n".repeat(262_144);
+    payload.push_str("END-PAYLOAD");
+    assert!(payload.len() > 1 << 20);
+    let started = Instant::now();
+    process.send(b"\x1b[200~");
+    process.send(payload.as_bytes());
+    process.send(b"\x1b[201~");
+    process.expect("END-PAYLOAD");
+    process.send(b"\x13");
+    process.expect("Save As (new path)");
+    process.send(path.as_os_str().as_encoded_bytes());
+    process.send(b"\r");
+    process.expect_status("Saved");
+    assert_eq!(std::fs::read(&path).unwrap(), payload.as_bytes());
+    eprintln!(
+        "external paste: {} bytes, receive/render/save {:?}",
+        payload.len(),
+        started.elapsed()
+    );
+    process.send(b"\x1a\x11");
+    process.expect("Unsaved changes");
+    process.send(b"\r");
+    thread::sleep(Duration::from_millis(30));
+    process.send(b"\x19\x11");
+    assert!(process.wait().success());
+    process.assert_restored();
+}
+
+/// A prompt at tiny geometry cannot accept a hidden Discard/Save button.
+#[test]
+fn dirty_quit_at_tiny_size_requires_visible_confirmation() {
+    let mut process = PtyChild::editor();
+    process.expect("Ready");
+    process.send(b"work");
+    process.expect("work");
+    process.resize(20, 4);
+    process.expect("Resize");
+    process.send(b"\x11");
+    thread::sleep(Duration::from_millis(30));
+    process.send(b"\t\t\r");
+    thread::sleep(Duration::from_millis(30));
+    assert!(process.child.try_wait().unwrap().is_none());
+    process.resize(80, 24);
+    process.expect("Unsaved changes");
+    process.send(b"\x1b");
+    thread::sleep(Duration::from_millis(60));
+    process.send(b"\x11");
+    process.expect("Unsaved changes");
+    process.send(b"\t\t\r");
+    assert!(process.wait().success());
+    process.assert_restored();
+}
+
+/// Synthetic protocol delivery exercises Cmd/Super and exact Shift, then restores the pushed mode.
+#[test]
+fn enhanced_cmd_delivery_and_restoration() {
+    let mut process = PtyChild::editor();
+    process.expect_raw("\x1b[?u");
+    process.send(b"\x1b[?1u");
+    process.expect_raw("\x1b[>1u");
+    process.expect("Ready");
+    process.send(b"\x1b[115;10u");
+    process.expect("Save As (new path)");
+    process.send(b"\x1b");
+    thread::sleep(Duration::from_millis(60));
+    process.send(b"\x1b[113;9u");
+    assert!(process.wait().success());
+    process.assert_restored();
+    assert!(process.output.windows(5).any(|bytes| bytes == b"\x1b[<1u"));
+}
+
+/// Real allocated-file terminal benchmark; opt in so ordinary tests remain small and repeatable.
+#[test]
+#[ignore = "large-file benchmark: run explicitly with EDE_BENCH_MIB and EDE_BENCH_CORPUS"]
+fn large_file_interactive_benchmark() {
+    use std::os::unix::fs::FileExt;
+    let mib: u64 = std::env::var("EDE_BENCH_MIB")
+        .unwrap_or_else(|_| "1024".into())
+        .parse()
+        .unwrap();
+    let corpus = std::env::var("EDE_BENCH_CORPUS").unwrap_or_else(|_| "ordinary".into());
+    let pattern: &[u8] = match corpus.as_str() {
+        "ordinary" => b"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef012\n",
+        "dense" => b"x\n",
+        "long" => b"x",
+        _ => panic!("invalid corpus"),
+    };
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("allocated.txt");
+    let mut file = File::create(&path).unwrap();
+    let mut chunk = vec![0; 1 << 20];
+    for (index, byte) in chunk.iter_mut().enumerate() {
+        *byte = pattern[index % pattern.len()];
+    }
+    let length = mib.checked_mul(1 << 20).unwrap();
+    let mut remaining = length;
+    let mut lines = 1u64;
+    while remaining > 0 {
+        let count = remaining.min(chunk.len() as u64) as usize;
+        file.write_all(&chunk[..count]).unwrap();
+        lines += chunk[..count].iter().filter(|byte| **byte == b'\n').count() as u64;
+        remaining -= count as u64;
+        if remaining.is_multiple_of(8 << 20) {
+            file.sync_data().unwrap();
+        }
+    }
+    file.sync_all().unwrap();
+    drop(file);
+    eprintln!(
+        "fixture={corpus} bytes={length} logical_lines={lines} generated warm on {}",
+        directory.path().display()
+    );
+    let started = Instant::now();
+    let mut process = PtyChild::editor_with_path(Some("xterm-256color"), Some(&path));
+    let first = if corpus == "ordinary" {
+        "0123456789abcdef"
+    } else {
+        "x"
+    };
+    process.expect_body(first, Duration::from_secs(120));
+    let first_text = started.elapsed();
+    process.expect_with_timeout("Ready", Duration::from_secs(120));
+    let ready = started.elapsed();
+    let pid = process.editor_pid();
+    let rss = || {
+        let output = Command::new("ps")
+            .args(["-o", "rss=", "-p", &pid.as_raw().to_string()])
+            .output()
+            .unwrap();
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .trim()
+            .parse::<u64>()
+            .unwrap()
+    };
+    let mut sampled_rss = rss();
+    let mut latency = Vec::new();
+    for count in 1..=40 {
+        let event = Instant::now();
+        process.send(b"Z");
+        process.expect_body(&"Z".repeat(count), TIMEOUT);
+        latency.push(event.elapsed().as_secs_f64() * 1000.0);
+        sampled_rss = sampled_rss.max(rss());
+    }
+    process.send(b"\x07");
+    process.expect("Go to line[:cell]");
+    let middle = if corpus == "long" {
+        format!("1:{}", length / 2 + 1)
+    } else {
+        format!("{}", lines / 2 + 1)
+    };
+    process.send(middle.as_bytes());
+    process.send(b"\rB");
+    process.expect_body("B", Duration::from_secs(120));
+    sampled_rss = sampled_rss.max(rss());
+    process.send(b"\x1b[1;5FC");
+    process.expect_body("C", Duration::from_secs(120));
+    process.send(b"\x13");
+    // Continue navigation and typing while the immutable save is in flight.
+    process.send(b"\x1b[1;5HD");
+    process.expect_body("D", Duration::from_secs(120));
+    process.expect_with_timeout("Saved", Duration::from_secs(120));
+    sampled_rss = sampled_rss.max(rss());
+    latency.sort_by(f64::total_cmp);
+    eprintln!(
+        "UI corpus={corpus} MiB={mib} first_text_ms={:.3} ready_ms={:.3} ordinary_samples={} p50_ms={:.3} p95_ms={:.3} max_ms={:.3} sampled_max_editor_RSS_KiB={sampled_rss}",
+        first_text.as_secs_f64() * 1000.0,
+        ready.as_secs_f64() * 1000.0,
+        latency.len(),
+        latency[latency.len() / 2],
+        latency[latency.len() * 95 / 100],
+        latency.last().unwrap()
+    );
+    let file = File::open(&path).unwrap();
+    let mut bytes = [0; 40];
+    file.read_exact_at(&mut bytes, 0).unwrap();
+    assert_eq!(&bytes, b"ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ");
+    assert_eq!(file.metadata().unwrap().len(), length + 42);
+    // The later D was not in the captured save, so normal quit must still protect it.
+    process.send(b"\x11");
+    process.expect("Unsaved changes");
+    process.send(b"\t\t\r");
+    assert!(process.wait().success());
+    process.assert_restored();
+    process.report_peak_rss();
+}
+
+/// Pasted path data and immediately following typing/Enter stay in order off the UI thread.
+#[test]
+fn pasted_save_as_path_and_immediate_submit() {
+    let directory = tempfile::tempdir().unwrap();
+    let stem = directory.path().join("pasted destination");
+    let destination = directory.path().join("pasted destination.txt");
+    let mut process = PtyChild::editor();
+    process.expect("Ready");
+    process.send("emoji 👩\n".as_bytes());
+    process.send(b"\x13");
+    process.expect("Save As (new path)");
+    process.send(b"\x1b[200~");
+    process.send(stem.as_os_str().as_encoded_bytes());
+    process.send(b"\x1b[201~.txt\r");
+    process.expect_status("Saved");
+    assert_eq!(
+        std::fs::read(&destination).unwrap(),
+        "emoji 👩\n".as_bytes()
+    );
+    process.send(b"\x11");
+    assert!(process.wait().success());
+    process.assert_restored();
+}
+
+/// A rapid multiline drag, copy and paste preserves ordering without waiting between mouse events.
+#[test]
+fn text_mouse_drag_copy_paste_round_trip() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("mouse.txt");
+    let original = "abc界def\n0123456789\nlast";
+    std::fs::write(&path, original).unwrap();
+    let mut process = PtyChild::editor_with_path(Some("xterm-256color"), Some(&path));
+    process.expect("Ready");
+    process.send(b"\x1b[<0;3;2M\x1b[<32;4;3M\x1b[<0;5;3m\x03\x1b[1;5F\r\x16\x13");
+    let expected = format!("{original}\nc界def\n0123");
+    let deadline = Instant::now() + TIMEOUT;
+    while std::fs::read(&path).unwrap() != expected.as_bytes() {
+        process.drain();
+        assert!(
+            Instant::now() < deadline,
+            "{}",
+            process.parser.screen().contents()
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+    process.expect_status("Saved");
+    process.send(b"\x11");
+    assert!(process.wait().success());
+    process.assert_restored();
+}
+
+/// Save As refuses an existing destination and offers a new path without dropping the buffer.
+#[test]
+fn save_as_existing_destination_retains_both_contents() {
+    let directory = tempfile::tempdir().unwrap();
+    let existing = directory.path().join("existing");
+    let fresh = directory.path().join("fresh");
+    std::fs::write(&existing, b"external").unwrap();
+    let mut process = PtyChild::editor();
+    process.expect("Ready");
+    process.send(b"mine\x13");
+    process.expect("Save As (new path)");
+    process.send(existing.as_os_str().as_encoded_bytes());
+    process.send(b"\r");
+    process.expect("work retained");
+    assert_eq!(std::fs::read(&existing).unwrap(), b"external");
+    process.send(b"\x1bOS");
+    process.expect("Save As (new path)");
+    process.send(fresh.as_os_str().as_encoded_bytes());
+    process.send(b"\r");
+    process.expect_status("Saved");
+    assert_eq!(std::fs::read(fresh).unwrap(), b"mine");
+    process.send(b"\x11");
+    assert!(process.wait().success());
+    process.assert_restored();
+}
+
+/// Separate ingress RSS from document-cache RSS while paste size grows, using fixed input chunks.
+#[test]
+#[ignore = "paste memory benchmark: run explicitly with EDE_PASTE_MIB"]
+fn large_paste_memory_benchmark() {
+    let mib: u64 = std::env::var("EDE_PASTE_MIB")
+        .unwrap_or_else(|_| "64".into())
+        .parse()
+        .unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("paste");
+    let mut process = PtyChild::editor();
+    process.expect("Ready");
+    let pid = process.editor_pid();
+    let rss = || {
+        let output = Command::new("ps")
+            .args(["-o", "rss=", "-p", &pid.as_raw().to_string()])
+            .output()
+            .unwrap();
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .trim()
+            .parse::<u64>()
+            .unwrap()
+    };
+    let baseline = rss();
+    let mut ingress_rss = baseline;
+    let chunk = vec![b'p'; 64 << 10];
+    let started = Instant::now();
+    process.send(b"\x1b[200~");
+    for index in 0..mib * 16 {
+        process.send(&chunk);
+        if index.is_multiple_of(128) {
+            ingress_rss = ingress_rss.max(rss());
+        }
+    }
+    ingress_rss = ingress_rss.max(rss());
+    process.send(b"PASTE_END\x1b[201~");
+    process.expect_body("PASTE_END", Duration::from_secs(120));
+    let ready_rss = rss();
+    process.send(b"\x13");
+    process.expect("Save As (new path)");
+    process.send(path.as_os_str().as_encoded_bytes());
+    process.send(b"\r");
+    process.expect_with_timeout("Saved", Duration::from_secs(120));
+    assert_eq!(std::fs::metadata(&path).unwrap().len(), mib * (1 << 20) + 9);
+    eprintln!(
+        "paste_MiB={mib} baseline_RSS_KiB={baseline} sampled_ingress_max_RSS_KiB={ingress_rss} document_ready_RSS_KiB={ready_rss} receive_render_save_ms={:.3}",
+        started.elapsed().as_secs_f64() * 1000.0
+    );
+    process.send(b"\x11");
+    assert!(process.wait().success());
+    process.assert_restored();
+    process.report_peak_rss();
+}
+
+/// Isolated tmux acceptance: portable editing/clipboard/paste, guarded saves and real job control.
+#[test]
+#[ignore = "requires local tmux: run explicitly with an isolated socket"]
+fn isolated_tmux_editing_and_suspend_smoke() {
+    use std::path::{Path, PathBuf};
+    /// This socket belongs only to the test; cleanup cannot reach a user's tmux server.
+    struct Server(PathBuf);
+    impl Drop for Server {
+        fn drop(&mut self) {
+            let _ = Command::new("tmux")
+                .arg("-S")
+                .arg(&self.0)
+                .arg("kill-server")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+    }
+    /// Quote fixture paths as one shell argument without interpreting embedded shell syntax.
+    fn quote(path: &Path) -> String {
+        format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
+    }
+    /// Darwin may set transient PENDIN while returning to its interactive shell.
+    fn cooked(file: &File) -> Termios {
+        let mut attributes = termios::tcgetattr(file).unwrap();
+        attributes.local_flags.remove(termios::LocalFlags::PENDIN);
+        attributes
+    }
+    /// Wait for the interactive shell to finish restoring its own line-editing mode.
+    fn restored(pane: &File, original: &Termios) {
+        let deadline = Instant::now() + TIMEOUT;
+        loop {
+            let actual = cooked(pane);
+            if actual == *original {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "shell attributes did not settle: {actual:?} != {original:?}"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let server = Server(directory.path().join("tmux.sock"));
+    let path = directory.path().join("document");
+    std::fs::write(&path, b"first\nsecond").unwrap();
+    let mut command = Command::new("tmux");
+    command
+        .arg("-S")
+        .arg(&server.0)
+        .args([
+            "-f",
+            "/dev/null",
+            "new-session",
+            "-s",
+            "ede-stage3",
+            "--",
+            "/bin/sh",
+            "-i",
+        ])
+        .env_remove("TMUX")
+        .env_remove("TMUX_PANE");
+    let mut process = PtyChild::spawn(command);
+    process.expect("EDE_TEST_PROMPT>");
+    let tty = Command::new("tmux")
+        .arg("-S")
+        .arg(&server.0)
+        .args(["list-panes", "-F", "#{pane_tty}"])
+        .output()
+        .unwrap();
+    assert!(tty.status.success());
+    let tty = String::from_utf8(tty.stdout).unwrap();
+    let pane = File::open(tty.trim()).unwrap();
+    let original = cooked(&pane);
+    process.send(
+        format!(
+            "{} {}\n",
+            quote(Path::new(env!("CARGO_BIN_EXE_ede"))),
+            quote(&path)
+        )
+        .as_bytes(),
+    );
+    process.expect("Ready");
+    process.send(b"X");
+    process.expect("Xfirst");
+    process.send(b"\x13");
+    process.expect("Saved");
+    assert_eq!(std::fs::read(&path).unwrap(), b"Xfirst\nsecond");
+    process.send(b"\x01\x03\x1b[1;5F\r\x16I");
+    process.expect("secondI");
+    process.send(b"\x1b[200~-external\n\x11TAIL\x1b[201~");
+    process.expect("TAIL");
+    process.send(b"\x13");
+    process.expect("Saved");
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        b"Xfirst\nsecond\nXfirst\nsecondI-external\n\x11TAIL"
+    );
+    // Exercise the client's actual SGR mouse forwarding, including a release
+    // position later than the last drag event, through the isolated tmux server.
+    process.send(b"\x1b[1;5H");
+    process.expect("Ln 1 Col 1");
+    process.send(b"\x1b[<0;1;2M\x1b[<32;2;2M\x1b[<0;3;2m\x03\x1b[1;5F\r\x16\x13");
+    process.expect("Saved");
+    let expected = b"Xfirst\nsecond\nXfirst\nsecondI-external\n\x11TAIL\nXf";
+    let deadline = Instant::now() + TIMEOUT;
+    while std::fs::read(&path).unwrap() != expected {
+        process.drain();
+        assert!(
+            Instant::now() < deadline,
+            "{}",
+            process.parser.screen().contents()
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+    // Pause native capture through the menu and keep it paused through suspend.
+    process.send(b"\x1bOQ");
+    process.expect("Actions");
+    for _ in 0..11 {
+        process.send(b"\x1b[B");
+    }
+    process.send(b"\r\x1bOQ");
+    process.expect("Mouse capture: paused");
+    process.send(b"\x1b");
+    let deadline = Instant::now() + TIMEOUT;
+    while process
+        .parser
+        .screen()
+        .contents()
+        .contains("Mouse capture: paused")
+    {
+        process.drain();
+        assert!(Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(5));
+    }
+    process.send(b"\x16");
+    process.expect_body("XfXf", TIMEOUT);
+    process.send(b"\x1a\x13");
+    process.expect("Saved");
+    process.send(b"\x1bOP");
+    process.expect("Cmd aliases require");
+    process.send(b"\t\r");
+    process.expect("EDE_TEST_PROMPT>");
+    restored(&pane, &original);
+    process.send(b"fg\n");
+    process.expect("Cmd aliases require");
+    process.send(b"\x1b");
+    let deadline = Instant::now() + TIMEOUT;
+    while process
+        .parser
+        .screen()
+        .contents()
+        .contains("Cmd aliases require")
+    {
+        process.drain();
+        assert!(Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(5));
+    }
+    process.send(b"\x11");
+    process.expect("EDE_TEST_PROMPT>");
+    restored(&pane, &original);
+    process.send(b"exit\n");
+    assert!(process.wait().success());
+}
+
+/// A wheel-then-click burst must not reuse the rows above the new viewport.
+#[test]
+fn wheel_then_click_rejects_obsolete_cell_map() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("wheel.txt");
+    let content = "row0\nrow1\nrow2\nrow3\nrow4\n";
+    std::fs::write(&path, content).unwrap();
+    let mut process = PtyChild::editor_with_path(Some("xterm-256color"), Some(&path));
+    process.expect("Ready");
+    process.expect("row0");
+    process.send(b"\x1b[B");
+    process.expect_status("Ln 2 Col 1");
+    // Scroll three rows down; click the top content row before a fresh screen is available.
+    process.send(b"\x1b[<65;1;2M\x1b[<0;1;2M\x1b[<0;1;2m");
+    process.send(b"!\x13");
+    process.expect_status("Saved");
+    let saved = std::fs::read_to_string(path).unwrap();
+    assert!(
+        saved == "row0\n!row1\nrow2\nrow3\nrow4\n" || saved == "row0\nrow1\nrow2\n!row3\nrow4\n",
+        "obsolete cell map changed the row above the viewport: {saved:?}"
+    );
+    process.send(b"\x11");
+    assert!(process.wait().success());
+}
+
+/// Replacing selected text with identical bytes still ends the selection.
+#[test]
+fn identical_replacement_moves_caret_without_history_entry() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("one");
+    std::fs::write(&path, b"a").unwrap();
+    let mut process = PtyChild::editor_with_path(Some("xterm-256color"), Some(&path));
+    process.expect_status("Ready");
+    process.send(b"\x01ab\x13");
+    process.expect_status("Saved");
+    assert_eq!(std::fs::read(&path).unwrap(), b"ab");
+    process.send(b"\x1a\x1a");
+    process.expect_body("a", TIMEOUT);
+    process.expect_status("Ln 1 Col 2");
+    process.send(b"\x19");
+    process.expect_body("ab", TIMEOUT);
+    process.send(b"\x11");
+    assert!(process.wait().success());
+}
+
+/// An open paste can be cancelled without treating Escape or Ctrl+Q bytes as keys.
+#[test]
+fn cancel_receiving_paste_with_signal() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("paste.txt");
+    std::fs::write(&path, b"original").unwrap();
+    let mut process = PtyChild::editor_with_path(Some("xterm-256color"), Some(&path));
+    process.expect_status("Ready");
+    process.send(b"\x1b[200~partial\x1b");
+    process.expect_status("Receiving paste | kill -USR1");
+    kill(process.editor_pid(), Signal::SIGUSR1).unwrap();
+    process.expect_status("Cancelling paste");
+    process.send(b"\x11discarded\x1b[201~");
+    process.expect_status("Paste cancelled");
+    process.send(b"\x1b[200~\x1b[27u\x11!\x1b[201~\x13");
+    process.expect_status("Saved");
+    assert_eq!(std::fs::read(&path).unwrap(), b"\x1b[27u\x11!original");
+    process.send(b"\x11");
+    assert!(process.wait().success());
+    process.assert_restored();
+}
+
+/// Probe backwards focus over CSI-u after the terminal advertises support.
+#[test]
+fn enhanced_shift_tab_moves_dialog_focus() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("focus.txt");
+    std::fs::write(&path, b"original").unwrap();
+    let mut process = PtyChild::editor_with_path(Some("xterm-256color"), Some(&path));
+    process.expect_raw("\x1b[?u");
+    process.send(b"\x1b[?1u");
+    process.expect_raw("\x1b[>1u");
+    process.expect("Ready");
+    process.send(b"\x1b[14~");
+    process.expect("Save As (new path)");
+    process.send(b"\x1b[9;2u\rx");
+    process.expect_body("xoriginal", TIMEOUT);
+    process.send(b"\x13");
+    process.expect_status("Saved");
+    process.send(b"\x11");
     assert!(process.wait().success());
 }

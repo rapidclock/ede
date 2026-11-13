@@ -1590,3 +1590,298 @@ fn net_zero_transaction_preserves_clean_state_and_redo() {
     document.redo(revision).unwrap();
     assert_eq!(text(&document.snapshot().unwrap()), "Aé\r\n");
 }
+
+/// A blocked save must not hold the document mutation lock or clean later edits.
+#[test]
+fn service_edit_commits_while_save_is_blocked() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("input");
+    fs::write(&path, b"before").unwrap();
+    let gate = Arc::new(Gate::default());
+    let mut config = options(directory.path());
+    config.faults = Some(gate.clone());
+    let mut service = StorageService::new(config).unwrap();
+    let opened = service.submit(1, Request::Open(path.clone())).unwrap();
+    let document = opened.document;
+    drop(receive(&mut service));
+    service.submit(2, Request::Snapshot(document)).unwrap();
+    let snapshot = match receive(&mut service).result.unwrap() {
+        Response::Snapshot(snapshot) => snapshot,
+        _ => panic!(),
+    };
+    gate.armed.store(true, std::sync::atomic::Ordering::Release);
+    let save = service
+        .submit(
+            3,
+            Request::Save {
+                snapshot,
+                target: SaveTarget::Current,
+            },
+        )
+        .unwrap();
+    {
+        let mut state = gate.state.lock().unwrap();
+        while !state.0 {
+            state = gate
+                .wake
+                .wait_timeout(state, Duration::from_secs(5))
+                .unwrap()
+                .0;
+        }
+    }
+    service
+        .submit(
+            4,
+            Request::Replace {
+                document,
+                expected: Revision(0),
+                range: TextRange::new(6, 6).unwrap(),
+                text: " after".into(),
+            },
+        )
+        .unwrap();
+    let changed = receive(&mut service);
+    assert_eq!(changed.request, 4);
+    assert!(matches!(
+        changed.result,
+        Ok(Response::Changed {
+            revision: Revision(1),
+            ..
+        })
+    ));
+    drop(changed);
+    {
+        let mut state = gate.state.lock().unwrap();
+        state.1 = true;
+        gate.wake.notify_all();
+    }
+    let saved = receive(&mut service);
+    assert_eq!(saved.job, save.id);
+    assert!(matches!(
+        saved.result,
+        Ok(Response::Saved(SaveReport {
+            outcome: SaveOutcome::Saved,
+            revision: Revision(0),
+            ..
+        }))
+    ));
+    drop(saved);
+    service.submit(5, Request::Info(document)).unwrap();
+    let info = match receive(&mut service).result.unwrap() {
+        Response::Info(info) => info,
+        _ => panic!(),
+    };
+    assert!(info.dirty);
+    assert_eq!(info.revision, Revision(1));
+    assert_eq!(fs::read(path).unwrap(), b"before");
+    service.shutdown().wait().unwrap();
+}
+
+/// A save worker panic after publication makes even previously clean content require attention.
+#[test]
+fn save_worker_panic_keeps_work_and_marks_unknown_publication() {
+    #[derive(Debug)]
+    struct PanicAfterPublish;
+    impl FaultInjector for PanicAfterPublish {
+        fn check(&self, point: IoPoint) -> io::Result<()> {
+            if point == IoPoint::DirectorySync {
+                panic!("injected post-publication panic");
+            }
+            Ok(())
+        }
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("input");
+    fs::write(&path, b"text").unwrap();
+    let mut config = options(directory.path());
+    config.faults = Some(Arc::new(PanicAfterPublish));
+    let mut service = StorageService::new(config).unwrap();
+    let opened = service.submit(1, Request::Open(path)).unwrap();
+    let document = opened.document;
+    drop(receive(&mut service));
+    service.submit(2, Request::Snapshot(document)).unwrap();
+    let snapshot = match receive(&mut service).result.unwrap() {
+        Response::Snapshot(snapshot) => snapshot,
+        _ => panic!(),
+    };
+    service
+        .submit(
+            3,
+            Request::Save {
+                snapshot,
+                target: SaveTarget::Current,
+            },
+        )
+        .unwrap();
+    assert!(matches!(
+        receive(&mut service).result,
+        Err(Error::SaveWorkerPanicked)
+    ));
+    service.submit(4, Request::Info(document)).unwrap();
+    let info = match receive(&mut service).result.unwrap() {
+        Response::Info(info) => info,
+        _ => panic!(),
+    };
+    assert!(info.dirty);
+    assert_eq!(info.len, 4);
+    service.shutdown().wait().unwrap();
+}
+
+/// Losing only one service worker must report failure instead of waiting forever for its job.
+#[test]
+fn storage_worker_panic_is_detected_without_a_completion() {
+    #[derive(Debug, Default)]
+    struct PanicRead(std::sync::atomic::AtomicBool);
+    impl FaultInjector for PanicRead {
+        fn check(&self, point: IoPoint) -> io::Result<()> {
+            if point == IoPoint::Read && self.0.swap(false, std::sync::atomic::Ordering::AcqRel) {
+                panic!("injected read-worker panic");
+            }
+            Ok(())
+        }
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("input");
+    fs::write(&path, b"text").unwrap();
+    let fault = Arc::new(PanicRead::default());
+    let mut config = options(directory.path());
+    config.faults = Some(fault.clone());
+    let mut service = StorageService::new(config).unwrap();
+    let opened = service.submit(1, Request::Open(path)).unwrap();
+    let document = opened.document;
+    drop(receive(&mut service));
+    service.submit(2, Request::Snapshot(document)).unwrap();
+    let snapshot = match receive(&mut service).result.unwrap() {
+        Response::Snapshot(snapshot) => snapshot,
+        _ => panic!(),
+    };
+    fault.0.store(true, std::sync::atomic::Ordering::Release);
+    service
+        .submit(
+            3,
+            Request::Read {
+                snapshot,
+                start: ByteOffset(0),
+                max_bytes: 64,
+            },
+        )
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match service.try_recv() {
+            Err(Error::Closed) => break,
+            Ok(None) => {}
+            _ => panic!("lost worker should report Closed"),
+        };
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(service.shutdown().wait().is_err());
+}
+
+/// A panicking mutation owner must still join its independently blocked save before shutdown returns.
+#[test]
+fn owner_panic_does_not_detach_an_in_flight_save() {
+    use std::sync::{
+        Condvar,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    };
+    #[derive(Debug)]
+    struct Fault {
+        entered: mpsc::Sender<()>,
+        released: Mutex<bool>,
+        wake: Condvar,
+        panic_write: AtomicBool,
+        owner_failed: AtomicBool,
+    }
+    impl FaultInjector for Fault {
+        fn check(&self, point: IoPoint) -> io::Result<()> {
+            if point == IoPoint::Publish {
+                self.entered.send(()).unwrap();
+                let (_guard, timeout) = self
+                    .wake
+                    .wait_timeout_while(
+                        self.released.lock().unwrap(),
+                        Duration::from_secs(10),
+                        |released| !*released,
+                    )
+                    .unwrap();
+                assert!(!timeout.timed_out(), "save gate timed out");
+            }
+            if point == IoPoint::Write && self.panic_write.swap(false, Ordering::AcqRel) {
+                self.owner_failed.store(true, Ordering::Release);
+                panic!("injected owner panic while saving");
+            }
+            Ok(())
+        }
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("destination");
+    fs::write(&path, "before").unwrap();
+    let (entered, gate) = mpsc::channel();
+    let fault = Arc::new(Fault {
+        entered,
+        released: Mutex::new(false),
+        wake: Condvar::new(),
+        panic_write: AtomicBool::new(false),
+        owner_failed: AtomicBool::new(false),
+    });
+    let mut config = options(directory.path());
+    config.faults = Some(fault.clone());
+    let mut service = StorageService::new(config).unwrap();
+    let opened = service.submit(1, Request::Open(path.clone())).unwrap();
+    let document = opened.document;
+    let revision = match receive(&mut service).result.unwrap() {
+        Response::Ready { revision, .. } => revision,
+        _ => panic!(),
+    };
+    service.submit(2, Request::Snapshot(document)).unwrap();
+    let snapshot = match receive(&mut service).result.unwrap() {
+        Response::Snapshot(snapshot) => snapshot,
+        _ => panic!(),
+    };
+    service
+        .submit(
+            3,
+            Request::Save {
+                snapshot,
+                target: SaveTarget::Current,
+            },
+        )
+        .unwrap();
+    gate.recv_timeout(Duration::from_secs(5)).unwrap();
+    fault.panic_write.store(true, Ordering::Release);
+    service
+        .submit(
+            4,
+            Request::Replace {
+                document,
+                expected: revision,
+                range: TextRange::new(0, 0).unwrap(),
+                text: "never published".into(),
+            },
+        )
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !fault.owner_failed.load(Ordering::Acquire) {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let (done, result) = mpsc::channel();
+    let waiter = std::thread::spawn(move || {
+        done.send(service.shutdown().wait()).unwrap();
+    });
+    let early = result.recv_timeout(Duration::from_millis(50)).ok();
+    *fault.released.lock().unwrap() = true;
+    fault.wake.notify_all();
+    let returned_early = early.is_some();
+    let outcome = early.unwrap_or_else(|| result.recv_timeout(Duration::from_secs(5)).unwrap());
+    waiter.join().unwrap();
+    assert!(
+        !returned_early,
+        "shutdown detached a blocked save after owner panic"
+    );
+    assert!(outcome.is_err());
+    assert_eq!(fs::read(&path).unwrap(), b"before");
+}

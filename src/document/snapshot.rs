@@ -44,6 +44,28 @@ impl Snapshot {
     pub fn line_count(&self) -> u64 {
         self.state.root.entry.lines + 1
     }
+    /// Round a byte position down to a UTF-8 scalar boundary with at most three bytes of context.
+    /// Blocking; intended for bounded chunk readers on background workers.
+    pub fn floor_scalar(&self, offset: ByteOffset) -> Result<ByteOffset, Error> {
+        if offset.0 > self.len() {
+            return Err(Error::InvalidRange);
+        }
+        let mut position = offset.0;
+        let mut byte = [0];
+        let mut context = 0;
+        while position != 0 && position < self.len() {
+            if context == 4 {
+                return Err(Error::CorruptStorage);
+            }
+            context += 1;
+            self.reader.read(*self.state, position, &mut byte)?;
+            if byte[0] & 0xc0 != 0x80 {
+                break;
+            }
+            position -= 1;
+        }
+        Ok(ByteOffset(position))
+    }
     /// Blocking scalar-aligned window read. Use a storage worker, never a UI handler.
     pub fn read_window(&self, start: ByteOffset, max_bytes: usize) -> Result<Window, Error> {
         self.read_window_with_cancel(start, max_bytes, &Cancellation::default())

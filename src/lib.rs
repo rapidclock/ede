@@ -1,14 +1,19 @@
-//! Terminal foundation for ede. Application state is independent of terminal ownership.
+//! Interactive paged text editor. Application state is independent of terminal ownership.
 
 mod app;
 mod command;
 pub mod document;
+mod editor;
+mod ingress;
 mod input;
 mod runtime;
+mod spool;
 pub mod status;
 mod terminal;
+mod text;
 mod ui;
 
+use std::path::PathBuf;
 use std::{
     fmt, io,
     panic::{self, AssertUnwindSafe},
@@ -56,26 +61,35 @@ impl From<io::Error> for Failure {
     }
 }
 
-/// Start the empty editor shell after validating stdin, stdout, and TERM.
+/// Start an unnamed editor document after validating stdin, stdout, and TERM.
 pub fn run() -> Result<Exit, Failure> {
     let (_sender, inbox) = status::mailbox();
-    run_with_status(inbox)
+    run_with_status_and_path(inbox, None)
 }
 
-/// Start the shell with a bounded background mailbox supplied by its caller.
+/// Start an unnamed editing session with a bounded background mailbox supplied by its caller.
 ///
 /// This function owns the single terminal event reader for the duration of the session.
 /// Only one interactive session may run in a process at a time. Callers must not print
 /// diagnostics while it is active; the binary suppresses the default panic hook so
 /// panic diagnostics are printed after restoration as well.
 pub fn run_with_status(inbox: StatusInbox) -> Result<Exit, Failure> {
+    run_with_status_and_path(inbox, None)
+}
+/// Start a single-document editing session with an optional OS-native file path.
+pub fn run_with_path(path: Option<PathBuf>) -> Result<Exit, Failure> {
+    let (_sender, inbox) = status::mailbox();
+    run_with_status_and_path(inbox, path)
+}
+/// Shared lifecycle boundary for embedded callers and command-line document startup.
+fn run_with_status_and_path(inbox: StatusInbox, path: Option<PathBuf>) -> Result<Exit, Failure> {
     terminal::validate()?;
     // Keep signal subscriptions alive through explicit restoration and the Drop retry.
     let signals = Signals::register()?;
     let mut session = TerminalSession::new(UnixTerminal);
     guarded(&mut session, |session| {
         session.acquire()?;
-        runtime::run(session, &signals, inbox)
+        runtime::run(session, &signals, inbox, path)
     })
 }
 

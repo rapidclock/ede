@@ -7,7 +7,7 @@ use super::{
     model::{Baseline, Document},
     platform::{self, Version},
     snapshot::Snapshot,
-    source::Store,
+    source::Reader,
 };
 use std::{
     fs::{self, File},
@@ -59,46 +59,100 @@ impl Document {
         target: SaveTarget,
         cancel: &Cancellation,
     ) -> SaveReport {
-        let mut committed = false;
-        let result = self.save_inner(snapshot, target, cancel, &mut committed);
-        let (outcome, error) = match result {
-            Ok(baseline) => {
-                self.baseline = Some(baseline);
-                self.attention = false;
-                (SaveOutcome::Saved, None)
-            }
-            Err(error) if committed => {
-                self.attention = true;
-                (SaveOutcome::CommittedDurabilityUncertain, Some(error))
-            }
-            Err(error) => (SaveOutcome::NotCommitted, Some(error)),
-        };
-        SaveReport {
-            document: self.id(),
-            revision: snapshot.revision(),
-            outcome,
-            error,
+        match self.prepare_save(snapshot, target) {
+            Ok(task) => self.finish_save(task.run(cancel)),
+            Err(error) => SaveReport {
+                document: self.id(),
+                revision: snapshot.revision(),
+                outcome: SaveOutcome::NotCommitted,
+                error: Some(error),
+            },
         }
     }
-    /// Execute the ordered preflight/staging/conflict/publication/acknowledgement protocol.
-    fn save_inner(
+    /// Capture the destination baseline without holding the mutation lock during I/O.
+    pub(super) fn prepare_save(
         &self,
         snapshot: &Snapshot,
         target: SaveTarget,
-        cancel: &Cancellation,
-        committed: &mut bool,
-    ) -> Result<Baseline, Error> {
+    ) -> Result<SaveTask, Error> {
         if snapshot.document() != self.id() || !Arc::ptr_eq(&snapshot.store, &self.store) {
             return Err(Error::Closed);
         }
+        Ok(SaveTask {
+            document: self.id(),
+            revision: snapshot.revision(),
+            state: *snapshot.state,
+            reader: self
+                .store
+                .lock()
+                .map_err(|_| Error::CorruptStorage)?
+                .reader()?,
+            baseline: self.baseline.clone(),
+            target,
+        })
+    }
+    /// Reconcile precisely the state published by a save, preserving newer edits.
+    pub(super) fn finish_save(&mut self, completion: SaveCompletion) -> SaveReport {
+        match completion.baseline {
+            Some(baseline) => {
+                self.baseline = Some(baseline);
+                self.attention = false;
+            }
+            None if completion.report.outcome == SaveOutcome::CommittedDurabilityUncertain => {
+                self.attention = true
+            }
+            None => {}
+        }
+        completion.report
+    }
+}
+/// Independent immutable save input; its caller must retain the snapshot lease until reconciliation.
+pub(super) struct SaveTask {
+    document: DocumentId,
+    revision: Revision,
+    state: State,
+    reader: Reader,
+    baseline: Option<Baseline>,
+    target: SaveTarget,
+}
+/// Worker result, reconciled on the mutable document owner before acknowledgement.
+pub(super) struct SaveCompletion {
+    baseline: Option<Baseline>,
+    report: SaveReport,
+}
+impl SaveTask {
+    /// Perform all potentially slow filesystem work using immutable read handles.
+    pub(super) fn run(self, cancel: &Cancellation) -> SaveCompletion {
+        let mut committed = false;
+        let result = self.save_inner(cancel, &mut committed);
+        let (baseline, outcome, error) = match result {
+            Ok(baseline) => (Some(baseline), SaveOutcome::Saved, None),
+            Err(error) if committed => {
+                (None, SaveOutcome::CommittedDurabilityUncertain, Some(error))
+            }
+            Err(error) => (None, SaveOutcome::NotCommitted, Some(error)),
+        };
+        SaveCompletion {
+            baseline,
+            report: SaveReport {
+                document: self.document,
+                revision: self.revision,
+                outcome,
+                error,
+            },
+        }
+    }
+    /// Execute the ordered preflight/staging/conflict/publication/acknowledgement protocol.
+    fn save_inner(&self, cancel: &Cancellation, committed: &mut bool) -> Result<Baseline, Error> {
         cancel.check()?;
-        let store = self.store.lock().map_err(|_| Error::CorruptStorage)?;
+        let store = &self.reader;
+        let target = &self.target;
         let _buffers = store
             .source
             .resources
             .buffers
             .acquire(store.source.limits.text_page_bytes * 4 + (256 << 10))?;
-        let expected = match &target {
+        let expected = match target {
             SaveTarget::Current => Some(
                 self.baseline
                     .as_ref()
@@ -106,7 +160,7 @@ impl Document {
             ),
             SaveTarget::New(_) => None,
         };
-        let supplied = match &target {
+        let supplied = match target {
             SaveTarget::Current => expected
                 .expect("current target has baseline")
                 .supplied
@@ -125,7 +179,7 @@ impl Document {
         let parent = File::open(parent_path)?;
         let parent_version = Version::of(&parent.metadata()?);
         if let Some(baseline) = expected {
-            check_destination(baseline, &store, cancel)?;
+            check_destination(baseline, store, cancel)?;
         } else {
             match fs::symlink_metadata(&destination) {
                 Ok(_) => return Err(Error::SaveConflict),
@@ -133,9 +187,12 @@ impl Document {
                 Err(error) => return Err(error.into()),
             }
         }
-        let raw_length = snapshot
-            .len()
-            .checked_add(if snapshot.format().bom { 3 } else { 0 })
+        let raw_length = self
+            .state
+            .root
+            .entry
+            .bytes
+            .checked_add(if self.state.format.bom { 3 } else { 0 })
             .ok_or(Error::ResourceLimit("save length overflow"))?;
         platform::reserve(&parent, raw_length, store.source.limits.disk_reserve_bytes)?;
         let staging = tempfile::Builder::new()
@@ -149,7 +206,7 @@ impl Document {
             .as_file()
             .set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
         let mut dirty_bytes = 0;
-        stream(&store, *snapshot.state, cancel, |bytes| {
+        stream(store, self.state, cancel, |bytes| {
             store.source.check(IoPoint::Write)?;
             output.write_all(bytes)?;
             dirty_bytes += bytes.len();
@@ -178,7 +235,7 @@ impl Document {
         store.source.check(IoPoint::Sync)?;
         output.as_file().sync_all()?;
         if let Some(baseline) = expected {
-            check_destination(baseline, &store, cancel)?;
+            check_destination(baseline, store, cancel)?;
         }
         store.source.check(IoPoint::Publish)?;
         cancel.check()?;
@@ -187,7 +244,7 @@ impl Document {
         }
         // Fault hooks may interleave external writers. Recheck after the final hook too.
         if let Some(baseline) = expected {
-            check_destination(baseline, &store, cancel)?;
+            check_destination(baseline, store, cancel)?;
         }
         cancel.check()?;
         let staged_version = Version::of(&output.as_file().metadata()?);
@@ -216,7 +273,7 @@ impl Document {
             return Err(Error::SaveConflict);
         }
         let baseline = Baseline {
-            state: *snapshot.state,
+            state: self.state,
             supplied,
             resolved: destination,
             version,
@@ -224,13 +281,13 @@ impl Document {
         // The published descriptor is externally writable. Its freshly observed metadata
         // cannot by itself prove that it still contains the state we serialized. Compare
         // against private bytes too, ignoring cancellation after name publication.
-        check_destination(&baseline, &store, &Cancellation::default())?;
+        check_destination(&baseline, store, &Cancellation::default())?;
         Ok(baseline)
     }
 }
 /// Stream preserved BOM followed by logical text using one bounded buffer.
 fn stream(
-    store: &Store,
+    store: &Reader,
     state: State,
     cancel: &Cancellation,
     mut sink: impl FnMut(&[u8]) -> Result<(), Error>,
@@ -252,7 +309,7 @@ fn stream(
 /// Match identity/version, symlink resolution, advanced metadata and complete immutable bytes.
 fn check_destination(
     baseline: &Baseline,
-    store: &Store,
+    store: &Reader,
     cancel: &Cancellation,
 ) -> Result<(), Error> {
     cancel.check()?;

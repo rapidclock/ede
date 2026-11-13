@@ -1,11 +1,12 @@
-//! Two serialized document-owner workers with aggregate queue and payload admission.
+//! Document owner, immutable-read worker, and one independent guarded-save worker.
 //!
 //! Submission/poll/close never wait for filesystem work. Result backpressure may
 //! stop workers, but closing/cancelling remains independent of queue capacity.
 
 use super::{
     ByteOffset, Cancellation, DocumentId, Error, JobId, OpenOptions, OpenProgress, Revision,
-    SaveReport, SaveTarget, Snapshot, StagedTransaction, StorageLimits, TextRange, Window,
+    SaveReport, SaveTarget, Snapshot, StagedTransaction, StorageLimits, StorageStats, TextRange,
+    Window,
     model::Document,
     resources::{Permit, Resources},
     types::identity,
@@ -29,6 +30,10 @@ pub enum Request {
     Open(PathBuf),
     /// Create an unnamed empty document.
     New,
+    /// Obtain current path, dirty state and retained history positions.
+    Info(DocumentId),
+    /// Obtain managed cache usage and working-store disk sizes on the owner.
+    Stats(DocumentId),
     /// Capture an immutable bounded read/save lease.
     Snapshot(DocumentId),
     /// Read a bounded window from a captured state.
@@ -101,7 +106,7 @@ impl Request {
     fn document(&self) -> Option<DocumentId> {
         match self {
             Self::Open(_) | Self::New => None,
-            Self::Snapshot(id) | Self::Compact(id) => Some(*id),
+            Self::Info(id) | Self::Stats(id) | Self::Snapshot(id) | Self::Compact(id) => Some(*id),
             Self::Read { snapshot, .. }
             | Self::LocateLine { snapshot, .. }
             | Self::Save { snapshot, .. } => Some(snapshot.document()),
@@ -134,6 +139,15 @@ pub enum Response {
         /// Initial monotonic epoch.
         revision: Revision,
     },
+    /// Current document metadata, read on the owning worker.
+    Info(DocumentInfo),
+    /// Measured managed usage for the owner's current revision.
+    Stats {
+        /// Current monotonic content epoch.
+        revision: Revision,
+        /// Managed caches and working-file sizes; OS page cache is separate.
+        usage: StorageStats,
+    },
     /// Bounded immutable state lease.
     Snapshot(Snapshot),
     /// Valid scalar-aligned text and continuation.
@@ -154,6 +168,23 @@ pub enum Response {
     /// Compaction finished without changing text, revision, or undo semantics.
     Compacted,
 }
+/// Small owner-consistent metadata for interactive state and bounded undo view history.
+pub struct DocumentInfo {
+    /// Current monotonic revision.
+    pub revision: Revision,
+    /// Current content needs saving, including any uncertain publication.
+    pub dirty: bool,
+    /// Logical UTF-8 byte length, excluding any leading BOM.
+    pub len: u64,
+    /// Exact number of logical lines, including the final empty line after LF.
+    pub lines: u64,
+    /// Supplied save destination, separate from its display label.
+    pub path: Option<PathBuf>,
+    /// Current retained undo descriptor identifier.
+    pub history: u64,
+    /// Oldest retained undo descriptor identifier.
+    pub history_begin: u64,
+}
 /// A bounded progress slot keeps preview until consumed and coalesces numeric progress.
 struct Progress {
     _permit: Permit,
@@ -173,6 +204,11 @@ impl Job {
     /// Request cooperative cancellation independently of worker/result backpressure.
     pub fn cancel(&self) {
         self.cancellation.cancel();
+    }
+    #[cfg(test)]
+    /// Observe the job's cooperative cancellation in synchronized fault tests.
+    pub(crate) fn cancellation(&self) -> Cancellation {
+        self.cancellation.clone()
     }
     /// Take the initial preview, then latest coalesced preparation progress.
     pub fn take_progress(&self) -> Option<OpenProgress> {
@@ -262,6 +298,7 @@ pub struct StorageService {
     entries: Arc<AtomicUsize>,
     resources: Arc<Resources>,
     limits: StorageLimits,
+    stopping: Arc<AtomicBool>,
 }
 /// Pending orderly shutdown. Waiting may block on OS I/O and must occur off the UI thread.
 pub struct Shutdown {
@@ -286,6 +323,13 @@ impl Shutdown {
 impl StorageService {
     /// Spawn two workers, sharing caches and buffers; no synthetic document is opened.
     pub fn new(options: OpenOptions) -> Result<Self, Error> {
+        Self::with_stop_flag(options, Arc::new(AtomicBool::new(false)))
+    }
+    /// Allow the terminal owner to cancel all storage jobs even if the coordinator is busy.
+    pub(crate) fn with_stop_flag(
+        options: OpenOptions,
+        stopping: Arc<AtomicBool>,
+    ) -> Result<Self, Error> {
         let resources = Resources::new(&options.limits)?;
         let entries = Arc::new(AtomicUsize::new(0));
         let (outbox, inbox) = mpsc::sync_channel(options.limits.queue_entries);
@@ -311,6 +355,7 @@ impl StorageService {
             entries,
             resources,
             limits: options.limits,
+            stopping,
         })
     }
     /// Try to enqueue work. No filesystem work or blocking queue operation occurs here.
@@ -367,7 +412,7 @@ impl StorageService {
             Ok(id) => JobId(id),
             Err(error) => return Err((error, Box::new(request))),
         };
-        let cancel = Cancellation::linked(closed.clone());
+        let cancel = Cancellation::linked(closed.clone(), self.stopping.clone());
         let progress_permit = match self
             .resources
             .buffers
@@ -431,6 +476,9 @@ impl StorageService {
                 }
                 Ok(Some(completion))
             }
+            Err(TryRecvError::Empty) if self.workers.iter().any(JoinHandle::is_finished) => {
+                Err(Error::Closed)
+            }
             Err(TryRecvError::Empty) => Ok(None),
             Err(TryRecvError::Disconnected) => Err(Error::Closed),
         }
@@ -451,6 +499,7 @@ impl StorageService {
     }
     /// Signal every live owner without waiting for queue slots or filesystem calls.
     fn cancel_all(&mut self) {
+        self.stopping.store(true, Ordering::Release);
         for closed in self.documents.values() {
             closed.store(true, Ordering::Release);
         }
@@ -463,6 +512,36 @@ impl Drop for StorageService {
         self.cancel_all();
     }
 }
+/// Save thread ownership that cannot silently detach while its document owner unwinds.
+struct SaveWorker {
+    handle: Option<JoinHandle<super::save::SaveCompletion>>,
+    cancel: Cancellation,
+}
+impl SaveWorker {
+    /// Test readiness without blocking the mutation owner.
+    fn is_finished(&self) -> bool {
+        self.handle.as_ref().is_some_and(JoinHandle::is_finished)
+    }
+    /// Reconcile an ordinary completion without cancelling a successful operation.
+    fn join(mut self) -> thread::Result<super::save::SaveCompletion> {
+        self.handle.take().expect("save worker handle").join()
+    }
+}
+impl Drop for SaveWorker {
+    /// Runs only on the storage owner: cancel pre-publication work and join even on panic.
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            self.cancel.cancel();
+            let _ = handle.join();
+        }
+    }
+}
+/// Field order keeps the save joined before its document/lease admission can be released.
+struct PendingSave {
+    worker: SaveWorker,
+    envelope: Envelope,
+    snapshot: Snapshot,
+}
 /// Owner loop: bounded messages, per-document serialization, no result loss under backpressure.
 fn worker(
     inbox: Receiver<Envelope>,
@@ -471,16 +550,132 @@ fn worker(
     resources: Arc<Resources>,
 ) {
     let mut documents: HashMap<DocumentId, OwnedDocument> = HashMap::new();
+    let mut saving: Option<PendingSave> = None;
     loop {
-        documents.retain(|_, owned| !owned.closed.load(Ordering::Acquire));
+        if saving
+            .as_ref()
+            .is_some_and(|save| save.worker.is_finished())
+        {
+            let PendingSave {
+                envelope,
+                snapshot,
+                worker,
+            } = saving.take().expect("finished save");
+            let result = match worker.join() {
+                Ok(saved) => documents
+                    .get_mut(&envelope.document)
+                    .map(|owned| Response::Saved(owned.document.finish_save(saved)))
+                    .ok_or(Error::Closed),
+                Err(_) => {
+                    if let Some(owned) = documents.get_mut(&envelope.document) {
+                        owned.document.attention = true;
+                    }
+                    Err(Error::SaveWorkerPanicked)
+                }
+            };
+            let completion = Completion {
+                job: envelope.job,
+                request: envelope.request_id,
+                document: envelope.document,
+                revision: Some(snapshot.revision()),
+                result,
+                closed: envelope.closed,
+                opening: false,
+                _admission: envelope.admission,
+            };
+            if outbox.send(completion).is_err() {
+                break;
+            }
+        }
+        documents.retain(|id, owned| {
+            !owned.closed.load(Ordering::Acquire)
+                || saving
+                    .as_ref()
+                    .is_some_and(|save| save.envelope.document == *id)
+        });
         let mut envelope = match inbox.recv_timeout(Duration::from_millis(10)) {
             Ok(message) => message,
             Err(mpsc::RecvTimeoutError::Timeout) => continue,
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                if let Some(PendingSave {
+                    envelope,
+                    snapshot: _snapshot,
+                    worker,
+                }) = saving.take()
+                    && let Ok(saved) = worker.join()
+                    && let Some(owned) = documents.get_mut(&envelope.document)
+                {
+                    owned.document.finish_save(saved);
+                }
+                break;
+            }
         };
         let revision = request_revision(&envelope.request);
         let opening = matches!(envelope.request, Request::Open(_) | Request::New);
         let request = std::mem::replace(&mut envelope.request, Request::New);
+        let request = if let Request::Save { snapshot, target } = request {
+            let task = if saving.is_some() {
+                Err(Error::Busy)
+            } else {
+                documents
+                    .get(&envelope.document)
+                    .ok_or(Error::Closed)
+                    .and_then(|owned| owned.document.prepare_save(&snapshot, target))
+            };
+            if let Ok(task) = task {
+                let cancel = envelope.cancel.clone();
+                match thread::Builder::new()
+                    .name("ede-save".into())
+                    .spawn(move || task.run(&cancel))
+                {
+                    Ok(handle) => {
+                        let worker = SaveWorker {
+                            handle: Some(handle),
+                            cancel: envelope.cancel.clone(),
+                        };
+                        saving = Some(PendingSave {
+                            envelope,
+                            snapshot,
+                            worker,
+                        });
+                        continue;
+                    }
+                    Err(error) => {
+                        let completion = Completion {
+                            job: envelope.job,
+                            request: envelope.request_id,
+                            document: envelope.document,
+                            revision: Some(snapshot.revision()),
+                            result: Err(error.into()),
+                            closed: envelope.closed,
+                            opening: false,
+                            _admission: envelope.admission,
+                        };
+                        if outbox.send(completion).is_err() {
+                            break;
+                        }
+                        continue;
+                    }
+                }
+            } else {
+                let completion = Completion {
+                    job: envelope.job,
+                    request: envelope.request_id,
+                    document: envelope.document,
+                    revision: Some(snapshot.revision()),
+                    result: Err(task.err().expect("failed save preparation")),
+                    closed: envelope.closed,
+                    opening: false,
+                    _admission: envelope.admission,
+                };
+                if outbox.send(completion).is_err() {
+                    break;
+                }
+                continue;
+            }
+        } else {
+            request
+        };
         let result = execute(
             request,
             &envelope,
@@ -493,6 +688,8 @@ fn worker(
                 Some(*revision)
             }
             Ok(Response::Snapshot(snapshot)) => Some(snapshot.revision()),
+            Ok(Response::Info(info)) => Some(info.revision),
+            Ok(Response::Stats { revision, .. }) => Some(*revision),
             Ok(Response::Transaction(transaction)) => Some(transaction.expected),
             Ok(Response::Saved(report)) => Some(report.revision),
             _ => revision,
@@ -510,6 +707,17 @@ fn worker(
         if outbox.send(completion).is_err() {
             break;
         }
+    }
+    // Result receiver loss is another shutdown path; never detach a publishing save.
+    if let Some(PendingSave {
+        envelope,
+        snapshot: _snapshot,
+        worker,
+    }) = saving.take()
+        && let Ok(saved) = worker.join()
+        && let Some(owned) = documents.get_mut(&envelope.document)
+    {
+        owned.document.finish_save(saved);
     }
 }
 /// Captured revision for stale viewport checks; Ready gets its revision in its response.
@@ -588,7 +796,20 @@ fn execute(
                 .ok_or(Error::Closed)?
                 .document;
             match request {
+                Request::Info(_) => Ok(Response::Info(DocumentInfo {
+                    revision: document.revision(),
+                    dirty: document.is_dirty(),
+                    len: document.current.root.entry.bytes,
+                    lines: document.current.root.entry.lines + 1,
+                    path: document.path().map(PathBuf::from),
+                    history: document.history.cursor,
+                    history_begin: document.history.begin,
+                })),
                 Request::Snapshot(_) => Ok(Response::Snapshot(document.snapshot()?)),
+                Request::Stats(_) => Ok(Response::Stats {
+                    revision: document.revision(),
+                    usage: document.stats()?,
+                }),
                 Request::BeginTransaction { expected, .. } => {
                     Ok(Response::Transaction(document.transaction(expected)?))
                 }

@@ -34,6 +34,39 @@
 - A workflow where the agent writes functional/system tests and the user writes
   implementation is an option to discuss later, not an established requirement.
 
+## Test-first development and review
+
+1. Define the observable behavior and the constraints that must hold on success
+   and failure. For a small change, the test can be the behavior record. For
+   stage work, link the affected acceptance criteria to checks in the existing
+   `Validation record`.
+2. For a behavior change, write or extend the focused test before changing the
+   implementation. Run it and confirm it fails for the expected reason. An
+   existing test that reproduces the problem serves the same purpose. When
+   automation is impractical, define a repeatable manual check before editing
+   and record what you can verify before and after the change.
+3. Make the smallest change that satisfies the behavior and its constraints.
+   Run the focused check and relevant regressions through the normal entry
+   points. Report what passed and any behavior or environment still unverified.
+
+- When a change affects overlapping operations, include a test that controls
+  the important ordering with explicit synchronization. Use Loom when a small
+  synchronization component needs several thread orderings explored. Use
+  integration tests for real file, process, or terminal behavior.
+- When a change alters a guard that protects user data, check that the test
+  catches a deliberate break in that guard after the baseline passes. Use an
+  isolated copy and either a focused `cargo-mutants` run or a single deliberate
+  mutation. Confirm the intended assertion fails. A build failure alone gives
+  no evidence about that assertion.
+- Any agent assigned a review must read and follow [REVIEW.md](REVIEW.md) before
+  starting. For substantial or risky changes, or when the user requests a
+  review, delegate to a separate Review agent. In the handoff, explicitly tell
+  the reviewer to read and follow `REVIEW.md` and provide the requirements, base
+  and diff, and relevant tests. Use a fresh context when available. Address
+  findings, rerun affected checks, and have the reviewer inspect material fixes.
+  If a separate reviewer is unavailable, follow `REVIEW.md` for the self-review
+  and identify it as such.
+
 ## Programming Style and Guidelines
 
 ### Rust
