@@ -28,6 +28,15 @@ use std::{
 pub enum Request {
     /// Prepare a named document, reporting provisional progress through its Job.
     Open(PathBuf),
+    /// Restore a validated recovery object as an unnamed document with fresh history.
+    Restore {
+        /// Immutable recovery-object path, never a named save destination.
+        path: PathBuf,
+        /// Checkpointed format, including the suggested Enter convention.
+        format: super::Format,
+        /// Expected logical text length, excluding the serialization BOM.
+        len: u64,
+    },
     /// Create an unnamed empty document.
     New,
     /// Obtain current path, dirty state and retained history positions.
@@ -36,6 +45,8 @@ pub enum Request {
     Stats(DocumentId),
     /// Capture an immutable bounded read/save lease.
     Snapshot(DocumentId),
+    /// Capture a budgeted background lease that pins its own generation during compaction.
+    BackgroundSnapshot(DocumentId),
     /// Read a bounded window from a captured state.
     Read {
         /// Captured immutable state.
@@ -100,13 +111,27 @@ pub enum Request {
     },
     /// Reclaim unreachable working data; external leases must first be released.
     Compact(DocumentId),
+    /// Capture immutable clean named state for background refresh preparation.
+    PrepareRefresh(DocumentId),
+    /// Atomically install prepared content if its captured revision/baseline remain eligible.
+    Refresh {
+        /// Original runtime document identity.
+        document: DocumentId,
+        /// Validated private candidate and its original snapshot lease.
+        prepared: Box<super::PreparedRefresh>,
+    },
 }
 impl Request {
     /// Originating identity, except when opening/creating a new one.
     fn document(&self) -> Option<DocumentId> {
         match self {
-            Self::Open(_) | Self::New => None,
-            Self::Info(id) | Self::Stats(id) | Self::Snapshot(id) | Self::Compact(id) => Some(*id),
+            Self::Open(_) | Self::Restore { .. } | Self::New => None,
+            Self::Info(id)
+            | Self::Stats(id)
+            | Self::Snapshot(id)
+            | Self::BackgroundSnapshot(id)
+            | Self::Compact(id)
+            | Self::PrepareRefresh(id) => Some(*id),
             Self::Read { snapshot, .. }
             | Self::LocateLine { snapshot, .. }
             | Self::Save { snapshot, .. } => Some(snapshot.document()),
@@ -115,13 +140,14 @@ impl Request {
             | Self::Apply { document, .. }
             | Self::Undo { document, .. }
             | Self::Redo { document, .. } => Some(*document),
+            Self::Refresh { document, .. } => Some(*document),
         }
     }
     /// Conservative owned payload charge. Staged file contents do not reside in memory.
     fn payload(&self) -> usize {
         match self {
             Self::Replace { text, .. } => text.capacity(),
-            Self::Open(path) => path.capacity(),
+            Self::Open(path) | Self::Restore { path, .. } => path.capacity(),
             Self::Save {
                 target: SaveTarget::New(path),
                 ..
@@ -167,8 +193,13 @@ pub enum Response {
     Saved(SaveReport),
     /// Compaction finished without changing text, revision, or undo semantics.
     Compacted,
+    /// Immutable owner-captured task; its caller performs preparation off the mutation path.
+    RefreshTask(Box<super::RefreshTask>),
+    /// Atomic refresh outcome with explicit history pruning/reset information.
+    Refreshed(super::RefreshReport),
 }
 /// Small owner-consistent metadata for interactive state and bounded undo view history.
+#[derive(Clone, Debug)]
 pub struct DocumentInfo {
     /// Current monotonic revision.
     pub revision: Revision,
@@ -184,6 +215,10 @@ pub struct DocumentInfo {
     pub history: u64,
     /// Oldest retained undo descriptor identifier.
     pub history_begin: u64,
+    /// A next mutation needs compaction; interactive background leases must yield first.
+    pub compaction_pending: bool,
+    /// Last acknowledged named-file version; absent for unnamed documents.
+    pub file_observation: Option<super::FileObservation>,
 }
 /// A bounded progress slot keeps preview until consumed and coalesces numeric progress.
 struct Progress {
@@ -566,6 +601,36 @@ struct PendingSave {
     envelope: Envelope,
     snapshot: Snapshot,
 }
+
+/// Source validation runs independently; unwinding still cancels and joins its reader.
+struct RefreshCheckWorker {
+    handle: Option<JoinHandle<Result<Box<super::PreparedRefresh>, Error>>>,
+    cancel: Cancellation,
+}
+impl RefreshCheckWorker {
+    fn is_finished(&self) -> bool {
+        self.handle.as_ref().is_some_and(JoinHandle::is_finished)
+    }
+    fn join(mut self) -> Result<Box<super::PreparedRefresh>, Error> {
+        self.handle
+            .take()
+            .ok_or(Error::CorruptStorage)?
+            .join()
+            .unwrap_or(Err(Error::CorruptStorage))
+    }
+}
+impl Drop for RefreshCheckWorker {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            self.cancel.cancel();
+            let _ = handle.join();
+        }
+    }
+}
+struct PendingRefreshCheck {
+    worker: RefreshCheckWorker,
+    envelope: Envelope,
+}
 /// Prepare one named file at a time. Only the mutation owner can install it.
 fn prepare_opens(
     inbox: Receiver<Envelope>,
@@ -574,13 +639,15 @@ fn prepare_opens(
     resources: Arc<Resources>,
 ) {
     for mut envelope in inbox {
-        let Request::Open(path) = std::mem::replace(&mut envelope.request, Request::New) else {
-            unreachable!("only named opens go to the preparation worker");
+        let (path, restore) = match std::mem::replace(&mut envelope.request, Request::New) {
+            Request::Open(path) => (path, None),
+            Request::Restore { path, format, len } => (path, Some((format, len))),
+            _ => unreachable!("only opens/restores go to the preparation worker"),
         };
         let result = (|| {
             envelope.cancel.check()?;
             let permit = resources.buffers.acquire(4096)?;
-            let document = Document::open_shared(
+            let mut document = Document::open_shared(
                 &path,
                 options.clone(),
                 resources.clone(),
@@ -594,6 +661,9 @@ fn prepare_opens(
                     }
                 },
             )?;
+            if let Some((format, len)) = restore {
+                document.restore_scratch(format, len)?;
+            }
             Ok(OwnedDocument {
                 document,
                 closed: envelope.closed.clone(),
@@ -686,7 +756,36 @@ fn worker(
     let mut opening: HashMap<DocumentId, VecDeque<Envelope>> = HashMap::new();
     let mut ready = VecDeque::new();
     let mut saving: Option<PendingSave> = None;
+    let mut checking: Option<PendingRefreshCheck> = None;
     loop {
+        if checking
+            .as_ref()
+            .is_some_and(|checking| checking.worker.is_finished())
+        {
+            let PendingRefreshCheck { worker, envelope } =
+                checking.take().expect("finished refresh validation");
+            let result = worker.join().and_then(|prepared| {
+                documents
+                    .get_mut(&envelope.document)
+                    .ok_or(Error::Closed)
+                    .and_then(|owned| {
+                        owned
+                            .document
+                            .finish_refresh_validated(*prepared, &envelope.cancel)
+                    })
+                    .map(Response::Refreshed)
+            });
+            let revision = match &result {
+                Ok(Response::Refreshed(report)) => Some(report.revision),
+                _ => None,
+            };
+            if outbox
+                .send(envelope.complete(revision, result, false))
+                .is_err()
+            {
+                break;
+            }
+        }
         // Process at most one transfer before giving mutations and saves a turn.
         if let Ok(PreparedOpen { envelope, result }) = prepared.try_recv() {
             if let Some(mut queued) = opening.remove(&envelope.document) {
@@ -761,7 +860,7 @@ fn worker(
                 break;
             }
         };
-        if matches!(envelope.request, Request::Open(_)) {
+        if matches!(envelope.request, Request::Open(_) | Request::Restore { .. }) {
             let document = envelope.document;
             // All envelopes share the admission bound, including this open.
             if let Err(error) = opens.try_send(envelope) {
@@ -787,6 +886,48 @@ fn worker(
         let revision = request_revision(&envelope.request);
         let creating = matches!(envelope.request, Request::New);
         let request = std::mem::replace(&mut envelope.request, Request::New);
+        let request = match request {
+            Request::Refresh {
+                document,
+                mut prepared,
+            } if !prepared.verified_for_owner() => {
+                if checking.is_some() {
+                    if outbox
+                        .send(envelope.complete(None, Err(Error::Busy), false))
+                        .is_err()
+                    {
+                        break;
+                    }
+                    continue;
+                }
+                let cancel = envelope.cancel.clone();
+                match thread::Builder::new()
+                    .name("ede-refresh-verify".into())
+                    .spawn(move || {
+                        prepared.validate_source(&cancel)?;
+                        Ok(prepared)
+                    }) {
+                    Ok(handle) => {
+                        debug_assert_eq!(document, envelope.document);
+                        let worker = RefreshCheckWorker {
+                            handle: Some(handle),
+                            cancel: envelope.cancel.clone(),
+                        };
+                        checking = Some(PendingRefreshCheck { worker, envelope });
+                    }
+                    Err(error) => {
+                        if outbox
+                            .send(envelope.complete(None, Err(error.into()), false))
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                }
+                continue;
+            }
+            request => request,
+        };
         let request = if let Request::Save { snapshot, target } = request {
             let task = if saving.is_some() {
                 Err(Error::Busy)
@@ -922,8 +1063,13 @@ fn execute(
                     path: document.path().map(PathBuf::from),
                     history: document.history.cursor,
                     history_begin: document.history.begin,
+                    compaction_pending: document.requires_compaction()?,
+                    file_observation: document.file_observation(),
                 })),
                 Request::Snapshot(_) => Ok(Response::Snapshot(document.snapshot()?)),
+                Request::BackgroundSnapshot(_) => {
+                    Ok(Response::Snapshot(document.background_snapshot()?))
+                }
                 Request::Stats(_) => Ok(Response::Stats {
                     revision: document.revision(),
                     usage: document.stats()?,
@@ -966,10 +1112,17 @@ fn execute(
                     document.compact(&envelope.cancel)?;
                     Ok(Response::Compacted)
                 }
+                Request::PrepareRefresh(_) => {
+                    Ok(Response::RefreshTask(Box::new(document.prepare_refresh()?)))
+                }
+                Request::Refresh { prepared, .. } => Ok(Response::Refreshed(
+                    document.finish_refresh_validated(*prepared, &envelope.cancel)?,
+                )),
                 Request::Read { .. }
                 | Request::LocateLine { .. }
                 | Request::Save { .. }
                 | Request::Open(_)
+                | Request::Restore { .. }
                 | Request::New => unreachable!("routed before executing a document mutation"),
             }
         }

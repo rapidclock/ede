@@ -11,6 +11,7 @@ mod history;
 mod index;
 mod model;
 mod platform;
+mod refresh;
 mod resources;
 mod save;
 mod service;
@@ -21,6 +22,8 @@ mod tree;
 mod types;
 
 pub use model::Document;
+pub(crate) use refresh::observe;
+pub use refresh::{FileObservation, PreparedRefresh, RefreshProgress, RefreshReport, RefreshTask};
 pub(crate) use resources::Permit;
 pub use save::{SaveOutcome, SaveReport, SaveTarget};
 pub use service::{

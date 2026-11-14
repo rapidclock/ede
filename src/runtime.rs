@@ -134,6 +134,7 @@ pub(crate) fn run(
     inbox: StatusInbox,
     launch_directory: PathBuf,
     paths: Vec<PathBuf>,
+    recovery: crate::recovery::Store,
 ) -> io::Result<Exit> {
     let (width, height) = crossterm::terminal::size()?;
     // The event loop owns resize/layout changes. A fixed viewport prevents Ratatui
@@ -144,7 +145,7 @@ pub(crate) fn run(
             viewport: Viewport::Fixed(Rect::new(0, 0, width, height)),
         },
     )?;
-    let mut editor = Editor::new(launch_directory.clone(), paths)?;
+    let mut editor = Editor::new(launch_directory.clone(), paths, recovery)?;
     let picker = crate::picker::Picker::new()?;
     let mut host = TerminalHost {
         terminal,
@@ -196,6 +197,9 @@ fn event_loop_impl(
             && let Some(bridge) = editor.as_deref()
         {
             bridge.cancel_paste();
+        }
+        if let Some(bridge) = editor.as_deref() {
+            bridge.receiving(app.receiving_paste_tab());
         }
         if let Some(bridge) = editor.as_deref_mut() {
             if bridge.failed() {
@@ -335,6 +339,10 @@ fn event_loop_impl(
                 rendered_generation = None;
             }
         }
+        // Admit a completed paste before releasing its reception guard.
+        if let Some(bridge) = editor.as_deref() {
+            bridge.receiving(app.receiving_paste_tab());
+        }
     }
 }
 
@@ -355,7 +363,16 @@ fn effect(
     picker: Option<&crate::picker::Picker>,
 ) -> io::Result<bool> {
     match intent {
-        Intent::Quit => return Ok(true),
+        Intent::Quit => {
+            if let Some(editor) = editor {
+                if editor.submit(Action::FinishQuit) {
+                    app.expect_guard(editor.sequence());
+                }
+            } else {
+                return Ok(true);
+            }
+        }
+        Intent::QuitConfirmed => return Ok(true),
         Intent::Suspend => suspend(host, app)?,
         Intent::MouseCapture(enabled) => host.mouse(enabled)?,
         Intent::Picker(request) => {

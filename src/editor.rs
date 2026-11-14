@@ -24,18 +24,109 @@ use std::{
     thread::{self, JoinHandle},
     time::Duration,
 };
+mod recovery;
+mod refresh;
+use refresh::{Monitor, Watch};
 mod session;
+pub(crate) use recovery::RecoveryPage;
+#[cfg(test)]
+pub(crate) use recovery::RecoveryRow;
+use recovery::{RetainedScratch, Retention};
 pub(crate) use session::absolute;
 use session::{OpenJob, RunningSave, SaveIntent, Tab, TabState, WaitingGuard};
 pub(crate) use session::{TabId, TabSummary};
-/// Superseded layouts cancel independently of ordered navigation and document mutations.
+/// Tab-local input revokes prepared refreshes while queued intentions retain their charge.
+#[derive(Default)]
+struct InputEpoch {
+    value: Arc<AtomicU64>,
+    pending: AtomicUsize,
+}
+/// Shared tab admission state is small and never holds a lock during filesystem I/O.
 #[derive(Default)]
 struct ViewControl {
     active: Mutex<Cancellation>,
     layout: Arc<AtomicU64>,
     navigation: Arc<AtomicU64>,
+    targets: Mutex<Vec<(TabId, Arc<InputEpoch>)>>,
+    current: Mutex<Option<TabId>>,
+    receiving: Mutex<Option<TabId>>,
 }
 impl ViewControl {
+    fn admit(&self, action: &Action) -> Vec<Arc<InputEpoch>> {
+        let current = *self
+            .current
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let all = matches!(
+            action,
+            Action::Size(..)
+                | Action::Switch(_)
+                | Action::CycleTab(_)
+                | Action::New
+                | Action::Open(_)
+                | Action::OpenRetained { .. }
+                | Action::Guard(After::Quit)
+                | Action::FinishQuit
+        );
+        let target = match action {
+            Action::ForTab(tab, _)
+            | Action::RetryRefresh(tab)
+            | Action::RemoveTab(tab)
+            | Action::CancelOpen(tab) => Some(*tab),
+            Action::Guard(after) | Action::SaveGuard(after, _) | Action::Discard(after, _) => {
+                after.target().or(current)
+            }
+            Action::RecoveryPage { .. }
+            | Action::DiscardRetained { .. }
+            | Action::FieldPaste(..)
+            | Action::CancelGuard => None,
+            _ => current,
+        };
+        let targets = self
+            .targets
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let epochs: Vec<_> = targets
+            .iter()
+            .filter(|(tab, _)| all || Some(*tab) == target)
+            .map(|(_, epoch)| epoch.clone())
+            .collect();
+        for epoch in &epochs {
+            epoch.pending.fetch_add(1, Ordering::AcqRel);
+            epoch.value.fetch_add(2, Ordering::AcqRel);
+        }
+        epochs
+    }
+    fn set_receiving(&self, tab: Option<TabId>) {
+        let mut receiving = self
+            .receiving
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if *receiving == tab {
+            return;
+        }
+        let targets = self
+            .targets
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let changed: Vec<_> = targets
+            .iter()
+            .filter(|(id, _)| Some(*id) == *receiving || Some(*id) == tab)
+            .map(|(_, epoch)| epoch.clone())
+            .collect();
+        for epoch in &changed {
+            epoch.value.fetch_add(1, Ordering::AcqRel);
+        }
+        *receiving = tab;
+        for epoch in &changed {
+            epoch.value.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+    fn receiving_for(&self, tab: TabId) -> bool {
+        self.receiving
+            .lock()
+            .map_or(true, |receiving| *receiving == Some(tab))
+    }
     /// Inspect or replace the current read token without changing its generation.
     fn lock(&self) -> std::sync::LockResult<std::sync::MutexGuard<'_, Cancellation>> {
         self.active.lock()
@@ -64,6 +155,21 @@ pub(crate) enum Action {
     CancelOpen(TabId),
     CancelActiveOpen(Option<u64>),
     CancelGuard,
+    FinishQuit,
+    RetryRefresh(TabId),
+    RecoveryPage {
+        generation: u64,
+        cursor: Option<(u64, crate::recovery::Id)>,
+        previous: bool,
+    },
+    OpenRetained {
+        generation: u64,
+        scratch: crate::recovery::Id,
+    },
+    DiscardRetained {
+        generation: u64,
+        scratch: crate::recovery::Id,
+    },
     ForTab(TabId, Box<Action>),
     Save(Option<PathBuf>),
     SaveGuard(After, Option<PathBuf>),
@@ -104,6 +210,7 @@ impl Action {
             Self::ForTab(_, action) => action.bytes(),
             _ => 0,
         }) + 128
+            + crate::TAB_LIMIT * std::mem::size_of::<Arc<InputEpoch>>()
     }
 }
 /// Only combine collinear wheel deltas with the same direction: clamping is order-dependent.
@@ -125,6 +232,9 @@ pub(crate) enum Event {
     OpenFailed(String),
     Uncertain(u64, After, JobId),
     FieldPaste(u64, Result<String, String>),
+    QuitReady(u64),
+    PersistenceFailed(TabId, After, String),
+    RecoveryPage(u64, Arc<RecoveryPage>),
 }
 /// Save outcomes that require different handling while a discard is pending.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -197,9 +307,13 @@ struct Envelope {
     navigation_epoch: u64,
     paste_slot: Arc<Mutex<Option<Cancellation>>>,
     used: Arc<QueueBudget>,
+    epochs: Vec<Arc<InputEpoch>>,
 }
 impl Drop for Envelope {
     fn drop(&mut self) {
+        for epoch in &self.epochs {
+            epoch.pending.fetch_sub(1, Ordering::AcqRel);
+        }
         self.used.bytes.fetch_sub(self.charge, Ordering::AcqRel);
         self.used.entries.fetch_sub(1, Ordering::AcqRel);
         if self.paste {
@@ -225,7 +339,11 @@ pub(crate) struct Editor {
 }
 impl Editor {
     /// Start storage and coordinator workers with an optional initial path.
-    pub fn new(launch_directory: PathBuf, paths: Vec<PathBuf>) -> std::io::Result<Self> {
+    pub fn new(
+        launch_directory: PathBuf,
+        paths: Vec<PathBuf>,
+        recovery: crate::recovery::Store,
+    ) -> std::io::Result<Self> {
         let (sender, receiver) = mpsc::sync_channel(256);
         let (event_sender, events) = mpsc::sync_channel(16);
         let screen = Arc::new(Mutex::new(None));
@@ -249,6 +367,7 @@ impl Editor {
                         active,
                         view_cancellation,
                     )
+                    .with_retention(recovery)
                     .run(launch_directory, paths),
                     Err(error) => {
                         if let Ok(mut slot) = output.lock() {
@@ -342,6 +461,7 @@ impl Editor {
         } else {
             self.view_cancel.navigation.load(Ordering::Acquire)
         };
+        let epochs = self.view_cancel.admit(&action);
         let envelope = Envelope {
             action,
             sequence,
@@ -353,6 +473,7 @@ impl Editor {
             navigation_epoch,
             paste_slot: self.paste_slot.clone(),
             used: self.used.clone(),
+            epochs,
         };
         let Some(sender) = &self.sender else {
             return false;
@@ -364,6 +485,10 @@ impl Editor {
             }
             Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => false,
         }
+    }
+    /// Protect the receiving document until its completed paste is admitted or rejected.
+    pub fn receiving(&self, tab: Option<TabId>) {
+        self.view_cancel.set_receiving(tab);
     }
     /// Identity of the last admitted intention, used to reject obsolete dialog responses.
     pub fn sequence(&self) -> u64 {
@@ -442,6 +567,8 @@ struct Coordinator {
     active_open_admission: Option<(TabId, u64)>,
     summaries: Arc<[TabSummary]>,
     parked_action: bool,
+    retention: Option<Retention>,
+    monitor: Option<Monitor>,
     clipboard: Option<Arc<Spool>>,
     cut_clipboard: Option<Arc<Spool>>,
     cache: Checkpoints,
@@ -489,6 +616,8 @@ impl Coordinator {
             active_open_admission: None,
             summaries: Arc::default(),
             parked_action: false,
+            retention: None,
+            monitor: None,
             clipboard: None,
             cut_clipboard: None,
             cache: Checkpoints::default(),
@@ -591,6 +720,14 @@ impl Coordinator {
             }
         }
         let shutdown = self.service.shutdown();
+        if let Some(monitor) = self.monitor.take() {
+            monitor.shutdown();
+        }
+        if let Some(retention) = self.retention.take()
+            && let Some(worker) = retention.service.shutdown()
+        {
+            let _ = worker.join();
+        }
         let _ = shutdown.wait();
     }
     /// Install a new cancellation token for exactly one foreground operation.
@@ -641,8 +778,18 @@ impl Coordinator {
         }
     }
     /// Submit a storage request, waiting on this worker and observing cancellation/progress.
+    fn call_background(&mut self, request: Request) -> Result<Response, Error> {
+        let foreground = std::mem::take(&mut self.cancel);
+        let result = self.call(request);
+        self.cancel = foreground;
+        result
+    }
+    /// Submit a storage request, waiting on this worker and observing cancellation/progress.
     fn call(&mut self, request: Request) -> Result<Response, Error> {
-        let opening = matches!(request, Request::Open(_) | Request::New);
+        let opening = matches!(
+            request,
+            Request::Open(_) | Request::Restore { .. } | Request::New
+        );
         let cancellable = !matches!(request, Request::Info(_) | Request::Snapshot(_));
         self.counter += 1;
         let job = self
@@ -751,13 +898,14 @@ impl Coordinator {
         self.tab.top = view.top;
         self.tab.left = view.left;
         self.tab.screen.view = Some(Arc::new(view));
+        self.tab.view_retry = None;
         Ok(())
     }
     /// Publish background changes and surface failures without blocking terminal input.
     fn poll_background(&mut self) -> bool {
         let result = (|| {
             let changed = self.settle_completions()? | self.receive()?;
-            Ok(changed | self.poll_opens()?)
+            Ok(changed | self.poll_opens()? | self.poll_retention()? | self.poll_refreshes()?)
         })();
         match result {
             Ok(true) => self.publish(),
@@ -778,6 +926,18 @@ impl Coordinator {
         paste: Option<Arc<Spool>>,
         range: std::ops::Range<u64>,
     ) -> Result<(), Error> {
+        if let Some(tab) = self.tab.screen.tab {
+            self.yield_refresh_for_edit(tab)?;
+        }
+        if self
+            .tab
+            .info
+            .as_ref()
+            .is_some_and(|info| info.compaction_pending)
+            && let Some(tab) = self.tab.screen.tab
+        {
+            self.yield_checkpoint(tab)?;
+        }
         let info = self.tab.info.as_ref().ok_or(Error::Busy)?;
         let expected = info.revision;
         let before = self.tab.screen.position;
@@ -970,6 +1130,17 @@ impl Coordinator {
     }
     /// Handle one ordered user intention, leaving state intact on a failed edit.
     fn action(&mut self, action: Action) -> Result<(), Error> {
+        if matches!(
+            action,
+            Action::Insert(_) | Action::Paste(_) | Action::Command(_)
+        ) && self
+            .tab
+            .scratch
+            .as_ref()
+            .is_some_and(|scratch| scratch.retiring)
+        {
+            self.cancel_retained_close()?;
+        }
         // Lifecycle guards and saving can still protect/serialize work when its
         // caret cannot currently be read. No new position-dependent edit can run.
         if !matches!(
@@ -988,11 +1159,34 @@ impl Coordinator {
                 | Action::CancelOpen(_)
                 | Action::CancelActiveOpen(_)
                 | Action::CancelGuard
+                | Action::FinishQuit
+                | Action::RetryRefresh(_)
+                | Action::RecoveryPage { .. }
+                | Action::OpenRetained { .. }
+                | Action::DiscardRetained { .. }
                 | Action::Size(..)
         ) {
             self.reconcile_edit()?;
         }
         match action {
+            Action::RetryRefresh(tab) => self.retry_refresh(tab)?,
+            Action::RecoveryPage {
+                generation,
+                cursor,
+                previous,
+            } => {
+                if let Some(retention) = &mut self.retention {
+                    retention.request_page(generation, cursor, previous);
+                }
+            }
+            Action::OpenRetained {
+                generation,
+                scratch,
+            } => self.open_retained(generation, scratch)?,
+            Action::DiscardRetained {
+                generation,
+                scratch,
+            } => self.discard_retained(generation, scratch)?,
             Action::FieldPaste(paste, generation) => {
                 // Field length is independently bounded; document paste has no size cutoff.
                 let result = (|| -> Result<String, Error> {
@@ -1035,7 +1229,18 @@ impl Coordinator {
             Action::RemoveTab(tab) => self.remove_tab(tab)?,
             Action::CancelOpen(tab) => self.cancel_open(tab)?,
             Action::CancelActiveOpen(switch) => self.cancel_active_open(switch)?,
-            Action::CancelGuard => self.waiting_guard = None,
+            Action::CancelGuard => {
+                self.waiting_guard = None;
+                self.cancel_retained_close()?;
+            }
+            Action::FinishQuit => {
+                if self.retention.is_some() {
+                    self.cancel_retained_close()?;
+                    self.begin_retained_quit(self.active_sequence);
+                } else {
+                    self.event(Event::QuitReady(self.active_sequence));
+                }
+            }
             Action::Save(path) => {
                 if let Some(tab) = self.tab.screen.tab {
                     self.queue_save(tab, path)?;
@@ -1743,7 +1948,11 @@ mod tests {
 
             let failure = events.try_recv().unwrap();
             assert!(matches!(failure, Event::Saved(_, SaveResult::Failed, _)));
-            assert!(app.event(failure).is_none());
+            assert!(matches!(
+                app.event(failure),
+                Some(crate::app::Intent::Editor(Action::CancelGuard))
+            ));
+            worker.action(Action::CancelGuard).unwrap();
             for event in events.try_iter() {
                 assert!(
                     app.event(event).is_none(),
@@ -2257,7 +2466,7 @@ mod ordering_tests {
         }
         assert_eq!(editor.used.entries.load(Ordering::Acquire), 0);
         assert_eq!(editor.used.bytes.load(Ordering::Acquire), 0);
-        let mut full = String::with_capacity((1 << 20) - 128);
+        let mut full = String::with_capacity((1 << 20) - Action::Insert(String::new()).bytes());
         full.push('x');
         assert!(editor.submit(Action::Insert(full)));
         assert_eq!(editor.used.bytes.load(Ordering::Acquire), 1 << 20);

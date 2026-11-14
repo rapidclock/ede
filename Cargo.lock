@@ -185,7 +185,7 @@ dependencies = [
 
 [[package]]
 name = "ede"
-version = "0.0.1-dev.2"
+version = "0.0.1-dev.5"
 dependencies = [
  "crossterm",
  "memchr",

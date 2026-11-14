@@ -32,6 +32,48 @@ impl History {
         history.write(0, state, 0)?;
         Ok(history)
     }
+    /// Capture immutable records and branch positions without copying on the owner.
+    pub(super) fn reader(&self) -> Result<Self, Error> {
+        Ok(Self {
+            file: self.file.try_clone()?,
+            begin: self.begin,
+            cursor: self.cursor,
+            end: self.end,
+        })
+    }
+    /// Copy the captured branch descriptor prefix away from foreground file operations.
+    pub(super) fn fork_to(
+        &self,
+        file: File,
+        source: &super::source::Source,
+        cancel: &super::Cancellation,
+    ) -> Result<Self, Error> {
+        let length = self
+            .end
+            .checked_add(1)
+            .and_then(|records| records.checked_mul(64))
+            .ok_or(Error::ResourceLimit("history fork size"))?;
+        source.reserve(length)?;
+        let _permit = source
+            .resources
+            .buffers
+            .acquire(source.limits.text_page_bytes)?;
+        let mut bytes = vec![0; source.limits.text_page_bytes];
+        super::platform::copy_prefix(
+            &self.file,
+            &file,
+            length,
+            &mut bytes,
+            cancel,
+            source.faults.as_deref(),
+        )?;
+        Ok(Self {
+            file,
+            begin: self.begin,
+            cursor: self.cursor,
+            end: self.end,
+        })
+    }
     /// Read a validated immutable descriptor and its predecessor.
     fn record(&self, index: u64) -> Result<(State, u64), Error> {
         let mut bytes = [0; 64];

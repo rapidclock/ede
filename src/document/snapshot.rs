@@ -18,6 +18,7 @@ pub struct Snapshot {
     pub(super) document: DocumentId,
     pub(super) revision: Revision,
     pub(super) leases: Arc<AtomicUsize>,
+    pub(super) blocking_leases: Option<Arc<AtomicUsize>>,
 }
 impl Snapshot {
     /// Originating document identity, retained after close for stale-result checks.
@@ -151,6 +152,9 @@ impl Drop for Snapshot {
     /// Release one externally retained state and its store generation.
     fn drop(&mut self) {
         self.leases.fetch_sub(1, Ordering::AcqRel);
+        if let Some(blocking) = &self.blocking_leases {
+            blocking.fetch_sub(1, Ordering::AcqRel);
+        }
     }
 }
 /// Owned text window with an aggregate buffer reservation that lasts until drop.

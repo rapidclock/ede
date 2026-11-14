@@ -234,6 +234,15 @@ impl AppState {
     }
 
     pub(super) fn dialog_wheel(&mut self, up: bool, layout: &LayoutSnapshot) -> bool {
+        if matches!(self.modal, Some(Modal::Recovery(_))) {
+            for _ in 0..3 {
+                self.recovery_command(
+                    Command::Move(if up { Movement::Up } else { Movement::Down }, false),
+                    layout,
+                );
+            }
+            return true;
+        }
         if let Some(Modal::Open(picker)) = &mut self.modal {
             picker.scroll(if up { -3 } else { 3 });
             self.dirty = true;
@@ -253,6 +262,15 @@ impl AppState {
 
     pub(super) fn dialog_click(&mut self, control: Control) -> bool {
         match (&mut self.modal, control) {
+            (Some(Modal::Recovery(dialog)), Control::RecoveryRow(row)) => {
+                if dialog.loading || row >= dialog.page.rows.len() {
+                    return true;
+                }
+                dialog.highlight = row;
+                dialog.revision = dialog.revision.wrapping_add(1);
+                self.focus = Some(Control::RecoveryList);
+                self.dirty = true;
+            }
             (Some(Modal::Open(picker)), Control::PickerRow(row)) => {
                 picker.highlight = row;
                 self.focus = Some(Control::PickerList);

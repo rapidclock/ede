@@ -402,6 +402,61 @@ impl<'a> Text<'a> {
         Ok((offset, column))
     }
     /// Cell coordinate of a valid caret, with a bounded checkpoint cache.
+    pub(crate) fn grapheme_coordinates(&mut self, offset: u64) -> Result<(u64, u64), Error> {
+        let line = self.snapshot.line_of_offset(ByteOffset(offset))?;
+        Ok((line, self.scan_graphemes(line, Some(offset), None)?.1))
+    }
+    /// Clamp a logical grapheme ordinal to a line without depending on terminal cell widths.
+    pub(crate) fn at_grapheme(&mut self, line: u64, ordinal: u64) -> Result<u64, Error> {
+        Ok(self.scan_graphemes(line, None, Some(ordinal))?.0)
+    }
+    /// Count long ASCII runs in bulk and stream all other extended grapheme boundaries.
+    fn scan_graphemes(
+        &mut self,
+        line: u64,
+        byte: Option<u64>,
+        ordinal: Option<u64>,
+    ) -> Result<(u64, u64), Error> {
+        let (mut offset, end) = self.line_bounds(line)?;
+        let mut count = 0u64;
+        while offset < end {
+            if byte.is_some_and(|target| offset >= target)
+                || ordinal.is_some_and(|target| count >= target)
+            {
+                break;
+            }
+            if offset < self.start as u64 || offset >= (self.start + self.chunk.len()) as u64 {
+                self.load(offset as usize)?;
+            }
+            let within = offset as usize - self.start;
+            let available = self.chunk.as_bytes()[within..]
+                .iter()
+                .take_while(|byte| matches!(byte, b' '..=b'~'))
+                .count() as u64;
+            let available = available.min(end - offset);
+            let safe = if offset + available == end {
+                available
+            } else {
+                available.saturating_sub(1)
+            };
+            let run = safe
+                .min(byte.map_or(u64::MAX, |target| target.saturating_sub(offset)))
+                .min(ordinal.map_or(u64::MAX, |target| target.saturating_sub(count)));
+            if run != 0 {
+                offset += run;
+                count += run;
+                continue;
+            }
+            let next = self.next(offset)?.min(end);
+            if next <= offset {
+                return Err(Error::CorruptStorage);
+            }
+            offset = next;
+            count += 1;
+        }
+        Ok((offset, count))
+    }
+    /// Cell coordinate of a valid caret, with a bounded checkpoint cache.
     pub fn coordinates(
         &mut self,
         offset: u64,
