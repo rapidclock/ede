@@ -204,8 +204,9 @@ ordinary event-to-visible latency and editor RSS, navigates/edits beginning,
 middle and end, and checks saving during edits. Corpus choices are `ordinary`,
 `dense`, and `long`; sizes are MiB. Fixtures are isolated and removed afterwards.
 Generated files are warm, and a PTY observer does not measure a graphical terminal
-or remote transport. Linux CI includes a 256 MiB, swap-disabled interactive run;
-its results remain pending until that workflow executes.
+or remote transport. Linux CI exercises storage, editing, scratch recovery, and
+refresh with 256 MiB and swap disabled. Native and CI measurements are recorded
+in the Stage 5 validation record.
 
 The resource probe runs the coordinator and UI against ordinary, dense, long-line
 and mixed Unicode files. It records managed allocation high waters, working-file

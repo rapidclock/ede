@@ -1,8 +1,7 @@
 # 05 — Persistent scratch documents, recovery, and automatic file refresh
 
-**Status:** Implemented; native validation and independent reviews passed.
-Final aggregate checks and Linux CI are pending. Design and implementation were
-authorized on 2026-11-14.
+**Status:** Implemented and validated; [PR #5](https://github.com/rapidclock/ede/pull/5)
+targets `feat/initial_mvp`. Design and implementation were authorized on 2026-11-14.
 
 Parent: [MVP overview](overview.md). Depends on Stages 02–04, including
 Stage 04 merged through [PR #4](https://github.com/rapidclock/ede/pull/4).
@@ -417,8 +416,12 @@ deferral.
 
 ## Validation record
 
-**Implementation complete; local checks and independent material-fix reviews
-passed. Linux CI and the final PR checks are pending.**
+**Implementation complete; local checks, Linux/macOS CI, resource probes,
+mutation checks, and independent material-fix reviews passed.**
+
+The [successful CI run](https://github.com/rapidclock/ede/actions/runs/43642498779)
+validated implementation commit `b2373aa`. Subsequent documentation-only commits
+record this evidence without changing the tested application or test code.
 
 Validation was performed on 2026-11-14 with Rust 1.99.1,
 `aarch64-apple-darwin`, macOS 27.2 (26B123), MacBookPro18,2,
@@ -438,6 +441,15 @@ simultaneous startup claims. `cargo fmt --all -- --check`,
 `cargo clippy --workspace --all-targets --locked -- -D warnings`, and
 `git diff --check` also passed.
 
+| Normal CI suite | Unit | CLI | Document integration | PTY |
+| --- | --- | --- | --- | --- |
+| macOS 26 arm64 | 114 passed | 4 passed | 40 passed | 26 passed |
+| Ubuntu 26.04 x86_64 | 115 passed | 4 passed | 41 passed | 27 passed |
+
+The Linux-only XDG-without-HOME executable check passed. All large storage and
+editing probes also passed on Linux, including Stage 05 recovery and refresh
+with a 256 MiB cgroup limit and swap disabled.
+
 | Criteria | Evidence |
 | --- | --- |
 | R01 | Scratch quit/relaunch PTY; exact selection, caret, preferred column, viewport, relative order, nonfirst remembered scratch across named CLI launch, empty scratches, Unicode, and fresh history in coordinator tests. |
@@ -452,7 +464,7 @@ simultaneous startup claims. `cargo fmt --all -- --check`,
 | F03 | Undo/redo and new baseline, prior history, BOM-only changes, identical text without a new revision, configured byte-cap reset, repeated-refresh automatic arena reclamation. |
 | F04 | Executable missing/invalid/symlink/rename recovery with last-good text intact; exact 1/2/4/8/16/30/30-second retry deadlines and manual bypass; storage permission/type/conflict regressions. |
 | I01 | Full PTY regressions cover keyboard, mouse, paste, tiny geometry, modal focus, canceled quit, signals, suspend/resume and terminal restoration. Physical terminal key delivery retains the Stage 03 limitations. |
-| I02 | Native 1 GiB refresh + 64 MiB scratch benchmark and 1 GiB managed-storage probe below. Linux constrained-memory jobs are configured, awaiting execution. |
+| I02 | Native and Linux 1 GiB refresh + 64 MiB scratch benchmarks and 1 GiB managed-storage probes passed; Linux used a 256 MiB cgroup limit with swap disabled. Measurements follow. |
 
 The production interval is five seconds. Scheduling tests control the stored
 deadline rather than waiting on wall time; synchronized worker gates establish
@@ -492,7 +504,7 @@ history reset. Working arenas may temporarily retain unreachable bytes until
 their bounded compaction threshold. Repeated-refresh tests verify collection
 without a later user edit. Directory sampling can miss short-lived disk peaks,
 and APFS allocated blocks can share physical extents. These figures do not claim
-a power-loss guarantee or constrained-memory verification.
+a power-loss guarantee. Constrained-memory evidence follows separately.
 
 The first-text and ordinary-input goals passed in this native run. Large paste
 ingress is substantially slower than storage refresh: this run's 104 seconds
@@ -526,25 +538,48 @@ bounded error annotations, and material-fix reproductions passed re-review with
 no remaining findings. The rare post-Ready Info-failure diagnostic path was
 inspected but not directly fault-injected.
 
-### Remaining checks and limits
+### Final CI evidence and limits
 
 The [first PR CI run](https://github.com/rapidclock/ede/actions/runs/43641321320)
 passed formatting, Clippy, and all normal tests on macOS and Ubuntu 26.04 x86_64
-(two AMD EPYC 9V74 CPUs, 7.7 GiB host RAM, ext4). It also passed the existing
+(two vCPUs reporting AMD EPYC 9V74, 7.7 GiB host RAM, ext4). It also passed the existing
 1 GiB ordinary/dense/long storage probes at 8 GiB, ordinary storage at 256 MiB,
 and all three interactive corpora at 256 MiB, with swap disabled. The new I02
 fixture writer was OOM-killed before starting the editor: it had accumulated
 unsynchronized dirty file cache under that limit. Both new fixture generators
 now synchronize every 8 MiB, matching the existing generator; the corrected
 16 MiB/1 MiB end-to-end smoke and repeated full local checks passed. New Stage 05
-resource checks now run before older benchmarks. Their Linux rerun is pending.
+resource checks now run before older benchmarks. The corrected
+[CI run](https://github.com/rapidclock/ede/actions/runs/43642498779) passed every
+step on both platforms, including both Stage 05 resource probes and all existing
+1 GiB storage and editing probes.
+
+| Linux at 256 MiB, swap disabled | Result |
+| --- | --- |
+| First displayed text / editable Ready | 42.846 ms / 14,835.216 ms |
+| Companion input, 50 samples | p50 18.748 ms; p95 18.924 ms; maximum 47.919 ms |
+| External refresh observed / storage-only refresh | 46,643.733 ms / 44,934.066 ms |
+| Final Quit flush / scratch relaunch | 37.566 ms / 727.978 ms |
+| 64 MiB paste reception and incorporation | 7,262.529 ms |
+| Sampled / kernel lifetime peak editor RSS | 5,900 / 5,928 KiB |
+| Shared managed cache / buffer high waters | 0 / 622,848 bytes |
+| Final working text / metadata bytes | 2,147,483,648 / 295,048 |
+| Sampled fixture + working logical / allocated bytes | 4,295,409,872 / 4,295,438,336 |
+
+The portable copy path was used on ext4. The first-text and ordinary-input goals
+passed. Under this memory limit, complete preparation takes longer while the
+companion tab remains responsive. The cgroup's 256 MiB peak includes file cache
+and the test harness; process RSS is reported separately. Recovery-object disk
+usage matched the native run. These are measured environments, not a claim about
+unmeasured hardware, cold-cache latency, or remote terminal transport.
 
 - Local aggregate formatting, Clippy with warnings denied, and tests passed.
   ShellCheck 0.11.0 passed all multiline CI shell blocks, extracted and linted
-  as POSIX shell through an isolated uv tool environment. PR checks are pending.
-- Linux native tests and 256 MiB, swap-disabled 1 GiB recovery/refresh jobs must run
-  in CI; the local Docker daemon is unavailable. Do not treat configured jobs as
-  passing results.
+  as POSIX shell through an isolated uv tool environment. The final fixture-only
+  changes received an additional independent review with no findings.
+- Linux native tests, 8 GiB baseline probes, and 256 MiB, swap-disabled 1 GiB
+  recovery/refresh and older regression jobs passed in CI. Local Docker execution
+  was unavailable; Linux evidence comes from the linked GitHub Actions run.
 - GUI terminals, actual Cmd delivery, remote transports, and power-loss recovery
   are not established by these PTYs. Existing Stage 03 compatibility limitations
   remain explicit; no new deferral or relaxed recovery guarantee is approved.

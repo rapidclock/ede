@@ -1,6 +1,6 @@
 # 001 — Initial MVP overview
 
-Status: **MVP scope and roadmap accepted — Stages 01–04 merged; Stage 05 implemented, with final checks in progress.**
+Status: **MVP scope and roadmap accepted — Stages 01–04 merged; Stage 05 implemented and validated, with its PR open.**
 
 Project: **ede**, a predominantly Rust terminal text editor for macOS and Linux.
 
@@ -512,10 +512,10 @@ Evidence: [Stage 04 validation record](04_tabs_and_file_picker.md#validation-rec
 ### 05 — Persistent scratch documents, recovery, and automatic file refresh
 
 Design: [05_scratch_recovery.md](05_scratch_recovery.md). Depends on: 02–04.
-Status: implemented; native validation and independent reviews passed; final checks pending.
+Status: implemented and validated; [PR #5](https://github.com/rapidclock/ede/pull/5) open into `feat/initial_mvp`.
 Branch: `stage/scratch_recovery`; PR target: `feat/initial_mvp`.
 Evidence: [Stage 05 validation record](05_scratch_recovery.md#validation-record)
-(native results recorded; Linux CI pending).
+(native and Linux CI results recorded).
 
 The accepted design gives each live instance an independent scratch set. A new
 instance restores the retained scratches of all retired owners; overflow beyond
