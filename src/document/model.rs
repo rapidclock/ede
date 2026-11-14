@@ -21,7 +21,7 @@ use std::{
 };
 
 /// Immutable expected destination content plus observed path/target identity.
-#[derive(Clone)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct Baseline {
     pub state: State,
     pub supplied: PathBuf,
@@ -36,9 +36,10 @@ pub struct Document {
     pub(super) attention: bool,
     pub(super) history: History,
     pub(super) id: DocumentId,
-    revision: Revision,
+    pub(super) revision: Revision,
     pub(super) leases: Arc<AtomicUsize>,
-    pruned: u64,
+    pub(super) blocking_leases: Arc<AtomicUsize>,
+    pub(super) pruned: u64,
 }
 impl Document {
     /// Prepare a stable private snapshot. Preview callbacks precede full validation.
@@ -140,7 +141,7 @@ impl Document {
         };
         Self::from_store(store, state, Some(baseline))
     }
-    /// Create an unnamed empty document; durable scratch recovery comes in Stage 05.
+    /// Create an unnamed empty document; the recovery service persists its snapshots.
     pub fn new(options: OpenOptions) -> Result<Self, Error> {
         let resources = Resources::new(&options.limits)?;
         Self::new_shared(options, resources)
@@ -174,8 +175,25 @@ impl Document {
             id: DocumentId(identity()?),
             revision: Revision(0),
             leases: Arc::new(AtomicUsize::new(0)),
+            blocking_leases: Arc::new(AtomicUsize::new(0)),
             pruned: 0,
         })
+    }
+    /// Remove an object's temporary path and start history at the checkpointed format.
+    pub(super) fn restore_scratch(&mut self, format: Format, len: u64) -> Result<(), Error> {
+        if self.current.root.entry.bytes != len || self.current.format.bom != format.bom {
+            return Err(Error::CorruptStorage);
+        }
+        let store = self.store.lock().map_err(|_| Error::CorruptStorage)?;
+        let state = State {
+            format,
+            ..self.current
+        };
+        let history = History::new(tempfile::tempfile_in(store.directory.path())?, state)?;
+        self.current = state;
+        self.baseline = None;
+        self.history = history;
+        Ok(())
     }
     /// Stable document identity.
     pub fn id(&self) -> DocumentId {
@@ -199,14 +217,29 @@ impl Document {
     }
     /// Create a bounded immutable read/save lease; the caller must release it.
     pub fn snapshot(&self) -> Result<Snapshot, Error> {
+        self.capture_snapshot(true)
+    }
+    /// Background readers pin their old immutable generation without blocking a new one.
+    pub(super) fn background_snapshot(&self) -> Result<Snapshot, Error> {
+        self.capture_snapshot(false)
+    }
+    fn capture_snapshot(&self, blocking: bool) -> Result<Snapshot, Error> {
         let store = self.store.lock().map_err(|_| Error::CorruptStorage)?;
         let limit = store.source.limits.leases;
-        let reader = Box::new(store.reader()?);
+        let mut reader = store.reader()?;
+        if !blocking {
+            reader.source.uncached = true;
+            reader.tree = store.tree.uncached_reader()?;
+        }
+        let reader = Box::new(reader);
         self.leases
             .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
                 (n < limit).then_some(n + 1)
             })
             .map_err(|_| Error::Busy)?;
+        if blocking {
+            self.blocking_leases.fetch_add(1, Ordering::AcqRel);
+        }
         Ok(Snapshot {
             store: self.store.clone(),
             state: Box::new(self.current),
@@ -214,6 +247,7 @@ impl Document {
             document: self.id,
             revision: self.revision,
             leases: self.leases.clone(),
+            blocking_leases: blocking.then(|| self.blocking_leases.clone()),
         })
     }
     /// Start an on-disk transaction plan for incremental, bounded-memory staging.
@@ -259,26 +293,7 @@ impl Document {
         }
         cancel.check()?;
         let next_revision = self.next_revision()?;
-        let needs_compaction = {
-            let store = self.store.lock().map_err(|_| Error::CorruptStorage)?;
-            let live_upper = self
-                .current
-                .root
-                .entry
-                .bytes
-                .saturating_add(
-                    self.baseline
-                        .as_ref()
-                        .map_or(0, |b| b.state.root.entry.bytes),
-                )
-                .saturating_add(store.source.limits.undo_bytes.saturating_mul(2));
-            store.source.length > live_upper.saturating_add(1 << 20)
-                || store
-                    .tree
-                    .disk_bytes()
-                    .saturating_add(self.history.disk_bytes()?)
-                    > 64 << 20
-        };
+        let needs_compaction = self.requires_compaction()?;
         if needs_compaction {
             self.compact(cancel)?;
         }
@@ -338,6 +353,27 @@ impl Document {
         self.current = state;
         self.revision = next_revision;
         Ok(self.revision)
+    }
+    /// Let interactive clients yield background snapshot leases before mandatory compaction.
+    pub(super) fn requires_compaction(&self) -> Result<bool, Error> {
+        let store = self.store.lock().map_err(|_| Error::CorruptStorage)?;
+        let live_upper = self
+            .current
+            .root
+            .entry
+            .bytes
+            .saturating_add(
+                self.baseline
+                    .as_ref()
+                    .map_or(0, |b| b.state.root.entry.bytes),
+            )
+            .saturating_add(store.source.limits.undo_bytes.saturating_mul(2));
+        Ok(store.source.length > live_upper.saturating_add(1 << 20)
+            || store
+                .tree
+                .disk_bytes()
+                .saturating_add(self.history.disk_bytes()?)
+                > 64 << 20)
     }
     /// Validate and apply reverse-ordered disk descriptors against one base revision.
     fn stage_apply(

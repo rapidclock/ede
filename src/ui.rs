@@ -28,6 +28,16 @@ pub(crate) enum Control {
     TabListRow(TabId),
     TabListClose,
     TabListSwitch,
+    RecoveryList,
+    RecoveryRow(usize),
+    RecoveryOpen,
+    RecoveryRetry,
+    RecoveryDiscard,
+    RecoveryPrevious,
+    RecoveryNext,
+    RetryRefresh,
+    RecoveryErrorRetry,
+    RecoveryErrorCancel,
     PickerList,
     PickerRow(usize),
     PickerUp,
@@ -56,6 +66,8 @@ impl Control {
             | Self::Tab(_)
             | Self::TabListRow(_)
             | Self::PickerRow(_) => None,
+            Self::RecoveryRow(_) | Self::RecoveryList => None,
+            Self::RetryRefresh => Some(Command::RetryRefresh),
             Self::Menu => Some(Command::Menu),
             Self::SaveErrorAs => Some(Command::SaveAs),
             Self::Help => Some(Command::Help),
@@ -78,6 +90,15 @@ impl Control {
             | Self::PickerList
             | Self::PickerRow(_)
             | Self::TabList => "",
+            Self::RecoveryList | Self::RecoveryRow(_) => "",
+            Self::RecoveryOpen => "Open",
+            Self::RecoveryRetry => "Retry",
+            Self::RecoveryDiscard => "Discard",
+            Self::RecoveryPrevious => "Prev",
+            Self::RecoveryNext => "Next",
+            Self::RetryRefresh => "Retry refresh",
+            Self::RecoveryErrorRetry => "Retry",
+            Self::RecoveryErrorCancel => "Cancel quit",
             Self::Tabs => "Tabs",
             Self::TabClose => "×",
             Self::TabListClose => "Close",
@@ -172,11 +193,17 @@ impl LayoutSnapshot {
             Some(Modal::Confirm(after, _)) => (3, after.target().map_or(0, |tab| tab.0)),
             Some(Modal::Details(_)) => (4, 0),
             Some(Modal::SaveError(_)) => (5, 0),
+            Some(Modal::PersistenceError(_)) => (10, 0),
             Some(Modal::Open(dialog)) => (6, dialog.highlight as u64),
             Some(Modal::Tabs(tab)) => (7, tab.map_or(0, |tab| tab.0)),
+            Some(Modal::Recovery(dialog)) => (8, dialog.revision),
+            Some(Modal::DiscardRecovery(dialog, _)) => (9, dialog.revision),
         };
         let (picker_revision, picker_request) = match &app.modal {
             Some(Modal::Open(dialog)) => (dialog.revision, dialog.generation),
+            Some(Modal::Recovery(dialog) | Modal::DiscardRecovery(dialog, _)) => {
+                (dialog.revision, dialog.generation)
+            }
             _ => (0, 0),
         };
         Signature {
@@ -230,6 +257,50 @@ impl LayoutSnapshot {
                 );
                 result.add(Control::PathSubmit, Rect::new(overlay.x + 2, y, 6, 1));
                 result.add(Control::PathCancel, Rect::new(overlay.x + 11, y, 10, 1));
+            }
+            Some(Modal::Recovery(dialog)) => {
+                let rows = overlay.height.saturating_sub(4);
+                result.list_rows = rows;
+                result.add(
+                    Control::RecoveryList,
+                    Rect::new(overlay.x + 1, overlay.y + 1, overlay.width - 2, rows),
+                );
+                for (row, index) in (0..dialog.page.rows.len())
+                    .skip(list_start(dialog.highlight, rows))
+                    .take(rows as usize)
+                    .enumerate()
+                {
+                    result.add(
+                        Control::RecoveryRow(index),
+                        Rect::new(
+                            overlay.x + 1,
+                            overlay.y + 1 + row as u16,
+                            overlay.width - 2,
+                            1,
+                        ),
+                    );
+                }
+                let first = overlay.bottom() - 3;
+                result.add(Control::RecoveryOpen, Rect::new(overlay.x + 1, first, 6, 1));
+                result.add(
+                    Control::RecoveryRetry,
+                    Rect::new(overlay.x + 8, first, 7, 1),
+                );
+                result.add(
+                    Control::RecoveryDiscard,
+                    Rect::new(overlay.x + 16, first, 9, 1),
+                );
+                result.add(Control::PathCancel, Rect::new(overlay.x + 26, first, 8, 1));
+                if dialog.page.previous {
+                    result.add(Control::RecoveryPrevious, Rect::new(overlay.x + 1, y, 6, 1));
+                }
+                if dialog.page.next {
+                    result.add(Control::RecoveryNext, Rect::new(overlay.x + 8, y, 6, 1));
+                }
+            }
+            Some(Modal::DiscardRecovery(..)) => {
+                result.add(Control::ConfirmDiscard, Rect::new(overlay.x + 1, y, 10, 1));
+                result.add(Control::ConfirmCancel, Rect::new(overlay.x + 13, y, 10, 1));
             }
             Some(Modal::Tabs(selected)) => {
                 let rows = overlay.height.saturating_sub(3);
@@ -311,8 +382,22 @@ impl LayoutSnapshot {
                 result.add(Control::SaveErrorAs, Rect::new(overlay.x + 1, y, 11, 1));
                 result.add(Control::PathCancel, Rect::new(overlay.x + 15, y, 10, 1));
             }
+            Some(Modal::PersistenceError(_)) => {
+                result.add(
+                    Control::RecoveryErrorRetry,
+                    Rect::new(overlay.x + 1, y, 7, 1),
+                );
+                result.add(Control::SaveErrorAs, Rect::new(overlay.x + 9, y, 10, 1));
+                result.add(
+                    Control::RecoveryErrorCancel,
+                    Rect::new(overlay.x + 21, y, 13, 1),
+                );
+            }
             Some(Modal::Details(_)) => {
-                result.add(Control::DetailsClose, Rect::new(overlay.x + 2, y, 9, 1))
+                result.add(Control::DetailsClose, Rect::new(overlay.x + 2, y, 9, 1));
+                if app.screen.path.is_some() {
+                    result.add(Control::RetryRefresh, Rect::new(overlay.x + 13, y, 17, 1));
+                }
             }
             None => {}
         }
@@ -381,7 +466,12 @@ impl LayoutSnapshot {
         let controls: Vec<_> = self
             .targets
             .iter()
-            .filter(|t| !matches!(t.control, Control::PickerRow(_) | Control::TabListRow(_)))
+            .filter(|t| {
+                !matches!(
+                    t.control,
+                    Control::PickerRow(_) | Control::TabListRow(_) | Control::RecoveryRow(_)
+                )
+            })
             .collect();
         let count = controls.len();
         if count == 0 {
@@ -413,7 +503,7 @@ fn list_start(highlight: usize, rows: u16) -> usize {
 
 fn tab_text(tab: &TabSummary, active: bool) -> String {
     format!(
-        "{}{}{}{} {}",
+        "{}{}{}{} {}{}",
         if active { ">" } else { " " },
         if tab.modified { "*" } else { "" },
         if tab.attention { "!" } else { "" },
@@ -428,6 +518,7 @@ fn tab_text(tab: &TabSummary, active: bool) -> String {
         } else {
             ""
         },
+        if tab.scratch { "~" } else { "" },
         tab.label
     )
 }
@@ -555,12 +646,15 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &AppState, layout: &LayoutSnaps
             Some(Modal::Menu(_)) => " Actions (wheel/arrows) ",
             Some(Modal::Open(_)) => " Open file ",
             Some(Modal::Tabs(_)) => " Tabs — Enter to switch ",
+            Some(Modal::Recovery(_)) => " Recovery — retained scratches ",
+            Some(Modal::DiscardRecovery(..)) => " Discard retained scratch? ",
             Some(Modal::Path(PathKind::Save, _)) => " Save As (new path) ",
             Some(Modal::Path(PathKind::GoTo, _)) => " Go to line[:cell] (from 1) ",
             Some(Modal::Confirm(_, Some(_))) => " Destination may have changed ",
             Some(Modal::Confirm(..)) => " Unsaved changes ",
             Some(Modal::Details(_)) => " Details ",
             Some(Modal::SaveError(_)) => " Save failed — work retained ",
+            Some(Modal::PersistenceError(_)) => " Scratch persistence failed ",
             None => " Help ",
         };
         frame.render_widget(Block::default().title(title).borders(Borders::ALL), overlay);
@@ -573,6 +667,24 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &AppState, layout: &LayoutSnaps
         let text = match &app.modal {
             Some(Modal::Menu(_) | Modal::Path(..) | Modal::Open(_) | Modal::Tabs(_)) => {
                 String::new()
+            }
+            Some(Modal::Recovery(dialog)) => {
+                if dialog.loading {
+                    "Loading retained scratches…".into()
+                } else if dialog.page.rows.is_empty() {
+                    "No unloaded scratches on this page".into()
+                } else {
+                    String::new()
+                }
+            }
+            Some(Modal::DiscardRecovery(dialog, scratch)) => {
+                let label = dialog
+                    .page
+                    .rows
+                    .iter()
+                    .find(|row| row.id == *scratch)
+                    .map_or("Scratch", |row| row.label.as_str());
+                format!("{label}\nPermanently remove these retained contents?")
             }
             Some(Modal::Confirm(after, uncertain)) => {
                 let verb = if matches!(after, After::Close(_)) {
@@ -592,7 +704,9 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &AppState, layout: &LayoutSnaps
                 };
                 format!("{verb} — {label}\n{guidance}")
             }
-            Some(Modal::Details(text) | Modal::SaveError(text)) => safe(text),
+            Some(Modal::Details(text) | Modal::SaveError(text) | Modal::PersistenceError(text)) => {
+                safe(text)
+            }
             None => {
                 let mut lines = vec![
                     "Up/Down scroll help; Escape closes".to_owned(),
@@ -676,7 +790,14 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &AppState, layout: &LayoutSnaps
             frame.render_widget(
                 Paragraph::new(text).wrap(Wrap { trim: false }).scroll((
                     if app.help
-                        || matches!(app.modal, Some(Modal::Details(_) | Modal::SaveError(_)))
+                        || matches!(
+                            app.modal,
+                            Some(
+                                Modal::Details(_)
+                                    | Modal::SaveError(_)
+                                    | Modal::PersistenceError(_)
+                            )
+                        )
                     {
                         app.help_scroll
                     } else {
@@ -711,6 +832,18 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &AppState, layout: &LayoutSnaps
                     )
                 })
             }
+            (Control::RecoveryRow(index), Some(Modal::Recovery(dialog))) => {
+                dialog.page.rows.get(index).map(|row| {
+                    (
+                        format!(
+                            "{} {}",
+                            if index == dialog.highlight { ">" } else { " " },
+                            row.label
+                        ),
+                        index == dialog.highlight,
+                    )
+                })
+            }
             _ => None,
         };
         if let Some((label, focused)) = row {
@@ -726,7 +859,11 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &AppState, layout: &LayoutSnaps
         }
         if matches!(
             target.control,
-            Control::Content | Control::PathField | Control::PickerList | Control::TabList
+            Control::Content
+                | Control::PathField
+                | Control::PickerList
+                | Control::TabList
+                | Control::RecoveryList
         ) {
             continue;
         }

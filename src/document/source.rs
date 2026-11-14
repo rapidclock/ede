@@ -27,6 +27,7 @@ pub(super) struct Source {
     pub limits: StorageLimits,
     pub resources: Arc<Resources>,
     pub faults: Option<Arc<dyn FaultInjector>>,
+    pub(super) uncached: bool,
 }
 impl Source {
     /// New source; all file handles remain open for the lifetime of its generation.
@@ -45,6 +46,7 @@ impl Source {
             limits: options.limits.clone(),
             resources,
             faults: options.faults.clone(),
+            uncached: false,
         })
     }
     /// Duplicate immutable-prefix handles without retaining the document mutation lock.
@@ -58,6 +60,7 @@ impl Source {
             limits: self.limits.clone(),
             resources: self.resources.clone(),
             faults: self.faults.clone(),
+            uncached: self.uncached,
         })
     }
     /// Current immutable prefix length, including a possible raw BOM.
@@ -111,6 +114,17 @@ impl Source {
     }
     /// Read a physical range using a shared cache; incomplete append pages are never cached.
     pub fn read(&self, mut offset: u64, mut out: &mut [u8]) -> Result<(), Error> {
+        if self.uncached {
+            self.check(IoPoint::Read)?;
+            if offset
+                .checked_add(out.len() as u64)
+                .is_none_or(|end| end > self.length)
+            {
+                return Err(Error::CorruptStorage);
+            }
+            self.file.read_exact_at(out, offset)?;
+            return Ok(());
+        }
         if offset
             .checked_add(out.len() as u64)
             .is_none_or(|end| end > self.length)
@@ -213,6 +227,42 @@ pub(super) struct Store {
     pub cloned: bool,
 }
 impl Store {
+    /// Fork captured immutable prefixes into a private generation; no live-store lock spans I/O.
+    pub(super) fn fork(
+        reader: &Reader,
+        options: &OpenOptions,
+        cancel: &Cancellation,
+        mut progress: impl FnMut(u64, u64),
+    ) -> Result<Self, Error> {
+        let resources = reader.source.resources.clone();
+        let _permit = resources
+            .buffers
+            .acquire(options.limits.text_page_bytes * 2)?;
+        let (mut fresh, cloned) = Self::empty(options, resources, Some(&reader.source.file))?;
+        fresh.source.uncached = true;
+        fresh
+            .source
+            .reserve(if cloned { 0 } else { reader.source.length })?;
+        if cloned {
+            fresh.source.file.set_len(reader.source.length)?;
+        }
+        let mut bytes = vec![0; options.limits.text_page_bytes];
+        let mut offset = 0;
+        while offset < reader.source.length {
+            cancel.check()?;
+            let count = (reader.source.length - offset).min(bytes.len() as u64) as usize;
+            reader.source.read(offset, &mut bytes[..count])?;
+            fresh.source.append(&bytes[..count], cloned)?;
+            offset += count as u64;
+            progress(offset, reader.source.length);
+        }
+        fresh.tree = reader.tree.fork_to(
+            private_file(&fresh.directory.path().join("fork-tree"))?,
+            &fresh.source,
+            cancel,
+        )?;
+        Ok(fresh)
+    }
     /// Create owner-scoped working files (directory 0700, files 0600).
     pub(super) fn empty(
         options: &OpenOptions,

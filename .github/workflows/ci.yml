@@ -45,6 +45,38 @@ jobs:
         if: runner.os == 'Linux'
         run: cargo test --release --locked --test terminal --no-run
 
+      - name: Build refresh resource probe (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          cargo test --release --locked --lib --no-run --message-format=json |
+            jq -r 'select(.reason == "compiler-artifact" and .target.kind == ["lib"] and .profile.test == true) | "EDE_REFRESH_PROBE=\(.executable)"' >> "$GITHUB_ENV"
+
+      - name: Validate scratch recovery and refresh with constrained memory (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          for binary in "$GITHUB_WORKSPACE"/target/release/deps/terminal-*; do
+            if [ ! -f "$binary" ] || [ ! -x "$binary" ]; then
+              continue
+            fi
+            sudo systemd-run --wait --pipe --collect \
+              --property=MemoryMax=256M --property=MemorySwapMax=0 \
+              --setenv="TMPDIR=$RUNNER_TEMP" \
+              --setenv="EDE_BENCH_MIB=1024" --setenv="EDE_PASTE_MIB=64" \
+              --setenv="EDE_BENCH_PEAK_RSS=1" \
+              --property="WorkingDirectory=$GITHUB_WORKSPACE" --uid="$(id -u)" \
+              "$binary" --ignored --exact large_recovery_and_refresh_benchmark --nocapture
+          done
+
+      - name: Measure refresh storage under constrained memory (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo systemd-run --wait --pipe --collect \
+            --property=MemoryMax=256M --property=MemorySwapMax=0 \
+            --setenv="TMPDIR=$RUNNER_TEMP" --setenv="EDE_BENCH_MIB=1024" \
+            --property="WorkingDirectory=$GITHUB_WORKSPACE" --uid="$(id -u)" \
+            "$EDE_REFRESH_PROBE" --ignored --exact \
+            document::refresh::tests::large_refresh_storage_measurements --nocapture
+
       - name: Validate large-file storage with constrained memory (Linux)
         if: runner.os == 'Linux'
         run: |
