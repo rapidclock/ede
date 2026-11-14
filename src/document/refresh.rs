@@ -496,10 +496,14 @@ mod tests {
             chunk[index] = b'\n';
         }
         let mut file = std::fs::File::create(&path).unwrap();
-        for _ in 0..mib {
+        for index in 0..mib {
             file.write_all(&chunk).unwrap();
+            if (index + 1).is_multiple_of(8) {
+                file.sync_data().unwrap();
+            }
         }
         file.sync_all().unwrap();
+        eprintln!("refresh_storage fixture_ready bytes={}", mib * (1 << 20));
         let limits = StorageLimits::default();
         let cancel = Cancellation::default();
         let mut document = Document::open(

@@ -458,6 +458,7 @@ The production interval is five seconds. Scheduling tests control the stored
 deadline rather than waiting on wall time; synchronized worker gates establish
 the overlap order. Worker cancellation may wait for a kernel call to return,
 but immutable background generations let foreground edits/compaction proceed.
+The opt-in isolated tmux editing/suspend smoke also passed locally with tmux 3.8.
 
 ### Large-document measurements
 
@@ -526,6 +527,17 @@ no remaining findings. The rare post-Ready Info-failure diagnostic path was
 inspected but not directly fault-injected.
 
 ### Remaining checks and limits
+
+The [first PR CI run](https://github.com/rapidclock/ede/actions/runs/43641321320)
+passed formatting, Clippy, and all normal tests on macOS and Ubuntu 26.04 x86_64
+(two AMD EPYC 9V74 CPUs, 7.7 GiB host RAM, ext4). It also passed the existing
+1 GiB ordinary/dense/long storage probes at 8 GiB, ordinary storage at 256 MiB,
+and all three interactive corpora at 256 MiB, with swap disabled. The new I02
+fixture writer was OOM-killed before starting the editor: it had accumulated
+unsynchronized dirty file cache under that limit. Both new fixture generators
+now synchronize every 8 MiB, matching the existing generator; the corrected
+16 MiB/1 MiB end-to-end smoke and repeated full local checks passed. New Stage 05
+resource checks now run before older benchmarks. Their Linux rerun is pending.
 
 - Local aggregate formatting, Clippy with warnings denied, and tests passed.
   ShellCheck 0.11.0 passed all multiline CI shell blocks, extracted and linted

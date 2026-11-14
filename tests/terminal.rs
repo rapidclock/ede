@@ -1092,12 +1092,20 @@ fn large_recovery_and_refresh_benchmark() {
         (&replacement, b"REFRESHED".as_slice()),
     ] {
         let mut file = File::create(fixture).unwrap();
-        for _ in 0..mib {
+        for index in 0..mib {
             file.write_all(&chunk).unwrap();
+            if (index + 1).is_multiple_of(8) {
+                file.sync_data().unwrap();
+            }
         }
         file.write_all_at(marker, 0).unwrap();
         file.sync_all().unwrap();
     }
+    eprintln!(
+        "recovery_refresh fixtures_ready named_bytes={} replacement_bytes={} scratch_MiB={scratch_mib}",
+        mib * (1 << 20),
+        mib * (1 << 20)
+    );
     std::fs::write(&companion, "Companion").unwrap();
     let started = Instant::now();
     let mut process =
