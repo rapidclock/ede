@@ -40,7 +40,7 @@ impl Budget {
     }
 }
 /// RAII aggregate buffer charge, released only when the owning result is dropped.
-pub(super) struct Permit {
+pub(crate) struct Permit {
     budget: Arc<Budget>,
     bytes: usize,
 }

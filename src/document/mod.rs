@@ -21,6 +21,7 @@ mod tree;
 mod types;
 
 pub use model::Document;
+pub(crate) use resources::Permit;
 pub use save::{SaveOutcome, SaveReport, SaveTarget};
 pub use service::{
     Completion, DocumentInfo, Job, Request, Response, Shutdown, StorageService, SubmissionError,

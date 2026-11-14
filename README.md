@@ -1,10 +1,9 @@
 # ede
 
 A Rust terminal text editor for macOS and Linux, built in reviewed stages.
-Current version: **0.0.1-dev.2**. Stage 3 editing is implemented on
-`stage/editing_and_mouse` and has completed local code review; unavailable terminal
-compatibility and CI validation remain pending. See the [MVP overview](specs/001_initial_mvp/overview.md) and
-[Stage 3 validation record](specs/001_initial_mvp/03_editing_and_mouse.md#validation-record).
+Current version: **0.0.1-dev.2**. Stage 4 adds document tabs and file selection.
+See the [MVP overview](specs/001_initial_mvp/overview.md) and the
+[Stage 4 validation record](specs/001_initial_mvp/04_tabs_and_file_picker.md#validation-record).
 
 ## Build and run
 
@@ -15,13 +14,14 @@ formatting/linting components.
 cargo build --locked
 cargo run --locked
 cargo run --locked -- path/to/file.txt
+cargo run --locked -- first.txt second.txt
 cargo run --locked -- -- -filename.txt
 ```
 
 Run in a terminal with a usable `TERM`, at least 40 columns by 8 rows. Smaller
 windows preserve work and show a resize prompt; return to a supported size to
 answer unsaved-change prompts. `--help` and `--version` work without a terminal.
-Pipes, tabs, recovery, search, and highlighting belong to later stages.
+Pipes, recovery, search, and highlighting belong to later stages.
 
 Opening validates a private UTF-8 snapshot in the background. Its initial preview
 is read-only; Escape cancels preparation. Once ready, files remain editable
@@ -35,6 +35,8 @@ binary data report errors.
 | Action | Portable shortcut | Additional shortcut when Cmd is delivered |
 | --- | --- | --- |
 | New / Open | Ctrl+N / Ctrl+O | Cmd+N / Cmd+O |
+| Previous / next tab | F7 / F8 | Same |
+| Close tab | Ctrl+W | Cmd+W |
 | Save / Save As | Ctrl+S / F4 | Cmd+S / Cmd+Shift+S |
 | Quit | Ctrl+Q | Cmd+Q |
 | Select all | Ctrl+A | Cmd+A |
@@ -51,6 +53,17 @@ Buttons and the action menu provide alternatives for shortcuts intercepted by a
 terminal. Tab cycles controls in dialogs/help and inserts text in the editor.
 Help scrolls with Up/Down or the wheel; the action menu also scrolls with the wheel. Suspend is available through Help or Actions; resume
 with the shell's `fg` command.
+
+New and Open add tabs, and switching restores each tab's caret, selection,
+scrolling, and undo history. Use the Tabs button or Actions → Tabs to select or
+close a tab outside the strip. Actions → Tab details shows the active file's
+path. The strip marks active (`>`), modified (`*`), waiting (`…`), loading
+(`↓`), queued save (`⇡`), saving (`↑`), and save attention (`!`).
+
+Open starts in the active file's parent directory or the launch directory.
+Use arrows or the wheel to select an entry and Enter to open it. Up and the
+page buttons browse directories. Tab to Path to enter a literal absolute or
+relative path. The listing includes hidden entries.
 
 Click to place the caret, Shift-click to extend, or drag to select. Dragging beyond
 the text area autoscrolls while the terminal continues reporting pointer events.
@@ -74,7 +87,8 @@ paste before it commits once the terminal has sent the closing marker.
 Save As creates a new destination; it does not overwrite an existing path. Normal
 Save checks the previously acknowledged destination for external changes. Editing
 can continue during saving; a save of older content leaves newer edits unsaved.
-New/Open/Quit prompt before dropping changes, with Cancel selected initially.
+Close and Quit protect modified tabs, with Cancel selected initially. Quit checks
+tabs in creation order and keeps all unsaved buffers if you cancel a later prompt.
 An uncertain save explicitly reports that the destination may have changed.
 
 ## Cmd delivery
@@ -115,14 +129,16 @@ control of iTerm2, so its real key delivery remains unverified.
 | `runtime` | Frame scheduling, worker polling, effects |
 | `input` / `command` | Text/modifier normalization and shared bindings |
 | `app` / `ui` | Modal routing, focus, controls, prepared-frame rendering/hits |
+| `picker` | Bounded native directory pages and cancellable background I/O |
 | `editor` / `text` | Ordered storage coordination, clipboard/history positions, chunked Unicode layout |
 | `document` | Paged text, immutable snapshots, edits, undo/redo, guarded saves |
 | `status` | Bounded notifications |
 
 `ede::document::Document` is a blocking storage API. Interactive clients use
-`StorageService`: bounded submit/poll/cancel operations, a document owner, an
-immutable-read worker, and at most one independent save worker. Saves reconcile
-on the owner before acknowledgement. Snapshot leases pin their storage generation;
+`StorageService`: bounded submit/poll/cancel operations, a document owner,
+separate workers for immutable reads and file preparation, and at most one
+independent save worker. Prepared files are installed and saves reconcile on
+the owner before acknowledgement. Snapshot leases pin their storage generation;
 release them before compaction. Terminal restoration precedes worker shutdown
 waits. SIGINT/SIGTERM/SIGHUP use best-effort cleanup and exit `128 + signal`;
 scratch recovery remains Stage 5.

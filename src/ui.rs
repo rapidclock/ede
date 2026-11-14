@@ -3,6 +3,7 @@ use crate::text::Span;
 use crate::{
     app::{AppState, MENU, Modal, PathKind},
     command::{BINDINGS, Command},
+    editor::{After, TabId, TabSummary},
     text::safe,
 };
 use ratatui::{
@@ -20,6 +21,19 @@ pub(crate) enum Control {
     Menu,
     Help,
     Quit,
+    Tabs,
+    Tab(TabId),
+    TabClose,
+    TabList,
+    TabListRow(TabId),
+    TabListClose,
+    TabListSwitch,
+    PickerList,
+    PickerRow(usize),
+    PickerUp,
+    PickerOpen,
+    PickerPrevious,
+    PickerNext,
     HelpQuit,
     HelpSuspend,
     HelpClose,
@@ -37,10 +51,16 @@ impl Control {
     /// Resolve buttons/menu items to the shared command handler.
     pub fn command(self) -> Option<Command> {
         match self {
-            Self::Content | Self::PathField => None,
+            Self::Content
+            | Self::PathField
+            | Self::Tab(_)
+            | Self::TabListRow(_)
+            | Self::PickerRow(_) => None,
             Self::Menu => Some(Command::Menu),
             Self::SaveErrorAs => Some(Command::SaveAs),
             Self::Help => Some(Command::Help),
+            Self::Tabs => Some(Command::Tabs),
+            Self::TabClose => Some(Command::CloseTab),
             Self::Quit | Self::HelpQuit => Some(Command::Quit),
             Self::HelpSuspend => Some(Command::Suspend),
             Self::HelpClose | Self::PathCancel | Self::DetailsClose => Some(Command::Cancel),
@@ -51,7 +71,21 @@ impl Control {
     /// Compact display labels fit the minimum 40×8 geometry.
     fn label(self) -> &'static str {
         match self {
-            Self::Content | Self::PathField => "",
+            Self::Content
+            | Self::PathField
+            | Self::Tab(_)
+            | Self::TabListRow(_)
+            | Self::PickerList
+            | Self::PickerRow(_)
+            | Self::TabList => "",
+            Self::Tabs => "Tabs",
+            Self::TabClose => "×",
+            Self::TabListClose => "Close",
+            Self::TabListSwitch => "Switch",
+            Self::PickerUp => "Up",
+            Self::PickerOpen => "Open",
+            Self::PickerPrevious => "Prev",
+            Self::PickerNext => "Next",
             Self::Menu => "Menu",
             Self::Help => "Help",
             Self::Quit | Self::HelpQuit => "Quit",
@@ -72,14 +106,27 @@ struct Target {
     control: Control,
     area: Rect,
 }
+/// Inputs that change geometry, row identity, or the document under a pointer.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct Signature {
+    help: bool,
+    modal: u8,
+    detail: u64,
+    active: Option<TabId>,
+    tabs: Vec<TabId>,
+    picker_revision: u64,
+    picker_request: u64,
+    switching: Option<u64>,
+}
 /// Immutable frame geometry; hidden surfaces have no hit targets.
 #[derive(Clone, Debug)]
 pub(crate) struct LayoutSnapshot {
     pub area: Rect,
     pub generation: u64,
     pub overlay: Option<Rect>,
-    pub signature: (bool, u8, usize),
+    pub signature: Signature,
     targets: Vec<Target>,
+    list_rows: u16,
 }
 impl LayoutSnapshot {
     /// Base geometry retained for shell/scheduler tests.
@@ -88,8 +135,12 @@ impl LayoutSnapshot {
             area,
             generation,
             overlay: None,
-            signature: (help, 0, 0),
+            signature: Signature {
+                help,
+                ..Signature::default()
+            },
             targets: Vec::new(),
+            list_rows: 0,
         };
         if area.width < 40 || area.height < 8 {
             return result;
@@ -113,29 +164,43 @@ impl LayoutSnapshot {
         result
     }
     /// Stable key for changes that invalidate pointer capture or hit geometry.
-    pub fn signature(app: &AppState) -> (bool, u8, usize) {
-        (
-            app.help,
-            match app.modal {
-                None => 0,
-                Some(Modal::Menu(_)) => 1,
-                Some(Modal::Path(..)) => 2,
-                Some(Modal::Confirm(..)) => 3,
-                Some(Modal::Details(_)) => 4,
-                Some(Modal::SaveError(_)) => 5,
-            },
-            if let Some(Modal::Menu(index)) = app.modal {
-                index
-            } else {
-                0
-            },
-        )
+    pub fn signature(app: &AppState) -> Signature {
+        let (modal, detail) = match &app.modal {
+            None => (0, 0),
+            Some(Modal::Menu(index)) => (1, *index as u64),
+            Some(Modal::Path(..)) => (2, 0),
+            Some(Modal::Confirm(after, _)) => (3, after.target().map_or(0, |tab| tab.0)),
+            Some(Modal::Details(_)) => (4, 0),
+            Some(Modal::SaveError(_)) => (5, 0),
+            Some(Modal::Open(dialog)) => (6, dialog.highlight as u64),
+            Some(Modal::Tabs(tab)) => (7, tab.map_or(0, |tab| tab.0)),
+        };
+        let (picker_revision, picker_request) = match &app.modal {
+            Some(Modal::Open(dialog)) => (dialog.revision, dialog.generation),
+            _ => (0, 0),
+        };
+        Signature {
+            help: app.help,
+            modal,
+            detail,
+            active: app.screen.tab,
+            tabs: app.screen.tabs.iter().map(|tab| tab.id).collect(),
+            picker_revision,
+            picker_request,
+            switching: app.switching,
+        }
     }
     /// Modal targets replace all underlying controls, including at tiny sizes.
     pub fn for_app(area: Rect, app: &AppState, generation: u64) -> Self {
         let mut result = Self::new(area, app.help, generation);
         result.signature = Self::signature(app);
-        if app.modal.is_none() || area.width < 40 || area.height < 8 {
+        if area.width < 40 || area.height < 8 {
+            return result;
+        }
+        if app.modal.is_none() {
+            if !app.help {
+                result.add_tab_strip(app);
+            }
             return result;
         }
         result.targets.clear();
@@ -166,6 +231,77 @@ impl LayoutSnapshot {
                 result.add(Control::PathSubmit, Rect::new(overlay.x + 2, y, 6, 1));
                 result.add(Control::PathCancel, Rect::new(overlay.x + 11, y, 10, 1));
             }
+            Some(Modal::Tabs(selected)) => {
+                let rows = overlay.height.saturating_sub(3);
+                result.list_rows = rows;
+                result.add(
+                    Control::TabList,
+                    Rect::new(overlay.x + 1, overlay.y + 1, overlay.width - 2, rows),
+                );
+                let highlight = app
+                    .screen
+                    .tabs
+                    .iter()
+                    .position(|tab| Some(tab.id) == *selected)
+                    .unwrap_or(0);
+                for (row, tab) in app
+                    .screen
+                    .tabs
+                    .iter()
+                    .skip(list_start(highlight, rows))
+                    .take(rows as usize)
+                    .enumerate()
+                {
+                    result.add(
+                        Control::TabListRow(tab.id),
+                        Rect::new(
+                            overlay.x + 1,
+                            overlay.y + 1 + row as u16,
+                            overlay.width - 2,
+                            1,
+                        ),
+                    );
+                }
+                result.add(Control::TabListClose, Rect::new(overlay.x + 1, y, 8, 1));
+                result.add(Control::PathCancel, Rect::new(overlay.x + 10, y, 9, 1));
+                result.add(Control::TabListSwitch, Rect::new(overlay.x + 20, y, 9, 1));
+            }
+            Some(Modal::Open(dialog)) => {
+                let rows = overlay.height.saturating_sub(5);
+                result.list_rows = rows;
+                result.add(
+                    Control::PickerList,
+                    Rect::new(overlay.x + 1, overlay.y + 2, overlay.width - 2, rows),
+                );
+                let start = list_start(dialog.highlight, rows);
+                for (offset, row) in (start..dialog.count().min(start + rows as usize)).enumerate()
+                {
+                    result.add(
+                        Control::PickerRow(row),
+                        Rect::new(
+                            overlay.x + 1,
+                            overlay.y + 2 + offset as u16,
+                            overlay.width - 2,
+                            1,
+                        ),
+                    );
+                }
+                result.add(
+                    Control::PathField,
+                    Rect::new(overlay.x + 6, y - 1, overlay.width - 7, 1),
+                );
+                if dialog.parent().is_some() {
+                    result.add(Control::PickerUp, Rect::new(overlay.x + 1, y, 5, 1));
+                }
+                if dialog.page_request(true).is_some() {
+                    result.add(Control::PickerPrevious, Rect::new(overlay.x + 6, y, 6, 1));
+                }
+                if dialog.page_request(false).is_some() {
+                    result.add(Control::PickerNext, Rect::new(overlay.x + 12, y, 6, 1));
+                }
+                result.add(Control::PickerOpen, Rect::new(overlay.x + 19, y, 6, 1));
+                result.add(Control::PathCancel, Rect::new(overlay.x + 26, y, 8, 1));
+            }
             Some(Modal::Confirm(..)) => {
                 result.add(Control::ConfirmSave, Rect::new(overlay.x + 1, y, 7, 1));
                 result.add(Control::ConfirmDiscard, Rect::new(overlay.x + 9, y, 10, 1));
@@ -182,6 +318,31 @@ impl LayoutSnapshot {
         }
         result
     }
+    /// Allocate a compact first-row strip around the active tab.
+    fn add_tab_strip(&mut self, app: &AppState) {
+        let area = self.area;
+        let tabs = &app.screen.tabs;
+        let right = area.right() - 25;
+        self.add(Control::Tabs, Rect::new(right - 6, area.y, 6, 1));
+        let Some(active) = tabs.iter().position(|t| Some(t.id) == app.screen.tab) else {
+            return;
+        };
+        self.add(Control::TabClose, Rect::new(right - 9, area.y, 3, 1));
+        let width = area.width - 34;
+        let count = (usize::from(width) / 12).max(1).min(tabs.len());
+        let start = active.saturating_sub(count - 1).min(tabs.len() - count);
+        let mut x = area.x;
+        for (index, tab) in tabs.iter().skip(start).take(count).enumerate() {
+            let cells = width / count as u16 + u16::from(index == 0) * (width % count as u16);
+            self.add(Control::Tab(tab.id), Rect::new(x, area.y, cells, 1));
+            x += cells;
+        }
+    }
+
+    pub fn list_rows(&self) -> u16 {
+        self.list_rows
+    }
+
     /// Center an overlay entirely within a supported terminal geometry.
     fn overlay_rect(&self, max_width: u16, max_height: u16) -> Rect {
         let width = self.area.width.min(max_width).saturating_sub(4);
@@ -217,11 +378,16 @@ impl LayoutSnapshot {
     }
     /// Cycle through only the currently visible interaction surface.
     pub fn next(&self, current: Option<Control>, backwards: bool) -> Option<Control> {
-        let count = self.targets.len();
+        let controls: Vec<_> = self
+            .targets
+            .iter()
+            .filter(|t| !matches!(t.control, Control::PickerRow(_) | Control::TabListRow(_)))
+            .collect();
+        let count = controls.len();
         if count == 0 {
             return None;
         }
-        let index = self.targets.iter().position(|t| Some(t.control) == current);
+        let index = controls.iter().position(|t| Some(t.control) == current);
         let next = match index {
             None => {
                 if backwards {
@@ -238,9 +404,34 @@ impl LayoutSnapshot {
                 }
             }
         };
-        Some(self.targets[next].control)
+        Some(controls[next].control)
     }
 }
+fn list_start(highlight: usize, rows: u16) -> usize {
+    highlight.saturating_sub(rows.saturating_sub(1) as usize)
+}
+
+fn tab_text(tab: &TabSummary, active: bool) -> String {
+    format!(
+        "{}{}{}{} {}",
+        if active { ">" } else { " " },
+        if tab.modified { "*" } else { "" },
+        if tab.attention { "!" } else { "" },
+        if tab.waiting {
+            "…"
+        } else if tab.loading {
+            "↓"
+        } else if tab.saving {
+            "↑"
+        } else if tab.queued_save {
+            "⇡"
+        } else {
+            ""
+        },
+        tab.label
+    )
+}
+
 /// Render a prepared view without performing text reads or recomputing Unicode boundaries.
 pub(crate) fn render(frame: &mut Frame<'_>, app: &AppState, layout: &LayoutSnapshot) {
     let area = layout.area;
@@ -248,32 +439,22 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &AppState, layout: &LayoutSnaps
         frame.render_widget(Paragraph::new("Resize to 40x8 | Ctrl+Q quit"), area);
         return;
     }
-    let title = app.screen.path.as_ref().map_or_else(
-        || "Untitled".into(),
-        |p| {
-            format!(
-                "{} — {}",
-                safe(&p.file_name().unwrap_or(p.as_os_str()).to_string_lossy()),
-                safe(&p.to_string_lossy())
-            )
-        },
-    );
-    frame.render_widget(
-        Paragraph::new(format!(
-            "{}{}{}",
-            if app.screen.modified { "* " } else { "" },
-            if app.screen.loading {
-                "[loading] "
-            } else if app.screen.saving {
-                "[saving] "
+    if app.screen.tab.is_none() {
+        frame.render_widget(
+            Paragraph::new(if app.screen.loading {
+                "Preparing document"
             } else {
-                ""
-            },
-            title
-        )),
-        Rect::new(area.x, area.y, area.width - 26, 1),
-    );
-    if let Some(preview) = &app.screen.preview {
+                "No open tabs"
+            }),
+            Rect::new(area.x, area.y, area.width - 31, 1),
+        );
+    }
+    if app.switching.is_some() {
+        frame.render_widget(
+            Paragraph::new("Preparing tab view"),
+            Rect::new(area.x, area.y + 1, area.width, 1),
+        );
+    } else if let Some(preview) = &app.screen.preview {
         let visible = preview
             .lines()
             .take(area.height.saturating_sub(2) as usize)
@@ -353,6 +534,9 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &AppState, layout: &LayoutSnaps
         crate::status::Severity::Error => "Error: ",
     };
     let footer = app.receiving_paste_status().unwrap_or_else(|| {
+        if app.guard_waiting() {
+            return "Waiting for tab state or save | Escape cancels".into();
+        }
         format!(
             "{}{} | {}{}",
             severity,
@@ -369,7 +553,8 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &AppState, layout: &LayoutSnaps
         frame.render_widget(Clear, overlay);
         let title = match &app.modal {
             Some(Modal::Menu(_)) => " Actions (wheel/arrows) ",
-            Some(Modal::Path(PathKind::Open, _)) => " Open path ",
+            Some(Modal::Open(_)) => " Open file ",
+            Some(Modal::Tabs(_)) => " Tabs — Enter to switch ",
             Some(Modal::Path(PathKind::Save, _)) => " Save As (new path) ",
             Some(Modal::Path(PathKind::GoTo, _)) => " Go to line[:cell] (from 1) ",
             Some(Modal::Confirm(_, Some(_))) => " Destination may have changed ",
@@ -385,23 +570,87 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &AppState, layout: &LayoutSnaps
             overlay.width - 2,
             overlay.height - 3,
         );
-        let text=match &app.modal{
-            Some(Modal::Menu(_))=>String::new(),Some(Modal::Path(kind,field))=>format!("{}\n{}",if *kind==PathKind::GoTo { "Line[:cell], starting at 1:" } else { "Path (no shell expansion):" },safe(field)),
-            Some(Modal::Confirm(_,uncertain))=>if uncertain.is_some(){"A save may have changed the destination. Discard acknowledges this and drops the buffer. Cancel keeps your work."}else{"Save your changes before continuing? Cancel keeps your work."}.into(),
-            Some(Modal::Details(text)|Modal::SaveError(text))=>safe(text),None => {
-                let mut lines = vec!["Up/Down scroll help; Escape closes".to_owned(),
+        let text = match &app.modal {
+            Some(Modal::Menu(_) | Modal::Path(..) | Modal::Open(_) | Modal::Tabs(_)) => {
+                String::new()
+            }
+            Some(Modal::Confirm(after, uncertain)) => {
+                let verb = if matches!(after, After::Close(_)) {
+                    "Close"
+                } else {
+                    "Quit"
+                };
+                let id = after.target().or(app.screen.tab);
+                let label = app.tab_path_hint(id).map_or_else(
+                    || app.tab_label(id).to_owned(),
+                    |path| tail_cells(path, inner.width.saturating_sub(verb.len() as u16 + 3)),
+                );
+                let guidance = if uncertain.is_some() {
+                    "A save may have changed the destination. Discard acknowledges this."
+                } else {
+                    "Save your changes before continuing?"
+                };
+                format!("{verb} — {label}\n{guidance}")
+            }
+            Some(Modal::Details(text) | Modal::SaveError(text)) => safe(text),
+            None => {
+                let mut lines = vec![
+                    "Up/Down scroll help; Escape closes".to_owned(),
                     "Arrows/Home/End/Page: move; Shift selects".into(),
                     "Ctrl+Home/End: document start/end".into(),
                     "Cmd aliases require terminal delivery.".into(),
                     "Terminal Cmd+V: external clipboard text".into(),
                     "Ctrl+V / delivered Cmd+V: internal paste".into(),
                     "F2: toggle capture for native selection.".into(),
-                    "Selection modifiers vary; tmux: copy mode.".into()];
-                lines.extend(BINDINGS.iter().map(|binding| format!("{:<15} {}", binding.shortcut, binding.command.label())));
+                    "Selection modifiers vary; tmux: copy mode.".into(),
+                    "Tabs: > active, * modified, ! save attention".into(),
+                    "Tabs: … waiting, ↓ loading, ⇡ queued save, ↑ saving".into(),
+                ];
+                lines.extend(BINDINGS.iter().map(|binding| {
+                    format!("{:<15} {}", binding.shortcut, binding.command.label())
+                }));
                 lines.join("\n")
-            },
+            }
         };
-        if let Some(Modal::Path(kind, field)) = &app.modal {
+        if let Some(Modal::Open(dialog)) = &app.modal {
+            let directory = safe(&dialog.directory.to_string_lossy());
+            let directory_width = if app.field_error.is_some() {
+                inner.width / 3
+            } else {
+                inner.width
+            };
+            let status = if dialog.loading { "Loading " } else { "Dir " };
+            frame.render_widget(
+                Paragraph::new(format!(
+                    "{status}{}",
+                    tail_cells(
+                        &directory,
+                        directory_width.saturating_sub(status.len() as u16)
+                    )
+                )),
+                Rect::new(inner.x, inner.y, directory_width, 1),
+            );
+            if let Some(error) = &app.field_error {
+                frame.render_widget(
+                    Paragraph::new(error.as_str()).style(Style::default().fg(Color::Red)),
+                    Rect::new(
+                        inner.x + directory_width,
+                        inner.y,
+                        inner.width - directory_width,
+                        1,
+                    ),
+                );
+            }
+            let y = overlay.bottom() - 3;
+            frame.render_widget(Paragraph::new("Path"), Rect::new(inner.x, y, 5, 1));
+            if let Some(target) = layout
+                .targets
+                .iter()
+                .find(|target| target.control == Control::PathField)
+            {
+                render_field(frame, app, &dialog.field, target.area);
+            }
+        } else if let Some(Modal::Path(kind, field)) = &app.modal {
             let label = if *kind == PathKind::GoTo {
                 "Line[:cell], starting at 1:"
             } else {
@@ -411,16 +660,12 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &AppState, layout: &LayoutSnaps
                 Paragraph::new(label),
                 Rect::new(inner.x, inner.y, inner.width, 1),
             );
-            let field = safe(field);
-            let width = field.width();
-            let offset = width.saturating_sub(inner.width.saturating_sub(1) as usize);
-            frame.render_widget(
-                Paragraph::new(field).scroll((0, offset as u16)),
+            render_field(
+                frame,
+                app,
+                field,
                 Rect::new(inner.x, inner.y + 1, inner.width, 1),
             );
-            if app.focus == Some(Control::PathField) {
-                frame.set_cursor_position((inner.x + (width - offset) as u16, inner.y + 1));
-            }
             if let Some(error) = &app.field_error {
                 frame.render_widget(
                     Paragraph::new(safe(error)).style(Style::default().fg(Color::Red)),
@@ -444,7 +689,45 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &AppState, layout: &LayoutSnaps
         }
     }
     for target in &layout.targets {
-        if matches!(target.control, Control::Content | Control::PathField) {
+        let row = match (target.control, &app.modal) {
+            (Control::Tab(id), _) | (Control::TabListRow(id), _) => {
+                app.screen.tabs.iter().find(|tab| tab.id == id).map(|tab| {
+                    let highlighted =
+                        matches!(app.modal, Some(Modal::Tabs(Some(highlight))) if highlight == id);
+                    (
+                        tab_text(tab, app.screen.tab == Some(id)),
+                        highlighted
+                            || app.focus == Some(target.control)
+                            || app.screen.tab == Some(id),
+                    )
+                })
+            }
+            (Control::PickerRow(index), Some(Modal::Open(dialog))) => {
+                dialog.row(index).map(|row| {
+                    let selected = index == dialog.highlight;
+                    (
+                        format!("{} {}", if selected { ">" } else { " " }, row.label()),
+                        selected,
+                    )
+                })
+            }
+            _ => None,
+        };
+        if let Some((label, focused)) = row {
+            let style = if focused {
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            frame.render_widget(Paragraph::new(label).style(style), target.area);
+            continue;
+        }
+        if matches!(
+            target.control,
+            Control::Content | Control::PathField | Control::PickerList | Control::TabList
+        ) {
             continue;
         }
         let focused = app.focus == Some(target.control)
@@ -474,6 +757,36 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &AppState, layout: &LayoutSnaps
         frame.render_widget(Paragraph::new(label).style(style), target.area);
     }
 }
+/// Display the right end of an editable field using the prepared hit geometry.
+fn render_field(frame: &mut Frame<'_>, app: &AppState, field: &str, area: Rect) {
+    let field = safe(field);
+    let width = field.width();
+    let offset = width.saturating_sub(area.width.saturating_sub(1) as usize);
+    frame.render_widget(Paragraph::new(field).scroll((0, offset as u16)), area);
+    if app.focus == Some(Control::PathField) {
+        frame.set_cursor_position((area.x + (width - offset) as u16, area.y));
+    }
+}
+
+/// Keep the basename visible in a clipped directory without splitting a scalar.
+fn tail_cells(text: &str, width: u16) -> String {
+    use unicode_width::UnicodeWidthChar;
+    if text.width() <= usize::from(width) {
+        return text.to_owned();
+    }
+    let mut left = usize::from(width.saturating_sub(1));
+    let mut start = text.len();
+    for (index, ch) in text.char_indices().rev() {
+        let cells = ch.width().unwrap_or(0);
+        if cells > left {
+            break;
+        }
+        left -= cells;
+        start = index;
+    }
+    format!("…{}", &text[start..])
+}
+
 /// Draw a prepared stride run in at most three full substrings and two clipped tokens.
 /// All byte/cell boundaries come from the worker; drawing does no Unicode segmentation.
 fn render_run(frame: &mut Frame<'_>, span: &Span, selection: &Range<u64>, start: u64, area: Rect) {
@@ -610,7 +923,7 @@ mod tests {
             for modal in [
                 None,
                 Some(Modal::Menu(13)),
-                Some(Modal::Path(PathKind::Open, "test".into())),
+                Some(Modal::Path(PathKind::GoTo, "test".into())),
                 Some(Modal::Confirm(After::Quit, None)),
             ] {
                 let mut app = AppState::new();
