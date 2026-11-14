@@ -962,6 +962,205 @@ impl FaultInjector for Gate {
         Ok(())
     }
 }
+/// A blocked preparation cannot delay mutations, and a cancelled open cannot be installed.
+#[test]
+fn ready_document_edits_while_open_is_blocked() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("blocked");
+    fs::write(&path, b"slow content").unwrap();
+    let gate = Arc::new(Gate::default());
+    let mut config = options(directory.path());
+    config.faults = Some(gate.clone());
+    let mut service = StorageService::new(config).unwrap();
+    let ready = service.submit(1, Request::New).unwrap();
+    assert!(matches!(
+        receive(&mut service).result,
+        Ok(Response::Ready { .. })
+    ));
+
+    gate.armed.store(true, std::sync::atomic::Ordering::Release);
+    let opening = service.submit(2, Request::Open(path)).unwrap();
+    let (state, _) = gate
+        .wake
+        .wait_timeout_while(gate.state.lock().unwrap(), Duration::from_secs(5), |s| !s.0)
+        .unwrap();
+    assert!(state.0, "file preparation never entered the gate");
+    drop(state);
+
+    service
+        .submit(
+            3,
+            Request::Replace {
+                document: ready.document,
+                expected: Revision(0),
+                range: TextRange::new(0, 0).unwrap(),
+                text: "independent edit".into(),
+            },
+        )
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let edit = loop {
+        if let Some(completion) = service.try_recv().unwrap() {
+            break Some(completion);
+        }
+        if Instant::now() >= deadline {
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    };
+    opening.cancel();
+    gate.state.lock().unwrap().1 = true;
+    gate.wake.notify_all();
+    let edit = edit.expect("Ready document edit waited for unrelated file preparation");
+    assert_eq!(edit.request, 3);
+    assert!(matches!(
+        edit.result,
+        Ok(Response::Changed {
+            revision: Revision(1),
+            ..
+        })
+    ));
+    let cancelled = receive(&mut service);
+    assert_eq!(cancelled.job, opening.id);
+    assert!(matches!(cancelled.result, Err(Error::Cancelled)));
+    assert!(matches!(
+        service.submit(4, Request::Info(opening.document)),
+        Err(SubmissionError {
+            error: Error::Closed,
+            ..
+        })
+    ));
+    service
+        .submit(5, Request::Snapshot(ready.document))
+        .unwrap();
+    let Ok(Response::Snapshot(snapshot)) = receive(&mut service).result else {
+        panic!("expected the edited document snapshot");
+    };
+    assert_eq!(text(&snapshot), "independent edit");
+    service.shutdown().wait().unwrap();
+}
+
+/// Requests accepted for an opening identity run in order after that document is ready.
+#[test]
+fn queued_requests_follow_their_open() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("blocked");
+    fs::write(&path, b"original").unwrap();
+    let gate = Arc::new(Gate::default());
+    let mut config = options(directory.path());
+    config.faults = Some(gate.clone());
+    let mut service = StorageService::new(config).unwrap();
+    let other = service.submit(1, Request::New).unwrap();
+    drop(receive(&mut service));
+    gate.armed.store(true, std::sync::atomic::Ordering::Release);
+    let open = service.submit(2, Request::Open(path)).unwrap();
+    let (state, _) = gate
+        .wake
+        .wait_timeout_while(gate.state.lock().unwrap(), Duration::from_secs(5), |s| !s.0)
+        .unwrap();
+    assert!(state.0, "file preparation never entered the gate");
+    drop(state);
+
+    service
+        .submit(
+            3,
+            Request::Replace {
+                document: open.document,
+                expected: Revision(0),
+                range: TextRange::new(0, 0).unwrap(),
+                text: "edited ".into(),
+            },
+        )
+        .unwrap();
+    service.submit(4, Request::Snapshot(open.document)).unwrap();
+    service.submit(5, Request::Info(other.document)).unwrap();
+    let unrelated = receive(&mut service);
+    gate.state.lock().unwrap().1 = true;
+    gate.wake.notify_all();
+    assert_eq!(unrelated.request, 5, "a request overtook its own open");
+    assert!(matches!(unrelated.result, Ok(Response::Info(_))));
+    let opened = receive(&mut service);
+    assert_eq!(opened.job, open.id);
+    assert!(matches!(opened.result, Ok(Response::Ready { .. })));
+    let edit = receive(&mut service);
+    assert_eq!(edit.request, 3);
+    assert!(matches!(edit.result, Ok(Response::Changed { .. })));
+    let capture = receive(&mut service);
+    assert_eq!(capture.request, 4);
+    let Ok(Response::Snapshot(snapshot)) = capture.result else {
+        panic!("expected a snapshot after the queued edit");
+    };
+    assert_eq!(text(&snapshot), "edited original");
+    service.shutdown().wait().unwrap();
+}
+
+/// Cancellation after the copy's final check must prevent the owner taking the store.
+#[test]
+fn cancelled_preparation_is_not_installed() {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        mpsc,
+    };
+
+    #[derive(Debug)]
+    struct LastWrite {
+        remaining: AtomicUsize,
+        entered: mpsc::Sender<()>,
+        release: Mutex<mpsc::Receiver<()>>,
+    }
+
+    impl FaultInjector for LastWrite {
+        fn check(&self, point: IoPoint) -> io::Result<()> {
+            // A one-page file writes the source once and then its first tree
+            // node. The node write occurs after open_shared's final cancel check.
+            if point == IoPoint::Write && self.remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
+                self.entered.send(()).unwrap();
+                self.release
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(5))
+                    .map_err(io::Error::other)?;
+            }
+            Ok(())
+        }
+    }
+
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("source");
+    fs::write(&path, b"one page").unwrap();
+    let (entered, wait_for_write) = mpsc::channel();
+    let (release, wait_for_cancel) = mpsc::channel();
+    let mut config = options(directory.path());
+    config.faults = Some(Arc::new(LastWrite {
+        remaining: AtomicUsize::new(2),
+        entered,
+        release: Mutex::new(wait_for_cancel),
+    }));
+    let mut service = StorageService::new(config).unwrap();
+    let open = service.submit(1, Request::Open(path.clone())).unwrap();
+    wait_for_write.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 2);
+    open.cancel();
+    release.send(()).unwrap();
+
+    let cancelled = receive(&mut service);
+    assert_eq!(cancelled.job, open.id);
+    assert!(
+        matches!(cancelled.result, Err(Error::Cancelled)),
+        "cancelled preparation was installed"
+    );
+    assert!(matches!(
+        service.submit(2, Request::Info(open.document)),
+        Err(SubmissionError {
+            error: Error::Closed,
+            ..
+        })
+    ));
+    assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
+    assert_eq!(fs::read(path).unwrap(), b"one page");
+    service.shutdown().wait().unwrap();
+}
+
 /// Cancelling an in-flight multi-page window must be observed before returning text.
 #[test]
 fn foreground_window_read_observes_in_flight_cancellation() {

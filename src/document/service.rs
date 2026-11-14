@@ -1,4 +1,4 @@
-//! Document owner, immutable-read worker, and one independent guarded-save worker.
+//! Document owner and independent workers for reads, file preparation, and saves.
 //!
 //! Submission/poll/close never wait for filesystem work. Result backpressure may
 //! stop workers, but closing/cancelling remains independent of queue capacity.
@@ -12,7 +12,7 @@ use super::{
     types::identity,
 };
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     path::PathBuf,
     sync::{
         Arc, Mutex,
@@ -288,10 +288,16 @@ struct OwnedDocument {
     closed: Arc<AtomicBool>,
     _permit: Permit,
 }
+/// A named document prepared off the owner, still subject to cancellation on transfer.
+struct PreparedOpen {
+    envelope: Envelope,
+    result: Result<OwnedDocument, Error>,
+}
 /// Bounded asynchronous storage bridge. Drop cancels and detaches; shutdown().wait()
 /// provides orderly joining outside the terminal event loop.
 pub struct StorageService {
-    senders: Vec<SyncSender<Envelope>>,
+    mutations: SyncSender<Envelope>,
+    reads: SyncSender<Envelope>,
     inbox: Receiver<Completion>,
     workers: Vec<JoinHandle<()>>,
     documents: HashMap<DocumentId, Arc<AtomicBool>>,
@@ -321,7 +327,12 @@ impl Shutdown {
     }
 }
 impl StorageService {
-    /// Spawn two workers, sharing caches and buffers; no synthetic document is opened.
+    /// Charge editor-owned state to the same aggregate buffer pool as storage.
+    pub(crate) fn reserve_interaction(&self, bytes: usize) -> Result<Permit, Error> {
+        self.resources.buffers.acquire(bytes)
+    }
+
+    /// Spawn the mutation, read, and preparation workers over one resource pool.
     pub fn new(options: OpenOptions) -> Result<Self, Error> {
         Self::with_stop_flag(options, Arc::new(AtomicBool::new(false)))
     }
@@ -333,24 +344,41 @@ impl StorageService {
         let resources = Resources::new(&options.limits)?;
         let entries = Arc::new(AtomicUsize::new(0));
         let (outbox, inbox) = mpsc::sync_channel(options.limits.queue_entries);
-        let mut senders = Vec::new();
-        let mut workers = Vec::new();
-        for number in 0..2 {
-            let (sender, receiver) = mpsc::sync_channel(options.limits.queue_entries);
-            let options = options.clone();
-            let resources = resources.clone();
-            let outbox = outbox.clone();
-            workers.push(
-                thread::Builder::new()
-                    .name(format!("ede-storage-{number}"))
-                    .spawn(move || worker(receiver, outbox, options, resources))?,
-            );
-            senders.push(sender);
-        }
+        let capacity = options.limits.queue_entries;
+        let (mutations, mutation_inbox) = mpsc::sync_channel(capacity);
+        let (reads, read_inbox) = mpsc::sync_channel(capacity);
+        let (opens, open_inbox) = mpsc::sync_channel(capacity);
+        // Prepared results still own their original admission. This channel can
+        // hold all admitted jobs, including when shutdown has stopped the owner.
+        let (prepared, prepared_inbox) = mpsc::sync_channel(capacity);
+        let owner_output = outbox.clone();
+        let owner_options = options.clone();
+        let owner_resources = resources.clone();
+        let owner = thread::Builder::new()
+            .name("ede-storage".into())
+            .spawn(move || {
+                worker(
+                    mutation_inbox,
+                    opens,
+                    prepared_inbox,
+                    owner_output,
+                    owner_options,
+                    owner_resources,
+                )
+            })?;
+        let reader = thread::Builder::new()
+            .name("ede-read".into())
+            .spawn(move || read_worker(read_inbox, outbox))?;
+        let open_options = options.clone();
+        let open_resources = resources.clone();
+        let opener = thread::Builder::new()
+            .name("ede-open".into())
+            .spawn(move || prepare_opens(open_inbox, prepared, open_options, open_resources))?;
         Ok(Self {
-            senders,
+            mutations,
+            reads,
             inbox,
-            workers,
+            workers: vec![owner, reader, opener],
             documents: HashMap::new(),
             entries,
             resources,
@@ -358,7 +386,8 @@ impl StorageService {
             stopping,
         })
     }
-    /// Try to enqueue work. No filesystem work or blocking queue operation occurs here.
+    /// Try to enqueue work without filesystem I/O or waiting for queue capacity.
+    /// Requests for an opening document wait for its preparation to settle.
     pub fn submit(&mut self, request_id: u64, request: Request) -> Result<Job, SubmissionError> {
         match self.admit(request_id, request) {
             Ok(job) => Ok(job),
@@ -436,15 +465,11 @@ impl StorageService {
             progress: progress.clone(),
             admission,
         };
-        let owner = if matches!(
-            envelope.request,
-            Request::Read { .. } | Request::LocateLine { .. }
-        ) {
-            1
-        } else {
-            0
+        let sender = match envelope.request {
+            Request::Read { .. } | Request::LocateLine { .. } => &self.reads,
+            _ => &self.mutations,
         };
-        match self.senders[owner].try_send(envelope) {
+        match sender.try_send(envelope) {
             Ok(()) => {
                 if is_new {
                     self.documents.insert(document, closed);
@@ -492,7 +517,6 @@ impl StorageService {
     /// Cancel queued/pre-commit work and return join handles for an off-UI wait.
     pub fn shutdown(mut self) -> Shutdown {
         self.cancel_all();
-        self.senders.clear();
         Shutdown {
             workers: std::mem::take(&mut self.workers),
         }
@@ -542,16 +566,148 @@ struct PendingSave {
     envelope: Envelope,
     snapshot: Snapshot,
 }
+/// Prepare one named file at a time. Only the mutation owner can install it.
+fn prepare_opens(
+    inbox: Receiver<Envelope>,
+    prepared: SyncSender<PreparedOpen>,
+    options: OpenOptions,
+    resources: Arc<Resources>,
+) {
+    for mut envelope in inbox {
+        let Request::Open(path) = std::mem::replace(&mut envelope.request, Request::New) else {
+            unreachable!("only named opens go to the preparation worker");
+        };
+        let result = (|| {
+            envelope.cancel.check()?;
+            let permit = resources.buffers.acquire(4096)?;
+            let document = Document::open_shared(
+                &path,
+                options.clone(),
+                resources.clone(),
+                &envelope.cancel,
+                |update| {
+                    if let Ok(mut slot) = envelope.progress.lock() {
+                        match update {
+                            OpenProgress::Preview { .. } => slot.preview = Some(update),
+                            _ => slot.latest = Some(update),
+                        }
+                    }
+                },
+            )?;
+            Ok(OwnedDocument {
+                document,
+                closed: envelope.closed.clone(),
+                _permit: permit,
+            })
+        })();
+        if prepared.send(PreparedOpen { envelope, result }).is_err() {
+            break;
+        }
+    }
+}
+
+/// Run immutable reads without acquiring the mutation owner's document map.
+fn read_worker(inbox: Receiver<Envelope>, outbox: SyncSender<Completion>) {
+    for mut envelope in inbox {
+        let revision = request_revision(&envelope.request);
+        let request = std::mem::replace(&mut envelope.request, Request::New);
+        let result = envelope.cancel.check().and_then(|()| match request {
+            Request::Read {
+                snapshot,
+                start,
+                max_bytes,
+            } => Ok(Response::Window(snapshot.read_window_with_cancel(
+                start,
+                max_bytes,
+                &envelope.cancel,
+            )?)),
+            Request::LocateLine { snapshot, line } => Ok(Response::Line(
+                snapshot.locate_line(line, &envelope.cancel)?,
+            )),
+            _ => unreachable!("only immutable reads go to the read worker"),
+        });
+        if outbox
+            .send(envelope.complete(revision, result, false))
+            .is_err()
+        {
+            break;
+        }
+    }
+}
+
+impl Envelope {
+    /// Keep the admission charged until the caller consumes the completion.
+    fn complete(
+        self,
+        revision: Option<Revision>,
+        result: Result<Response, Error>,
+        opening: bool,
+    ) -> Completion {
+        Completion {
+            job: self.job,
+            request: self.request_id,
+            document: self.document,
+            revision,
+            result,
+            closed: self.closed,
+            opening,
+            _admission: self.admission,
+        }
+    }
+}
+
+/// Assign the service identity only when the owner accepts the prepared document.
+fn install(
+    id: DocumentId,
+    mut owned: OwnedDocument,
+    documents: &mut HashMap<DocumentId, OwnedDocument>,
+) -> Response {
+    owned.document.id = id;
+    let revision = owned.document.revision();
+    documents.insert(id, owned);
+    Response::Ready {
+        document: id,
+        revision,
+    }
+}
+
 /// Owner loop: bounded messages, per-document serialization, no result loss under backpressure.
 fn worker(
     inbox: Receiver<Envelope>,
+    opens: SyncSender<Envelope>,
+    prepared: Receiver<PreparedOpen>,
     outbox: SyncSender<Completion>,
     options: OpenOptions,
     resources: Arc<Resources>,
 ) {
     let mut documents: HashMap<DocumentId, OwnedDocument> = HashMap::new();
+    // Requests can use Job.document before Ready. Preserve admission order for
+    // that identity while allowing unrelated documents to keep making progress.
+    let mut opening: HashMap<DocumentId, VecDeque<Envelope>> = HashMap::new();
+    let mut ready = VecDeque::new();
     let mut saving: Option<PendingSave> = None;
     loop {
+        // Process at most one transfer before giving mutations and saves a turn.
+        if let Ok(PreparedOpen { envelope, result }) = prepared.try_recv() {
+            if let Some(mut queued) = opening.remove(&envelope.document) {
+                ready.append(&mut queued);
+            }
+            let result = envelope
+                .cancel
+                .check()
+                .and(result)
+                .map(|owned| install(envelope.document, owned, &mut documents));
+            let revision = match &result {
+                Ok(Response::Ready { revision, .. }) => Some(*revision),
+                _ => None,
+            };
+            if outbox
+                .send(envelope.complete(revision, result, true))
+                .is_err()
+            {
+                break;
+            }
+        }
         if saving
             .as_ref()
             .is_some_and(|save| save.worker.is_finished())
@@ -573,16 +729,7 @@ fn worker(
                     Err(Error::SaveWorkerPanicked)
                 }
             };
-            let completion = Completion {
-                job: envelope.job,
-                request: envelope.request_id,
-                document: envelope.document,
-                revision: Some(snapshot.revision()),
-                result,
-                closed: envelope.closed,
-                opening: false,
-                _admission: envelope.admission,
-            };
+            let completion = envelope.complete(Some(snapshot.revision()), result, false);
             if outbox.send(completion).is_err() {
                 break;
             }
@@ -593,7 +740,11 @@ fn worker(
                     .as_ref()
                     .is_some_and(|save| save.envelope.document == *id)
         });
-        let mut envelope = match inbox.recv_timeout(Duration::from_millis(10)) {
+        let mut envelope = match ready
+            .pop_front()
+            .map(Ok)
+            .unwrap_or_else(|| inbox.recv_timeout(Duration::from_millis(10)))
+        {
             Ok(message) => message,
             Err(mpsc::RecvTimeoutError::Timeout) => continue,
             Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -610,8 +761,31 @@ fn worker(
                 break;
             }
         };
+        if matches!(envelope.request, Request::Open(_)) {
+            let document = envelope.document;
+            // All envelopes share the admission bound, including this open.
+            if let Err(error) = opens.try_send(envelope) {
+                let (envelope, error) = match error {
+                    TrySendError::Disconnected(envelope) => (envelope, Error::Closed),
+                    TrySendError::Full(envelope) => (envelope, Error::Busy),
+                };
+                if outbox
+                    .send(envelope.complete(None, Err(error), true))
+                    .is_err()
+                {
+                    break;
+                }
+            } else {
+                opening.insert(document, VecDeque::new());
+            }
+            continue;
+        }
+        if let Some(queued) = opening.get_mut(&envelope.document) {
+            queued.push_back(envelope);
+            continue;
+        }
         let revision = request_revision(&envelope.request);
-        let opening = matches!(envelope.request, Request::Open(_) | Request::New);
+        let creating = matches!(envelope.request, Request::New);
         let request = std::mem::replace(&mut envelope.request, Request::New);
         let request = if let Request::Save { snapshot, target } = request {
             let task = if saving.is_some() {
@@ -641,16 +815,8 @@ fn worker(
                         continue;
                     }
                     Err(error) => {
-                        let completion = Completion {
-                            job: envelope.job,
-                            request: envelope.request_id,
-                            document: envelope.document,
-                            revision: Some(snapshot.revision()),
-                            result: Err(error.into()),
-                            closed: envelope.closed,
-                            opening: false,
-                            _admission: envelope.admission,
-                        };
+                        let completion =
+                            envelope.complete(Some(snapshot.revision()), Err(error.into()), false);
                         if outbox.send(completion).is_err() {
                             break;
                         }
@@ -658,16 +824,11 @@ fn worker(
                     }
                 }
             } else {
-                let completion = Completion {
-                    job: envelope.job,
-                    request: envelope.request_id,
-                    document: envelope.document,
-                    revision: Some(snapshot.revision()),
-                    result: Err(task.err().expect("failed save preparation")),
-                    closed: envelope.closed,
-                    opening: false,
-                    _admission: envelope.admission,
-                };
+                let completion = envelope.complete(
+                    Some(snapshot.revision()),
+                    Err(task.err().expect("failed save preparation")),
+                    false,
+                );
                 if outbox.send(completion).is_err() {
                     break;
                 }
@@ -694,16 +855,7 @@ fn worker(
             Ok(Response::Saved(report)) => Some(report.revision),
             _ => revision,
         };
-        let completion = Completion {
-            job: envelope.job,
-            request: envelope.request_id,
-            document: envelope.document,
-            revision,
-            result,
-            closed: envelope.closed,
-            opening,
-            _admission: envelope.admission,
-        };
+        let completion = envelope.complete(revision, result, creating);
         if outbox.send(completion).is_err() {
             break;
         }
@@ -743,52 +895,18 @@ fn execute(
 ) -> Result<Response, Error> {
     envelope.cancel.check()?;
     match request {
-        Request::Read {
-            snapshot,
-            start,
-            max_bytes,
-        } => Ok(Response::Window(snapshot.read_window_with_cancel(
-            start,
-            max_bytes,
-            &envelope.cancel,
-        )?)),
-        Request::LocateLine { snapshot, line } => Ok(Response::Line(
-            snapshot.locate_line(line, &envelope.cancel)?,
-        )),
-        Request::Open(_) | Request::New => {
+        Request::New => {
             let permit = resources.buffers.acquire(4096)?;
-            let mut document = if let Request::Open(path) = request {
-                Document::open_shared(
-                    &path,
-                    options.clone(),
-                    resources,
-                    &envelope.cancel,
-                    |update| {
-                        if let Ok(mut slot) = envelope.progress.lock() {
-                            match update {
-                                OpenProgress::Preview { .. } => slot.preview = Some(update),
-                                _ => slot.latest = Some(update),
-                            }
-                        }
-                    },
-                )?
-            } else {
-                Document::new_shared(options.clone(), resources)?
-            };
-            document.id = envelope.document;
-            let revision = document.revision();
-            documents.insert(
+            let document = Document::new_shared(options.clone(), resources)?;
+            Ok(install(
                 envelope.document,
                 OwnedDocument {
                     document,
                     closed: envelope.closed.clone(),
                     _permit: permit,
                 },
-            );
-            Ok(Response::Ready {
-                document: envelope.document,
-                revision,
-            })
+                documents,
+            ))
         }
         request => {
             let document = &mut documents
@@ -844,19 +962,15 @@ fn execute(
                     revision: document.redo(expected)?,
                     history_pruned: 0,
                 }),
-                Request::Save { snapshot, target } => Ok(Response::Saved(document.save(
-                    &snapshot,
-                    target,
-                    &envelope.cancel,
-                ))),
                 Request::Compact(_) => {
                     document.compact(&envelope.cancel)?;
                     Ok(Response::Compacted)
                 }
                 Request::Read { .. }
                 | Request::LocateLine { .. }
+                | Request::Save { .. }
                 | Request::Open(_)
-                | Request::New => unreachable!("reads and creation handled above"),
+                | Request::New => unreachable!("routed before executing a document mutation"),
             }
         }
     }

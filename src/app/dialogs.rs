@@ -1,0 +1,307 @@
+//! Modal routing for the file picker and the overflow tab list.
+
+use super::*;
+
+impl AppState {
+    pub(super) fn tab_change(&mut self, action: Action) -> Option<Intent> {
+        self.capture = None;
+        self.focus = Some(Control::Content);
+        self.dirty = true;
+        Some(Intent::Editor(action))
+    }
+
+    pub(super) fn paste_target(&self) -> PasteTarget {
+        if self.field_open() && self.focus == Some(Control::PathField) {
+            PasteTarget::Field(self.field_generation)
+        } else if self.editor_focused() && self.ready() && self.guard_request.is_none() {
+            PasteTarget::Tab(self.screen.tab)
+        } else {
+            PasteTarget::Ignore
+        }
+    }
+
+    pub(super) fn request_picker(
+        &mut self,
+        path: PathBuf,
+        browse: Option<Browse>,
+    ) -> Option<Intent> {
+        let Some(Modal::Open(picker)) = &mut self.modal else {
+            return None;
+        };
+        self.picker_generation = self.picker_generation.wrapping_add(1);
+        picker.generation = self.picker_generation;
+        self.capture = None;
+        self.dirty = true;
+        if browse.is_none()
+            && self
+                .screen
+                .reserved_paths
+                .iter()
+                .any(|reserved| reserved.as_os_str() == path.as_os_str())
+        {
+            picker.loading = false;
+            picker.requested_file = None;
+            self.field_message(&format!(
+                "Path busy with Save As — {}",
+                crate::text::safe(&path.to_string_lossy())
+            ));
+            return Some(Intent::CancelPicker);
+        }
+        picker.loading = true;
+        picker.requested_file = browse.is_none().then(|| path.clone());
+        self.field_error = None;
+        Some(Intent::Picker(picker::Request {
+            generation: picker.generation,
+            path,
+            browse,
+        }))
+    }
+
+    /// Only the current dialog request can install a page or open a tab.
+    pub fn picker_reply(&mut self, reply: picker::Reply) -> Option<Intent> {
+        let Some(Modal::Open(picker)) = &mut self.modal else {
+            return None;
+        };
+        if picker.generation != reply.generation {
+            return None;
+        }
+        picker.loading = false;
+        self.capture = None;
+        self.dirty = true;
+        if let Some(path) = picker.requested_file.take()
+            && self
+                .screen
+                .reserved_paths
+                .iter()
+                .any(|reserved| reserved.as_os_str() == path.as_os_str())
+        {
+            self.field_message(&format!(
+                "Path busy with Save As — {}",
+                crate::text::safe(&path.to_string_lossy())
+            ));
+            return None;
+        }
+        match reply.result {
+            Ok(picker::Outcome::Page(page)) => {
+                picker.accept(page);
+                self.field_error = None;
+            }
+            Ok(picker::Outcome::File(path)) => {
+                self.modal = None;
+                self.field_paste = None;
+                self.field_submit = None;
+                return self.tab_change(Action::Open(path));
+            }
+            Err(error) => self.field_message(&error),
+        }
+        None
+    }
+
+    pub(super) fn picker_command(
+        &mut self,
+        command: Command,
+        layout: &LayoutSnapshot,
+    ) -> Option<Intent> {
+        layout.overlay?;
+        let Some(Modal::Open(picker)) = &mut self.modal else {
+            return None;
+        };
+        match command {
+            Command::Backspace if self.focus == Some(Control::PathField) => {
+                self.edit_field(FieldEdit::Backspace)
+            }
+            Command::Tab | Command::FocusNext | Command::FocusPrevious => {
+                self.focus = layout.next(self.focus, command == Command::FocusPrevious);
+                self.dirty = true;
+            }
+            Command::Move(movement, _) => {
+                let rows = layout.list_rows() as isize;
+                let delta = match movement {
+                    Movement::Up => -1,
+                    Movement::Down => 1,
+                    Movement::PageUp => -rows,
+                    Movement::PageDown => rows,
+                    _ => return None,
+                };
+                let at_boundary = if delta < 0 {
+                    picker.highlight == 0
+                } else {
+                    picker.highlight + 1 >= picker.count()
+                };
+                if at_boundary
+                    && matches!(movement, Movement::PageUp | Movement::PageDown)
+                    && let Some(browse) = picker.page_request(delta < 0)
+                {
+                    let directory = picker.directory.clone();
+                    return self.request_picker(directory, Some(browse));
+                }
+                picker.scroll(delta);
+                self.focus = Some(Control::PickerList);
+                self.dirty = true;
+            }
+            Command::Activate | Command::Newline => match self.focus {
+                Some(Control::PathCancel) => return self.command(Command::Cancel, layout),
+                Some(Control::PathField) => {
+                    if let Some(pending) = &mut self.field_paste {
+                        pending.submit = true;
+                        return None;
+                    }
+                    if picker.field.is_empty() {
+                        self.field_message("Enter a file or directory path");
+                        return None;
+                    }
+                    let path = picker.field_path();
+                    return self.request_picker(path, None);
+                }
+                Some(Control::PickerUp) => {
+                    let path = picker.parent()?;
+                    return self.request_picker(path, Some(Browse::First));
+                }
+                Some(Control::PickerPrevious | Control::PickerNext) => {
+                    let browse =
+                        picker.page_request(self.focus == Some(Control::PickerPrevious))?;
+                    let directory = picker.directory.clone();
+                    return self.request_picker(directory, Some(browse));
+                }
+                Some(Control::PickerList | Control::PickerOpen) => {
+                    let path = picker.directory.join(&picker.row(picker.highlight)?.name);
+                    return self.request_picker(path, None);
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+        None
+    }
+
+    pub(super) fn tabs_command(
+        &mut self,
+        command: Command,
+        layout: &LayoutSnapshot,
+    ) -> Option<Intent> {
+        layout.overlay?;
+        let Some(Modal::Tabs(highlight)) = &mut self.modal else {
+            return None;
+        };
+        match command {
+            Command::Tab | Command::FocusNext | Command::FocusPrevious => {
+                self.focus = layout.next(self.focus, command == Command::FocusPrevious);
+                self.dirty = true;
+            }
+            Command::Move(movement, _) => {
+                let rows = layout.list_rows() as isize;
+                let delta = match movement {
+                    Movement::Up => -1,
+                    Movement::Down => 1,
+                    Movement::PageUp => -rows,
+                    Movement::PageDown => rows,
+                    _ => return None,
+                };
+                let index = self
+                    .screen
+                    .tabs
+                    .iter()
+                    .position(|t| Some(t.id) == *highlight)
+                    .unwrap_or(0);
+                let next = index
+                    .saturating_add_signed(delta)
+                    .min(self.screen.tabs.len().saturating_sub(1));
+                *highlight = self.screen.tabs.get(next).map(|t| t.id);
+                self.focus = Some(Control::TabList);
+                self.dirty = true;
+            }
+            Command::Activate | Command::Newline => {
+                let action = match self.focus {
+                    Some(Control::TabList) => Action::Switch((*highlight)?),
+                    Some(Control::TabListClose) => Action::Guard(After::Close((*highlight)?)),
+                    Some(Control::PathCancel) => return self.command(Command::Cancel, layout),
+                    _ => return None,
+                };
+                self.modal = None;
+                if let Action::Guard(After::Close(id)) = action {
+                    self.guard_return = Some(Modal::Tabs(Some(id)));
+                    self.capture = None;
+                    self.dirty = true;
+                    return Some(Intent::Editor(action));
+                }
+                return self.tab_change(action);
+            }
+            _ => {}
+        }
+        None
+    }
+
+    pub(super) fn dialog_wheel(&mut self, up: bool, layout: &LayoutSnapshot) -> bool {
+        if let Some(Modal::Open(picker)) = &mut self.modal {
+            picker.scroll(if up { -3 } else { 3 });
+            self.dirty = true;
+            return true;
+        }
+        if matches!(self.modal, Some(Modal::Tabs(_))) {
+            for _ in 0..3 {
+                self.tabs_command(
+                    Command::Move(if up { Movement::Up } else { Movement::Down }, false),
+                    layout,
+                );
+            }
+            return true;
+        }
+        false
+    }
+
+    pub(super) fn dialog_click(&mut self, control: Control) -> bool {
+        match (&mut self.modal, control) {
+            (Some(Modal::Open(picker)), Control::PickerRow(row)) => {
+                picker.highlight = row;
+                self.focus = Some(Control::PickerList);
+                self.dirty = true;
+            }
+            (Some(Modal::Tabs(selected)), Control::TabListRow(tab)) => {
+                *selected = Some(tab);
+                self.focus = Some(Control::TabList);
+                self.dirty = true;
+            }
+            _ => return false,
+        }
+        true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A busy Save As destination revokes any older picker reply and keeps field input.
+    #[test]
+    fn reserved_picker_destination_revokes_earlier_reply() {
+        let mut app = AppState::new();
+        let path = PathBuf::from("/tmp/pending-save");
+        app.screen.reserved_paths = vec![Arc::from(path.as_path())].into();
+        let mut dialog = picker::Dialog::new(PathBuf::from("/tmp"));
+        dialog.field = "pending-save".into();
+        app.modal = Some(Modal::Open(Box::new(dialog)));
+        app.focus = Some(Control::PathField);
+        assert!(matches!(
+            app.request_picker("/tmp".into(), Some(Browse::First)),
+            Some(Intent::Picker(_))
+        ));
+        assert!(matches!(
+            app.request_picker(path, None),
+            Some(Intent::CancelPicker)
+        ));
+        assert!(
+            app.picker_reply(picker::Reply {
+                generation: 1,
+                result: Ok(picker::Outcome::File("/tmp/old".into())),
+            })
+            .is_none()
+        );
+        assert!(matches!(&app.modal, Some(Modal::Open(dialog)) if dialog.field == "pending-save"));
+        assert!(
+            app.field_error
+                .as_deref()
+                .unwrap()
+                .contains("busy with Save As")
+        );
+    }
+}

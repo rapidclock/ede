@@ -15,7 +15,7 @@ use crate::{
 };
 use std::{
     collections::VecDeque,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
@@ -24,6 +24,10 @@ use std::{
     thread::{self, JoinHandle},
     time::Duration,
 };
+mod session;
+pub(crate) use session::absolute;
+use session::{OpenJob, RunningSave, SaveIntent, Tab, TabState, WaitingGuard};
+pub(crate) use session::{TabId, TabSummary};
 /// Superseded layouts cancel independently of ordered navigation and document mutations.
 #[derive(Default)]
 struct ViewControl {
@@ -42,8 +46,8 @@ impl ViewControl {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum After {
     Quit,
-    New,
-    Open,
+    QuitTab(TabId),
+    Close(TabId),
 }
 /// Ordered intent submitted by the terminal shell.
 #[derive(Clone, Debug)]
@@ -54,7 +58,15 @@ pub(crate) enum Action {
     FieldPaste(Arc<Spool>, u64),
     Open(PathBuf),
     New,
+    Switch(TabId),
+    CycleTab(bool),
+    RemoveTab(TabId),
+    CancelOpen(TabId),
+    CancelActiveOpen(Option<u64>),
+    CancelGuard,
+    ForTab(TabId, Box<Action>),
     Save(Option<PathBuf>),
+    SaveGuard(After, Option<PathBuf>),
     Guard(After),
     Discard(After, Option<JobId>),
     Size(u16, u16, u64),
@@ -86,7 +98,10 @@ impl Action {
     fn bytes(&self) -> usize {
         (match self {
             Self::Insert(text) => text.capacity(),
-            Self::Open(path) | Self::Save(Some(path)) => path.capacity(),
+            Self::Open(path) | Self::Save(Some(path)) | Self::SaveGuard(_, Some(path)) => {
+                path.capacity()
+            }
+            Self::ForTab(_, action) => action.bytes(),
             _ => 0,
         }) + 128
     }
@@ -100,10 +115,14 @@ fn scrolls_combine(v: i64, h: i64, next_v: i64, next_h: i64) -> bool {
 #[derive(Clone, Debug)]
 pub(crate) enum Event {
     Guard(u64, After, bool),
+    QuitTabs(u64, Vec<TabId>),
     Proceed(u64, After),
-    NeedSaveAs(u64),
-    Saved(SaveResult, String),
+    NeedSaveAs(u64, TabId),
+    NeedGuardSaveAs(u64, After, TabId),
+    GuardSaveStopped(u64),
+    Saved(TabId, SaveResult, String),
     Failure(String),
+    OpenFailed(String),
     Uncertain(u64, After, JobId),
     FieldPaste(u64, Result<String, String>),
 }
@@ -118,6 +137,9 @@ pub(crate) enum SaveResult {
 /// Most recent document state plus prepared immutable viewport.
 #[derive(Clone)]
 pub(crate) struct Screen {
+    pub tab: Option<TabId>,
+    pub tabs: Arc<[TabSummary]>,
+    pub reserved_paths: Arc<[Arc<Path>]>,
     pub document: Option<DocumentId>,
     pub view: Option<Arc<View>>,
     pub preview: Option<String>,
@@ -125,7 +147,6 @@ pub(crate) struct Screen {
     pub path: Option<PathBuf>,
     pub modified: bool,
     pub loading: bool,
-    pub saving: bool,
     pub message: String,
     pub acknowledged: u64,
     pub pointer_press: Option<u64>,
@@ -134,6 +155,9 @@ impl Default for Screen {
     /// Pending startup is visibly distinct from a ready empty buffer.
     fn default() -> Self {
         Self {
+            tab: None,
+            tabs: Arc::default(),
+            reserved_paths: Arc::default(),
             document: None,
             view: None,
             preview: None,
@@ -141,7 +165,6 @@ impl Default for Screen {
             path: None,
             modified: false,
             loading: true,
-            saving: false,
             message: "Preparing document".into(),
             acknowledged: 0,
             pointer_press: None,
@@ -202,7 +225,7 @@ pub(crate) struct Editor {
 }
 impl Editor {
     /// Start storage and coordinator workers with an optional initial path.
-    pub fn new(path: Option<PathBuf>) -> std::io::Result<Self> {
+    pub fn new(launch_directory: PathBuf, paths: Vec<PathBuf>) -> std::io::Result<Self> {
         let (sender, receiver) = mpsc::sync_channel(256);
         let (event_sender, events) = mpsc::sync_channel(16);
         let screen = Arc::new(Mutex::new(None));
@@ -226,7 +249,7 @@ impl Editor {
                         active,
                         view_cancellation,
                     )
-                    .run(path),
+                    .run(launch_directory, paths),
                     Err(error) => {
                         if let Ok(mut slot) = output.lock() {
                             *slot = Some(Screen {
@@ -275,8 +298,12 @@ impl Editor {
             self.used.entries.fetch_sub(1, Ordering::AcqRel);
             return false;
         }
+        let inner = match &action {
+            Action::ForTab(_, inner) => inner,
+            action => action,
+        };
         let paste = matches!(
-            action,
+            inner,
             Action::Paste(_) | Action::FieldPaste(..) | Action::Command(Command::Paste)
         );
         if paste
@@ -298,14 +325,19 @@ impl Editor {
         // Entry admission guarantees channel capacity. Advance epochs before
         // enqueueing so even a job that has not created its read token sees it.
         let layout_epoch = if matches!(
-            action,
-            Action::Size(..) | Action::Scroll(..) | Action::Guard(_)
+            inner,
+            Action::Size(..)
+                | Action::Scroll(..)
+                | Action::Guard(_)
+                | Action::Switch(_)
+                | Action::CycleTab(_)
+                | Action::RemoveTab(_)
         ) {
             self.view_cancel.layout.fetch_add(1, Ordering::AcqRel) + 1
         } else {
             self.view_cancel.layout.load(Ordering::Acquire)
         };
-        let navigation_epoch = if matches!(action, Action::Guard(_)) {
+        let navigation_epoch = if matches!(inner, Action::Guard(_)) {
             self.view_cancel.navigation.fetch_add(1, Ordering::AcqRel) + 1
         } else {
             self.view_cancel.navigation.load(Ordering::Acquire)
@@ -394,25 +426,28 @@ struct Coordinator {
     activity: Arc<Mutex<Cancellation>>,
     view_cancel: Arc<ViewControl>,
     cancel: Cancellation,
-    screen: Screen,
-    info: Option<DocumentInfo>,
-    saving: Option<Job>,
-    save_latest: bool,
-    uncertain: Option<JobId>,
+    tab: TabState,
+    tabs: Vec<Tab>,
+    next_tab: u64,
+    next_untitled: u64,
+    launch_directory: PathBuf,
+    opening: Option<OpenJob>,
+    startup_fallback: bool,
+    saving: Option<RunningSave>,
+    saves: VecDeque<SaveIntent>,
+    completed_open: Option<document::Completion>,
+    completed_save: Option<document::Completion>,
+    waiting_guard: Option<WaitingGuard>,
+    acknowledged: u64,
+    active_open_admission: Option<(TabId, u64)>,
+    summaries: Arc<[TabSummary]>,
+    parked_action: bool,
     clipboard: Option<Arc<Spool>>,
     cut_clipboard: Option<Arc<Spool>>,
     cache: Checkpoints,
-    undo_views: VecDeque<(Position, Position)>,
-    redo_views: Vec<(Position, Position)>,
-    pending_edit: Option<CommittedEdit>,
-    completed_save: Option<SaveResult>,
-    save_message: String,
     width: u16,
     height: u16,
     generation: u64,
-    top: u64,
-    left: u64,
-    preferred: Option<u64>,
     counter: u64,
     active_sequence: u64,
     layout_epoch: u64,
@@ -438,55 +473,41 @@ impl Coordinator {
             activity,
             view_cancel,
             cancel: Cancellation::default(),
-            screen: Screen::default(),
-            info: None,
+            tab: TabState::default(),
+            tabs: Vec::new(),
+            next_tab: 0,
+            next_untitled: 0,
+            launch_directory: PathBuf::new(),
+            opening: None,
+            startup_fallback: false,
             saving: None,
-            save_latest: false,
-            uncertain: None,
+            saves: VecDeque::new(),
+            completed_open: None,
+            completed_save: None,
+            waiting_guard: None,
+            acknowledged: 0,
+            active_open_admission: None,
+            summaries: Arc::default(),
+            parked_action: false,
             clipboard: None,
             cut_clipboard: None,
             cache: Checkpoints::default(),
-            undo_views: VecDeque::new(),
-            redo_views: Vec::new(),
-            pending_edit: None,
-            completed_save: None,
-            save_message: String::new(),
             width: 80,
             height: 22,
             generation: 0,
-            top: 0,
-            left: 0,
-            preferred: None,
             counter: 0,
             active_sequence: 0,
             layout_epoch: 0,
             navigation_epoch: 0,
         }
     }
-    /// Start a document, then process ordered intents and save completions.
-    fn run(mut self, path: Option<PathBuf>) {
-        // Preserve a cancellation delivered before this thread began startup.
-        if let Ok(active) = self.activity.lock() {
-            self.cancel = active.clone();
-        }
-        if let Err(error) = self.replace_document(path) {
-            let cancelled = matches!(error, Error::Cancelled);
-            let mut message = error.to_string();
-            if self.screen.document.is_none() {
-                self.begin();
-                if let Err(fallback) = self.replace_document(None) {
-                    message = format!("{message}; empty buffer unavailable: {fallback}");
-                }
-            }
-            self.screen.message = message.clone();
-            self.publish();
-            if !cancelled && !self.stop.load(Ordering::Acquire) {
-                self.event(Event::Failure(message));
-            }
-        }
+    /// Process lifecycle commands and asynchronous results in admission order.
+    fn run(mut self, launch_directory: PathBuf, paths: Vec<PathBuf>) {
+        self.start(launch_directory, paths);
+        self.publish();
         let mut pending = None;
         while !self.stop.load(Ordering::Acquire) {
-            if !self.poll_save_events() {
+            if !self.poll_background() {
                 break;
             }
             match pending
@@ -502,7 +523,7 @@ impl Coordinator {
                             (Action::Size(..), Action::Size(..)) => {}
                             (Action::Scroll(v, h), Action::Scroll(nv, nh))
                                 if scrolls_combine(*v, *h, *nv, *nh)
-                                    && (*v == 0 || self.left == 0) =>
+                                    && (*v == 0 || self.tab.left == 0) =>
                             {
                                 *nv = nv.saturating_add(*v);
                                 *nh = nh.saturating_add(*h);
@@ -548,18 +569,18 @@ impl Coordinator {
                     let action = std::mem::replace(&mut envelope.action, Action::ClearSelection);
                     let result = self.action(action);
                     let closed = matches!(result, Err(Error::Closed));
-                    self.screen.acknowledged = envelope.sequence;
+                    self.acknowledged = envelope.sequence;
                     if let Err(error) = result {
-                        self.screen.message = if self.pending_edit.is_some() {
+                        self.tab.screen.message = if self.tab.pending_edit.is_some() {
                             format!("Edit committed; caret lookup pending: {error}")
                         } else {
                             error.to_string()
                         };
                         if !matches!(error, Error::Cancelled) {
-                            self.event(Event::Failure(self.screen.message.clone()));
+                            self.event(Event::Failure(self.tab.screen.message.clone()));
                         }
                     }
-                    let storage_available = self.poll_save_events();
+                    let storage_available = self.poll_background();
                     self.publish();
                     if closed || !storage_available {
                         break;
@@ -590,23 +611,17 @@ impl Coordinator {
                 *active = cancel.clone();
             }
         }
-        if matches!(
-            envelope.action,
-            Action::Open(_)
-                | Action::New
-                | Action::Paste(_)
-                | Action::FieldPaste(..)
-                | Action::Command(Command::Paste)
-        ) && envelope.cancellation != envelope.used.cancellation.load(Ordering::Acquire)
+        if (envelope.paste || matches!(envelope.action, Action::Open(_) | Action::New))
+            && envelope.cancellation != envelope.used.cancellation.load(Ordering::Acquire)
         {
             self.cancel.cancel();
         }
     }
     /// Coalesce screen updates; two bounded layouts at most are retained across the bridge.
     fn publish(&mut self) {
-        self.screen.saving = self.saving.is_some();
+        self.summarize();
         if let Ok(mut slot) = self.output.lock() {
-            *slot = Some(self.screen.clone());
+            *slot = Some(self.tab.screen.clone());
         }
     }
     /// Send rare control events with bounded backpressure and shutdown cancellation.
@@ -639,9 +654,9 @@ impl Coordinator {
                 job.cancel();
             }
             while let Some(progress) = job.take_progress() {
-                self.screen.message = match progress {
+                self.tab.screen.message = match progress {
                     OpenProgress::Preview { text, raw_bytes } => {
-                        self.screen.preview = Some(text);
+                        self.tab.screen.preview = Some(text);
                         format!("Loading {raw_bytes} bytes (read-only preview)")
                     }
                     OpenProgress::Preparing { completed, total } => {
@@ -651,14 +666,17 @@ impl Coordinator {
                 self.publish();
             }
             if let Some(completion) = self.service.try_recv()? {
-                if completion.job == job.id {
+                if completion.job == job.id
+                    && completion.document == job.document
+                    && completion.request == self.counter
+                {
                     if opening && self.cancel.is_cancelled() {
                         self.service.close(completion.document);
                         return Err(Error::Cancelled);
                     }
                     return completion.result;
                 }
-                self.save_completion(completion);
+                self.route_completion(completion);
             } else {
                 thread::sleep(Duration::from_millis(1));
             }
@@ -666,29 +684,39 @@ impl Coordinator {
     }
     /// Current ready identity or an explicit loading error.
     fn document(&self) -> Result<DocumentId, Error> {
-        self.screen.document.ok_or(Error::Busy)
+        self.tab.screen.document.ok_or(Error::Busy)
     }
-    /// Refresh authoritative dirty/path/history metadata after every mutation or save.
-    fn refresh(&mut self) -> Result<(), Error> {
-        let id = self.document()?;
-        if let Response::Info(info) = self.call(Request::Info(id))? {
-            self.screen.path = info.path.clone();
-            self.screen.modified =
-                info.dirty && (info.path.is_some() || info.len != 0 || self.uncertain.is_some());
-            self.info = Some(info);
+    /// Read authoritative dirty/path/history metadata after a mutation or save.
+    fn read_info(&mut self, id: DocumentId) -> Result<DocumentInfo, Error> {
+        match self.call(Request::Info(id))? {
+            Response::Info(info) => Ok(info),
+            _ => Err(Error::CorruptStorage),
         }
+    }
+
+    fn refresh(&mut self) -> Result<(), Error> {
+        let info = self.read_info(self.document()?)?;
+        self.tab.apply_info(info);
         Ok(())
     }
+
     /// Capture a bounded immutable lease for background navigation/layout/staging.
-    fn snapshot(&mut self) -> Result<Snapshot, Error> {
-        match self.call(Request::Snapshot(self.document()?))? {
+    fn snapshot_of(&mut self, document: DocumentId) -> Result<Snapshot, Error> {
+        match self.call(Request::Snapshot(document))? {
             Response::Snapshot(snapshot) => Ok(snapshot),
             _ => Err(Error::CorruptStorage),
         }
     }
+
+    fn snapshot(&mut self) -> Result<Snapshot, Error> {
+        self.snapshot_of(self.document()?)
+    }
     /// Render a fresh revision/geometry-tagged view; no snapshot is retained afterward.
     fn layout(&mut self, reveal: bool) -> Result<(), Error> {
-        self.screen.view = None;
+        self.tab.screen.view = None;
+        if self.parked_action {
+            return Ok(());
+        }
         // Drop an unconsumed replacement before building another: the UI's current
         // Arc and this job then account for at most two prepared layout allocations.
         if let Ok(mut slot) = self.output.lock() {
@@ -703,9 +731,9 @@ impl Coordinator {
         let snapshot = self.snapshot()?;
         let result = Text::new(&snapshot, &cancel).view(
             ViewRequest {
-                position: self.screen.position,
-                top: self.top,
-                left: self.left,
+                position: self.tab.screen.position,
+                top: self.tab.top,
+                left: self.tab.left,
                 width: self.width,
                 height: self.height,
                 reveal,
@@ -716,168 +744,33 @@ impl Coordinator {
         let view = match result {
             Ok(view) => view,
             Err(Error::Cancelled) if !self.cancel.is_cancelled() => {
-                self.screen.message = "Preparing newer view".into();
                 return Ok(());
             }
             Err(error) => return Err(error),
         };
-        self.top = view.top;
-        self.left = view.left;
-        self.screen.view = Some(Arc::new(view));
+        self.tab.top = view.top;
+        self.tab.left = view.left;
+        self.tab.screen.view = Some(Arc::new(view));
         Ok(())
     }
-    /// Retain the old document until a fully validated replacement is ready.
-    fn replace_document(&mut self, path: Option<PathBuf>) -> Result<(), Error> {
-        self.screen.loading = true;
-        self.publish();
-        let result = self.call(path.map_or(Request::New, Request::Open));
-        self.screen.loading = false;
-        self.screen.preview = None;
-        if let Response::Ready { document, .. } = result? {
-            if let Some(old) = self.screen.document.replace(document) {
-                self.service.close(old);
-            }
-            self.screen.position = Position::default();
-            self.screen.pointer_press = None;
-            self.top = 0;
-            self.left = 0;
-            self.preferred = None;
-            self.cache = Checkpoints::default();
-            self.undo_views.clear();
-            self.redo_views.clear();
-            self.pending_edit = None;
-            self.uncertain = None;
-            self.refresh()?;
-            self.layout(true)?;
-            self.screen.message = "Ready".into();
-        }
-        Ok(())
-    }
-    /// Complete a single save on the owner before exposing the result to the UI.
-    fn save_completion(&mut self, completion: document::Completion) {
-        if self
-            .saving
-            .as_ref()
-            .is_none_or(|job| job.id != completion.job)
-        {
-            return;
-        }
-        self.saving = None;
-        let result = match completion.result {
-            Ok(Response::Saved(report)) => {
-                // Only an acknowledged save resolves an earlier uncertain publication.
-                // A retry that never committed says nothing about that prior destination.
-                self.uncertain = match report.outcome {
-                    SaveOutcome::Saved => None,
-                    SaveOutcome::CommittedDurabilityUncertain => Some(completion.job),
-                    SaveOutcome::NotCommitted => self.uncertain,
-                };
-                let cancelled = matches!(report.error, Some(Error::Cancelled));
-                self.screen.message = match report.outcome {
-                    SaveOutcome::Saved => "Saved".into(),
-                    SaveOutcome::NotCommitted if cancelled => "Save cancelled".into(),
-                    SaveOutcome::NotCommitted => format!(
-                        "Save failed: {}. Use Save As (F4).",
-                        report
-                            .error
-                            .map_or_else(|| "Unknown error".into(), |e| e.to_string())
-                    ),
-                    SaveOutcome::CommittedDurabilityUncertain => format!(
-                        "Destination may have changed; save is uncertain: {}",
-                        report
-                            .error
-                            .map_or_else(|| "Unknown error".into(), |e| e.to_string())
-                    ),
-                };
-                // The caller's foreground request may be inside call(); enqueueing another
-                // request here would consume its completion. Refresh in poll_save instead.
-                match report.outcome {
-                    SaveOutcome::Saved => SaveResult::Saved,
-                    SaveOutcome::NotCommitted if cancelled => SaveResult::Cancelled,
-                    SaveOutcome::NotCommitted => SaveResult::Failed,
-                    SaveOutcome::CommittedDurabilityUncertain => SaveResult::Uncertain,
-                }
-            }
+    /// Publish background changes and surface failures without blocking terminal input.
+    fn poll_background(&mut self) -> bool {
+        let result = (|| {
+            let changed = self.settle_completions()? | self.receive()?;
+            Ok(changed | self.poll_opens()?)
+        })();
+        match result {
+            Ok(true) => self.publish(),
+            Ok(false) => {}
+            Err(Error::Closed) => return false,
             Err(error) => {
-                self.screen.message = error.to_string();
-                match error {
-                    Error::SaveWorkerPanicked => {
-                        self.uncertain = Some(completion.job);
-                        SaveResult::Uncertain
-                    }
-                    Error::Cancelled => SaveResult::Cancelled,
-                    _ => SaveResult::Failed,
-                }
+                self.event(Event::Failure(error.to_string()));
+                self.publish();
             }
-            _ => return,
-        };
-        self.completed_save = Some(result);
-        self.save_message = self.screen.message.clone();
-    }
-    /// Poll save completion while ordinary input remains available.
-    fn poll_save(&mut self) -> Result<Option<SaveResult>, Error> {
-        if self.saving.is_some()
-            && let Some(completion) = self.service.try_recv()?
-        {
-            self.save_completion(completion);
-        }
-        let result = self.completed_save.take();
-        if let Some(result) = result {
-            self.refresh()?;
-            self.screen.message = if result == SaveResult::Saved && self.screen.modified {
-                "Saved captured revision; newer edits unsaved".into()
-            } else {
-                self.save_message.clone()
-            };
-            self.event(Event::Saved(result, self.screen.message.clone()));
-            self.publish();
-            if self.save_latest {
-                self.save_latest = false;
-                self.start_save(None)?;
-            }
-        }
-        Ok(result)
-    }
-    /// Surface polling/admission failures; owner loss must terminate instead of waiting forever.
-    fn poll_save_events(&mut self) -> bool {
-        if let Err(error) = self.poll_save() {
-            let closed = matches!(error, Error::Closed);
-            self.screen.message = error.to_string();
-            self.event(Event::Failure(self.screen.message.clone()));
-            self.publish();
-            return !closed;
         }
         true
     }
-    /// Capture one revision for the independent save worker; retain only one latest intent.
-    fn start_save(&mut self, path: Option<PathBuf>) -> Result<(), Error> {
-        if self.saving.is_some() {
-            if path.is_some() {
-                return Err(Error::Busy);
-            }
-            self.save_latest = true;
-            return Ok(());
-        }
-        if path.is_none() && self.screen.path.is_none() {
-            self.event(Event::NeedSaveAs(self.active_sequence));
-            return Ok(());
-        }
-        let snapshot = self.snapshot()?;
-        self.counter += 1;
-        self.saving = Some(
-            self.service
-                .submit(
-                    self.counter,
-                    Request::Save {
-                        snapshot,
-                        target: path.map_or(SaveTarget::Current, SaveTarget::New),
-                    },
-                )
-                .map_err(|e| e.error)?,
-        );
-        self.screen.message = "Saving".into();
-        Ok(())
-    }
+
     /// Apply one atomic replacement, publishing view history only after successful commit.
     fn replace(
         &mut self,
@@ -885,9 +778,9 @@ impl Coordinator {
         paste: Option<Arc<Spool>>,
         range: std::ops::Range<u64>,
     ) -> Result<(), Error> {
-        let info = self.info.as_ref().ok_or(Error::Busy)?;
+        let info = self.tab.info.as_ref().ok_or(Error::Busy)?;
         let expected = info.revision;
-        let before = self.screen.position;
+        let before = self.tab.screen.position;
         let inserted = text
             .as_ref()
             .map_or_else(|| paste.as_ref().map_or(0, |p| p.len), |s| s.len() as u64);
@@ -927,13 +820,13 @@ impl Coordinator {
             }
             if revision != expected {
                 self.cache.edited(expected, revision, range.start);
-                self.pending_edit = Some(CommittedEdit {
+                self.tab.pending_edit = Some(CommittedEdit {
                     before,
                     endpoint: range.start + inserted,
                     history_pruned,
                 });
                 // An old cell map/selection must not describe the committed revision.
-                self.screen.view = None;
+                self.tab.screen.view = None;
                 self.begin();
                 self.reconcile_edit()?;
             } else {
@@ -941,15 +834,15 @@ impl Coordinator {
                 if inserted != 0 {
                     // Storage kept the same bytes and history. The selection still
                     // ends at its original, valid grapheme boundary after replacement.
-                    self.screen.position.move_to(range.end, false);
+                    self.tab.screen.position.move_to(range.end, false);
                 }
             }
-            self.screen.message = if history_pruned > 0 {
+            self.tab.screen.message = if history_pruned > 0 {
                 format!("History pruned: {history_pruned} undo entries")
             } else {
                 "Ready".into()
             };
-            self.preferred = None;
+            self.tab.preferred = None;
             self.layout(true)?;
         }
         Ok(())
@@ -957,7 +850,7 @@ impl Coordinator {
     /// Resolve committed caret/history exactly once before another position-dependent action.
     /// The pending record survives a read failure; retrying never repeats the transaction.
     fn reconcile_edit(&mut self) -> Result<(), Error> {
-        let Some(edit) = &self.pending_edit else {
+        let Some(edit) = &self.tab.pending_edit else {
             return Ok(());
         };
         let endpoint = edit.endpoint;
@@ -967,22 +860,23 @@ impl Coordinator {
             *active = self.cancel.clone();
         }
         let caret = Text::new(&snapshot, &self.cancel).ceil(endpoint)?;
-        let edit = self.pending_edit.take().expect("committed edit");
-        self.screen.position.move_to(caret, false);
-        self.redo_views.clear();
-        self.undo_views
-            .push_back((edit.before, self.screen.position));
-        for _ in 0..edit.history_pruned.min(self.undo_views.len() as u64) {
-            self.undo_views.pop_front();
+        let edit = self.tab.pending_edit.take().expect("committed edit");
+        self.tab.screen.position.move_to(caret, false);
+        self.tab.redo_views.clear();
+        self.tab
+            .undo_views
+            .push_back((edit.before, self.tab.screen.position));
+        for _ in 0..edit.history_pruned.min(self.tab.undo_views.len() as u64) {
+            self.tab.undo_views.pop_front();
         }
-        self.preferred = None;
+        self.tab.preferred = None;
         Ok(())
     }
     /// Copy exact selection bytes to a private disk spool with fixed buffers.
     fn copy(&mut self, cut: bool) -> Result<(), Error> {
-        let range = self.screen.position.selection();
+        let range = self.tab.screen.position.selection();
         if range.is_empty() {
-            self.screen.message = "No selection".into();
+            self.tab.screen.message = "No selection".into();
             return Ok(());
         }
         let snapshot = self.snapshot()?;
@@ -1008,7 +902,7 @@ impl Coordinator {
         } else {
             self.clipboard = Some(spool);
         }
-        self.screen.message = if cut { "Cut" } else { "Copied" }.into();
+        self.tab.screen.message = if cut { "Cut" } else { "Copied" }.into();
         Ok(())
     }
     /// Navigate using the same chunked cell mapping as rendering and pointer hits.
@@ -1022,7 +916,7 @@ impl Coordinator {
         let snapshot = self.snapshot()?;
         let mut text = Text::new(&snapshot, &cancel);
         self.cache.reset(snapshot.revision());
-        let position = self.screen.position;
+        let position = self.tab.screen.position;
         let range = position.selection();
         let line = snapshot.line_of_offset(ByteOffset(position.caret))?;
         let vertical = matches!(
@@ -1030,7 +924,7 @@ impl Coordinator {
             Movement::Up | Movement::Down | Movement::PageUp | Movement::PageDown
         );
         let preferred = if vertical {
-            match self.preferred {
+            match self.tab.preferred {
                 Some(column) => column,
                 None => text.coordinates(position.caret, &mut self.cache)?.1,
             }
@@ -1059,13 +953,17 @@ impl Coordinator {
                 &mut self.cache,
             )?,
         };
-        self.screen.position.move_to(caret, extend);
-        self.preferred = vertical.then_some(preferred);
+        self.tab.screen.position.move_to(caret, extend);
+        self.tab.preferred = vertical.then_some(preferred);
         if movement == Movement::PageUp {
-            self.top = self.top.saturating_sub(page);
+            self.tab.top = self.tab.top.saturating_sub(page);
         }
         if movement == Movement::PageDown {
-            self.top = self.top.saturating_add(page).min(snapshot.line_count() - 1);
+            self.tab.top = self
+                .tab
+                .top
+                .saturating_add(page)
+                .min(snapshot.line_count() - 1);
         }
         drop(snapshot);
         self.layout(true)
@@ -1079,9 +977,18 @@ impl Coordinator {
             Action::Guard(_)
                 | Action::Discard(..)
                 | Action::Save(_)
+                | Action::SaveGuard(..)
                 | Action::New
                 | Action::Open(_)
                 | Action::FieldPaste(..)
+                | Action::ForTab(..)
+                | Action::Switch(_)
+                | Action::CycleTab(_)
+                | Action::RemoveTab(_)
+                | Action::CancelOpen(_)
+                | Action::CancelActiveOpen(_)
+                | Action::CancelGuard
+                | Action::Size(..)
         ) {
             self.reconcile_edit()?;
         }
@@ -1111,48 +1018,50 @@ impl Coordinator {
                     result.map_err(|error| error.to_string()),
                 ));
             }
-            Action::New => self.replace_document(None)?,
-            Action::Open(path) => self.replace_document(Some(path))?,
-            Action::Save(path) => self.start_save(path)?,
-            Action::Guard(after) => {
-                if self.screen.document.is_some() {
-                    self.refresh()?;
-                }
-                let dirty =
-                    self.uncertain.is_some() || self.saving.is_some() || self.screen.modified;
-                self.event(Event::Guard(self.active_sequence, after, dirty));
+            Action::New | Action::Open(_) if self.cancel.is_cancelled() => {
+                return Err(Error::Cancelled);
             }
-            Action::Discard(after, acknowledged) => {
-                self.save_latest = false;
-                if let Some(job) = &self.saving {
-                    job.cancel();
-                }
-                while self.saving.is_some() && !self.stop.load(Ordering::Acquire) {
-                    if self.poll_save()? == Some(SaveResult::Failed) {
-                        return Ok(());
-                    }
-                    thread::sleep(Duration::from_millis(1));
-                }
-                if let Some(job) = self.uncertain.filter(|job| Some(*job) != acknowledged) {
-                    self.event(Event::Uncertain(self.active_sequence, after, job));
-                } else {
-                    self.event(Event::Proceed(self.active_sequence, after));
+            Action::New => self.add_new()?,
+            Action::Open(path) => {
+                self.add_named(&path, true)?;
+                if self.tab.screen.loading
+                    && let Some(tab) = self.tab.screen.tab
+                {
+                    self.active_open_admission = Some((tab, self.active_sequence));
                 }
             }
+            Action::Switch(tab) => self.switch_tab(tab)?,
+            Action::CycleTab(backwards) => self.cycle_tab(backwards)?,
+            Action::RemoveTab(tab) => self.remove_tab(tab)?,
+            Action::CancelOpen(tab) => self.cancel_open(tab)?,
+            Action::CancelActiveOpen(switch) => self.cancel_active_open(switch)?,
+            Action::CancelGuard => self.waiting_guard = None,
+            Action::Save(path) => {
+                if let Some(tab) = self.tab.screen.tab {
+                    self.queue_save(tab, path)?;
+                }
+            }
+            Action::Guard(after) => self.guard(after)?,
+            Action::SaveGuard(after, path) => self.save_for_guard(after, path)?,
+            Action::Discard(after, acknowledged) => self.discard(after, acknowledged),
+            Action::ForTab(tab, action) => self.tab_action(tab, *action)?,
             Action::Insert(text) => {
-                self.replace(Some(text), None, self.screen.position.selection())?
+                self.replace(Some(text), None, self.tab.screen.position.selection())?
             }
             Action::Paste(paste) => {
-                self.replace(None, Some(paste), self.screen.position.selection())?
+                self.replace(None, Some(paste), self.tab.screen.position.selection())?
             }
             Action::Size(width, height, generation) => {
                 self.width = width;
                 self.height = height;
                 self.generation = generation;
-                self.layout(false)?;
+                if self.tab.screen.document.is_some() {
+                    self.layout(false)?;
+                }
             }
             Action::Scroll(vertical, horizontal) => {
                 let last_line = self
+                    .tab
                     .info
                     .as_ref()
                     .ok_or(Error::Busy)?
@@ -1161,17 +1070,18 @@ impl Coordinator {
                 // Ordered bounds are independent of cancelled/superseded paint jobs.
                 // Clamp the old offset too: an edit may have shortened the document.
                 let top = self
+                    .tab
                     .top
                     .min(last_line)
                     .saturating_add_signed(vertical)
                     .min(last_line);
-                let left = if self.left != 0 || horizontal != 0 {
+                let left = if self.tab.left != 0 || horizontal != 0 {
                     let snapshot = self.snapshot()?;
                     let cancel = self
                         .cancel
                         .for_epoch(self.view_cancel.navigation.clone(), self.navigation_epoch);
                     let mut text = Text::new(&snapshot, &cancel);
-                    let old = text.clamp_left(top, self.height, self.left, &mut self.cache)?;
+                    let old = text.clamp_left(top, self.height, self.tab.left, &mut self.cache)?;
                     text.clamp_left(
                         top,
                         self.height,
@@ -1181,8 +1091,8 @@ impl Coordinator {
                 } else {
                     0
                 };
-                self.top = top;
-                self.left = left;
+                self.tab.top = top;
+                self.tab.left = left;
                 self.layout(false)?;
             }
             Action::GoTo { line, column } => {
@@ -1198,13 +1108,15 @@ impl Coordinator {
                 }
                 let caret =
                     Text::new(&snapshot, &cancel).at_column(line, column, &mut self.cache)?;
-                self.screen.position.move_to(caret, false);
-                self.preferred = None;
+                self.tab.screen.position.move_to(caret, false);
+                self.tab.preferred = None;
                 self.layout(true)?;
             }
             Action::ClearSelection => {
-                self.screen.position.anchor = self.screen.position.caret;
-                self.layout(false)?;
+                if self.tab.screen.document.is_some() {
+                    self.tab.screen.position.anchor = self.tab.screen.position.caret;
+                    self.layout(false)?;
+                }
             }
             Action::Hit {
                 caret,
@@ -1216,47 +1128,48 @@ impl Coordinator {
                 left,
                 gesture,
             } => {
-                if matches!(gesture, PointerGesture::Drag(id) if self.screen.pointer_press != Some(id))
+                if matches!(gesture, PointerGesture::Drag(id) if self.tab.screen.pointer_press != Some(id))
                 {
                     return Ok(());
                 }
-                if self.screen.document == Some(document)
+                if self.tab.screen.document == Some(document)
                     && generation == self.generation
-                    && top == self.top
-                    && left == self.left
+                    && top == self.tab.top
+                    && left == self.tab.left
                     && self
+                        .tab
                         .info
                         .as_ref()
                         .is_some_and(|info| info.revision == revision)
                 {
                     if let PointerGesture::Press(id) = gesture {
-                        self.screen.pointer_press = Some(id);
+                        self.tab.screen.pointer_press = Some(id);
                     }
-                    self.screen.position.move_to(caret, extend);
-                    self.preferred = None;
+                    self.tab.screen.position.move_to(caret, extend);
+                    self.tab.preferred = None;
                     self.layout(false)?;
                 } else {
-                    self.screen.message = "Selection ignored: view changed; retry".into();
+                    self.tab.screen.message = "Selection ignored: view changed; retry".into();
                 }
             }
             Action::Command(command) => match command {
                 Command::Move(movement, extend) => self.movement(movement, extend)?,
                 Command::SelectAll => {
                     let snapshot = self.snapshot()?;
-                    self.screen.position = Position {
+                    self.tab.screen.position = Position {
                         anchor: 0,
                         caret: snapshot.len(),
                     };
-                    self.preferred = None;
+                    self.tab.preferred = None;
                     self.layout(true)?;
                 }
                 Command::Copy => self.copy(false)?,
                 Command::Cut => self.copy(true)?,
                 Command::Paste => {
                     if let Some(paste) = self.clipboard.clone() {
-                        self.replace(None, Some(paste), self.screen.position.selection())?;
+                        self.replace(None, Some(paste), self.tab.screen.position.selection())?;
                     } else {
-                        self.screen.message = "Clipboard empty".into();
+                        self.tab.screen.message = "Clipboard empty".into();
                     }
                 }
                 Command::Newline | Command::Tab => {
@@ -1267,10 +1180,14 @@ impl Coordinator {
                     } else {
                         "\n"
                     };
-                    self.replace(Some(text.into()), None, self.screen.position.selection())?;
+                    self.replace(
+                        Some(text.into()),
+                        None,
+                        self.tab.screen.position.selection(),
+                    )?;
                 }
                 Command::Backspace | Command::Delete => {
-                    let mut range = self.screen.position.selection();
+                    let mut range = self.tab.screen.position.selection();
                     if range.is_empty() {
                         let snapshot = self.snapshot()?;
                         let mut text = Text::new(&snapshot, &self.cancel);
@@ -1283,7 +1200,7 @@ impl Coordinator {
                     self.replace(Some(String::new()), None, range)?;
                 }
                 Command::Undo | Command::Redo => {
-                    let expected = self.info.as_ref().ok_or(Error::Busy)?.revision;
+                    let expected = self.tab.info.as_ref().ok_or(Error::Busy)?.revision;
                     let document = self.document()?;
                     let response = self.call(if command == Command::Undo {
                         Request::Undo { document, expected }
@@ -1292,19 +1209,19 @@ impl Coordinator {
                     })?;
                     if matches!(response, Response::Changed {revision, ..} if revision != expected)
                     {
-                        self.screen.view = None;
+                        self.tab.screen.view = None;
                         if command == Command::Undo {
-                            if let Some(entry) = self.undo_views.pop_back() {
-                                self.screen.position = entry.0;
-                                self.redo_views.push(entry);
+                            if let Some(entry) = self.tab.undo_views.pop_back() {
+                                self.tab.screen.position = entry.0;
+                                self.tab.redo_views.push(entry);
                             }
-                        } else if let Some(entry) = self.redo_views.pop() {
-                            self.screen.position = entry.1;
-                            self.undo_views.push_back(entry);
+                        } else if let Some(entry) = self.tab.redo_views.pop() {
+                            self.tab.screen.position = entry.1;
+                            self.tab.undo_views.push_back(entry);
                         }
                     }
                     self.refresh()?;
-                    self.preferred = None;
+                    self.tab.preferred = None;
                     self.layout(true)?;
                 }
                 _ => {}
@@ -1332,7 +1249,7 @@ mod tests {
             Arc::new(ViewControl::default()),
         );
         worker.begin();
-        worker.replace_document(None).unwrap();
+        worker.add_new().unwrap();
         worker
     }
     /// Read small test contents with the same bounded snapshot interface as production.
@@ -1351,10 +1268,72 @@ mod tests {
     fn saved(worker: &mut Coordinator) {
         let deadline = Instant::now() + Duration::from_secs(10);
         while worker.saving.is_some() || worker.completed_save.is_some() {
-            worker.poll_save().unwrap();
+            worker.receive().unwrap();
             assert!(Instant::now() < deadline);
             thread::sleep(Duration::from_millis(1));
         }
+    }
+
+    /// A close's Save decision must survive acknowledgement of an older revision.
+    #[test]
+    fn guarded_save_waits_for_newer_queued_revision() {
+        use crate::{
+            app::{AppState, Intent, Modal},
+            input::Input,
+            ui::LayoutSnapshot,
+        };
+        use ratatui::layout::Rect;
+        let gate = Arc::new(SaveGate {
+            fail: false,
+            ..SaveGate::new(document::IoPoint::Publish, 1)
+        });
+        let mut worker = coordinator(OpenOptions {
+            faults: Some(gate.clone()),
+            ..OpenOptions::default()
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("named");
+        std::fs::write(&file, "initial").unwrap();
+        worker.open_and_switch(&file).unwrap();
+        let id = worker.tab.screen.tab.unwrap();
+        let after = After::Close(id);
+        let (sender, events) = mpsc::sync_channel(16);
+        worker.events = sender;
+        worker.action(Action::Insert("one ".into())).unwrap();
+        worker.action(Action::Save(None)).unwrap();
+        gate.wait_until_blocked();
+        worker.action(Action::Insert("two ".into())).unwrap();
+        worker.active_sequence = 5;
+        worker.action(Action::Guard(after)).unwrap();
+        let mut app = AppState::new();
+        app.update(worker.tab.screen.clone(), false);
+        app.expect_guard(5);
+        app.event(events.try_recv().unwrap());
+        let layout = LayoutSnapshot::for_app(Rect::new(0, 0, 80, 24), &app, 1);
+        app.input(Input::Command(Command::Tab), &layout);
+        let Some(Intent::Editor(save)) = app.input(Input::Command(Command::Newline), &layout)
+        else {
+            panic!("expected guarded save");
+        };
+        worker.active_sequence = 6;
+        app.expect_guard_for(6, after);
+        worker.action(save).unwrap();
+        gate.release();
+        saved(&mut worker);
+        let mut removed = None;
+        for event in events.try_iter() {
+            match app.event(event) {
+                Some(Intent::Editor(Action::RemoveTab(id))) => removed = Some(id),
+                Some(Intent::Editor(Action::Guard(_))) => {
+                    panic!("older save consumed the close decision")
+                }
+                None => {}
+                Some(intent) => panic!("unexpected {intent:?}"),
+            }
+        }
+        assert_eq!(removed, Some(id));
+        assert!(!matches!(app.modal, Some(Modal::Confirm(..))));
+        assert_eq!(std::fs::read_to_string(file).unwrap(), "one two initial");
     }
     /// Selection replacement, grapheme deletion and view history restore exact caret/anchor pairs.
     #[test]
@@ -1372,15 +1351,15 @@ mod tests {
         worker
             .action(Action::Command(Command::Move(Movement::Right, true)))
             .unwrap();
-        let selection = worker.screen.position;
+        let selection = worker.tab.screen.position;
         assert_eq!(selection.selection(), 1..4);
         worker.action(Action::Insert("X".into())).unwrap();
         assert_eq!(contents(&mut worker), "aXe\u{301}\r\nlast");
-        let after = worker.screen.position;
+        let after = worker.tab.screen.position;
         worker.action(Action::Command(Command::Undo)).unwrap();
-        assert_eq!(worker.screen.position, selection);
+        assert_eq!(worker.tab.screen.position, selection);
         worker.action(Action::Command(Command::Redo)).unwrap();
-        assert_eq!(worker.screen.position, after);
+        assert_eq!(worker.tab.screen.position, after);
         worker
             .action(Action::Command(Command::Move(Movement::End, false)))
             .unwrap();
@@ -1400,12 +1379,12 @@ mod tests {
         worker.action(Action::Command(Command::Copy)).unwrap();
         worker.action(Action::Insert("two".into())).unwrap();
         worker.action(Action::Insert("three".into())).unwrap();
-        assert_eq!(worker.undo_views.len(), 2);
+        assert_eq!(worker.tab.undo_views.len(), 2);
         worker.action(Action::Command(Command::Undo)).unwrap();
         let before = contents(&mut worker);
-        let position = worker.screen.position;
+        let position = worker.tab.screen.position;
         assert!(worker.action(Action::Insert("\0".into())).is_err());
-        assert_eq!(worker.screen.position, position);
+        assert_eq!(worker.tab.screen.position, position);
         assert_eq!(contents(&mut worker), before);
         worker.action(Action::Insert(String::new())).unwrap();
         worker.action(Action::Command(Command::Redo)).unwrap();
@@ -1424,17 +1403,17 @@ mod tests {
         worker.action(Action::Insert("a".into())).unwrap();
         worker.action(Action::Insert("b".into())).unwrap();
         worker.action(Action::Command(Command::Undo)).unwrap();
-        let revision = worker.info.as_ref().unwrap().revision;
+        let revision = worker.tab.info.as_ref().unwrap().revision;
         worker.action(Action::Command(Command::SelectAll)).unwrap();
         worker.action(Action::Insert("a".into())).unwrap();
         assert_eq!(
-            worker.screen.position,
+            worker.tab.screen.position,
             Position {
                 caret: 1,
                 anchor: 1
             }
         );
-        assert_eq!(worker.info.as_ref().unwrap().revision, revision);
+        assert_eq!(worker.tab.info.as_ref().unwrap().revision, revision);
         worker.action(Action::Command(Command::Redo)).unwrap();
         assert_eq!(contents(&mut worker), "ab");
     }
@@ -1448,7 +1427,7 @@ mod tests {
             .unwrap();
         worker.action(Action::GoTo { line: 1, column: 0 }).unwrap();
         let document = worker.document().unwrap();
-        let revision = worker.info.as_ref().unwrap().revision;
+        let revision = worker.tab.info.as_ref().unwrap().revision;
         let hit = |caret, top, gesture| Action::Hit {
             caret,
             extend: matches!(gesture, PointerGesture::Drag(_)),
@@ -1463,7 +1442,7 @@ mod tests {
         worker.action(hit(0, 0, PointerGesture::Press(1))).unwrap();
         worker.action(hit(21, 3, PointerGesture::Drag(1))).unwrap();
         assert_eq!(
-            worker.screen.position,
+            worker.tab.screen.position,
             Position {
                 caret: 5,
                 anchor: 5
@@ -1471,7 +1450,7 @@ mod tests {
         );
         worker.action(hit(15, 3, PointerGesture::Press(2))).unwrap();
         worker.action(hit(21, 3, PointerGesture::Drag(2))).unwrap();
-        assert_eq!(worker.screen.position.selection(), 15..21);
+        assert_eq!(worker.tab.screen.position.selection(), 15..21);
     }
     /// Internal and external disk-spooled pastes exceed 1 MiB, commit atomically, and undo once.
     #[test]
@@ -1496,11 +1475,11 @@ mod tests {
             .unwrap();
         worker.action(Action::Command(Command::Paste)).unwrap();
         assert_eq!(worker.snapshot().unwrap().len(), length * 2);
-        let position = worker.screen.position;
+        let position = worker.tab.screen.position;
         let mut invalid = Spool::new().unwrap();
         invalid.append(b"valid\xffinvalid").unwrap();
         assert!(worker.action(Action::Paste(Arc::new(invalid))).is_err());
-        assert_eq!(worker.screen.position, position);
+        assert_eq!(worker.tab.screen.position, position);
         assert_eq!(worker.snapshot().unwrap().len(), length * 2);
     }
     /// Failed replacements retain the current document; save/undo tracks the acknowledged content.
@@ -1512,21 +1491,21 @@ mod tests {
         worker.action(Action::Insert("hello".into())).unwrap();
         worker.action(Action::Save(Some(path.clone()))).unwrap();
         saved(&mut worker);
-        assert!(!worker.screen.modified);
+        assert!(!worker.tab.screen.modified);
         assert_eq!(std::fs::read(&path).unwrap(), b"hello");
         worker.action(Action::Insert("!".into())).unwrap();
-        assert!(worker.screen.modified);
+        assert!(worker.tab.screen.modified);
         worker.action(Action::Command(Command::Undo)).unwrap();
-        assert!(!worker.screen.modified);
-        let old = worker.screen.document;
+        assert!(!worker.tab.screen.modified);
+        let old = worker.tab.screen.document;
         assert!(
             worker
-                .action(Action::Open(directory.path().join("missing")))
+                .open_and_switch(&directory.path().join("missing"))
                 .is_err()
         );
-        assert_eq!(worker.screen.document, old);
+        assert_eq!(worker.tab.screen.document, old);
         assert_eq!(contents(&mut worker), "hello");
-        assert!(!worker.screen.loading);
+        assert!(!worker.tab.screen.loading);
     }
     /// A pre-publication retry failure cannot acknowledge a prior uncertain destination.
     #[test]
@@ -1554,21 +1533,21 @@ mod tests {
         fault.0.store(true, Ordering::Release);
         worker.action(Action::Save(Some(path.clone()))).unwrap();
         saved(&mut worker);
-        assert!(worker.uncertain.is_some());
+        assert!(worker.tab.uncertain.is_some());
         worker.action(Action::Save(Some(path))).unwrap();
         saved(&mut worker);
-        assert!(worker.uncertain.is_some());
-        assert!(worker.screen.modified);
+        assert!(worker.tab.uncertain.is_some());
+        assert!(worker.tab.screen.modified);
         let (sender, events) = mpsc::sync_channel(16);
         worker.events = sender;
         worker.active_sequence = 77;
         worker.action(Action::Discard(After::Quit, None)).unwrap();
         assert!(matches!(
             events.try_recv(),
-            Ok(Event::Uncertain(77, After::Quit, job)) if Some(job) == worker.uncertain
+            Ok(Event::Uncertain(77, After::Quit, job)) if Some(job) == worker.tab.uncertain
         ));
         worker
-            .action(Action::Discard(After::Quit, worker.uncertain))
+            .action(Action::Discard(After::Quit, worker.tab.uncertain))
             .unwrap();
         assert!(matches!(
             events.try_recv(),
@@ -1668,30 +1647,31 @@ mod tests {
         });
         let (sender, events) = mpsc::sync_channel(16);
         worker.events = sender;
-        worker.replace_document(Some(path.clone())).unwrap();
+        worker.open_and_switch(&path).unwrap();
         worker.action(Action::Insert("edit-".into())).unwrap();
         let first = directory.path().join("first-destination");
         worker.action(Action::Save(Some(first))).unwrap();
         saved(&mut worker);
-        let first_job = worker.uncertain.unwrap();
+        let first_job = worker.tab.uncertain.unwrap();
         assert!(matches!(
             events.try_recv(),
-            Ok(Event::Saved(SaveResult::Uncertain, _))
+            Ok(Event::Saved(_, SaveResult::Uncertain, _))
         ));
 
         worker.action(Action::Save(None)).unwrap();
         gate.wait_until_blocked();
         assert_eq!(std::fs::read(&path).unwrap(), b"edit-first");
-        let retry = worker.saving.as_ref().unwrap();
+        let retry = &worker.saving.as_ref().unwrap().job;
         let retry_job = retry.id;
         let release = gate.release_after_cancellation(retry.cancellation());
         worker
             .action(Action::Discard(After::Quit, Some(first_job)))
             .unwrap();
         release.join().unwrap();
+        saved(&mut worker);
         assert!(matches!(
             events.try_recv(),
-            Ok(Event::Saved(SaveResult::Uncertain, _))
+            Ok(Event::Saved(_, SaveResult::Uncertain, _))
         ));
         assert!(
             matches!(events.try_recv(), Ok(Event::Uncertain(_, After::Quit, job)) if job == retry_job)
@@ -1725,16 +1705,18 @@ mod tests {
             });
             let (sender, events) = mpsc::sync_channel(16);
             worker.events = sender;
-            worker.replace_document(Some(path.clone())).unwrap();
+            worker.open_and_switch(&path).unwrap();
             worker.action(Action::Insert("edit-".into())).unwrap();
             worker.action(Action::Save(None)).unwrap();
             gate.wait_until_blocked();
 
             let mut app = AppState::new();
-            app.update(worker.screen.clone(), false);
+            app.update(worker.tab.screen.clone(), false);
             worker.active_sequence = 5;
             app.expect_guard(5);
-            worker.action(Action::Guard(After::Quit)).unwrap();
+            worker
+                .action(Action::Guard(After::Close(worker.tab.screen.tab.unwrap())))
+                .unwrap();
             app.event(events.try_recv().unwrap());
             let layout = LayoutSnapshot::for_app(Rect::new(0, 0, 80, 24), &app, 0);
             let _ = app.input(crate::input::Input::Command(Command::Tab), &layout);
@@ -1744,7 +1726,7 @@ mod tests {
             else {
                 panic!("expected Discard");
             };
-            assert!(matches!(discard, Action::Discard(After::Quit, None)));
+            assert!(matches!(discard, Action::Discard(After::Close(_), None)));
             worker.active_sequence = 6;
             app.expect_guard(6);
             if failure_already_polled {
@@ -1752,14 +1734,15 @@ mod tests {
                 saved(&mut worker);
                 worker.action(discard).unwrap();
             } else {
-                let release =
-                    gate.release_after_cancellation(worker.saving.as_ref().unwrap().cancellation());
+                let release = gate
+                    .release_after_cancellation(worker.saving.as_ref().unwrap().job.cancellation());
                 worker.action(discard).unwrap();
                 release.join().unwrap();
+                saved(&mut worker);
             }
 
             let failure = events.try_recv().unwrap();
-            assert!(matches!(failure, Event::Saved(SaveResult::Failed, _)));
+            assert!(matches!(failure, Event::Saved(_, SaveResult::Failed, _)));
             assert!(app.event(failure).is_none());
             for event in events.try_iter() {
                 assert!(
@@ -1806,7 +1789,7 @@ mod tests {
             Arc::new(ViewControl::default()),
         );
         worker.begin();
-        worker.replace_document(Some(path.clone())).unwrap();
+        worker.open_and_switch(&path).unwrap();
         worker.action(Action::Insert("edit-".into())).unwrap();
         worker.action(Action::Save(None)).unwrap();
         gate.wait_until_blocked();
@@ -1815,6 +1798,7 @@ mod tests {
             .saving
             .as_ref()
             .unwrap()
+            .job
             .cancellation()
             .is_cancelled();
         gate.release();
@@ -1843,8 +1827,10 @@ mod tests {
     #[test]
     fn guard_can_quit_without_a_ready_document() {
         let mut worker = coordinator(OpenOptions::default());
-        worker.service.close(worker.screen.document.take().unwrap());
-        worker.info = None;
+        worker
+            .service
+            .close(worker.tab.screen.document.take().unwrap());
+        worker.tab.info = None;
         let (sender, events) = mpsc::sync_channel(16);
         worker.events = sender;
         worker.active_sequence = 3;
@@ -1860,11 +1846,11 @@ mod tests {
         let mut worker = coordinator(OpenOptions::default());
         worker.action(Action::Insert("a\nb\nc".into())).unwrap();
         worker.action(Action::Scroll(100, 0)).unwrap();
-        assert_eq!(worker.top, 2);
+        assert_eq!(worker.tab.top, 2);
         worker.view_cancel.layout.fetch_add(1, Ordering::AcqRel);
         worker.action(Action::Scroll(3, 0)).unwrap();
         worker.action(Action::Scroll(-3, 0)).unwrap();
-        assert_eq!(worker.top, 0);
+        assert_eq!(worker.tab.top, 0);
         assert!(!scrolls_combine(3, 0, -3, 0));
         assert!(!scrolls_combine(0, 4, 0, -4));
         assert!(scrolls_combine(3, 0, 3, 0));
@@ -1875,17 +1861,17 @@ mod tests {
         worker.action(Action::Scroll(0, 4)).unwrap();
         worker.action(Action::Scroll(0, 4)).unwrap();
         worker.action(Action::Scroll(0, -4)).unwrap();
-        assert_eq!(worker.left, 1);
+        assert_eq!(worker.tab.left, 1);
         worker.action(Action::Command(Command::SelectAll)).unwrap();
         worker
             .action(Action::Insert("a\nb\nc\nd\ne".into()))
             .unwrap();
         worker.action(Action::Scroll(100, 0)).unwrap();
-        assert_eq!(worker.top, 4);
+        assert_eq!(worker.tab.top, 4);
         worker.action(Action::Command(Command::SelectAll)).unwrap();
         worker.action(Action::Insert("a\nb\nc".into())).unwrap();
         worker.action(Action::Scroll(-3, 0)).unwrap();
-        assert_eq!(worker.top, 0);
+        assert_eq!(worker.tab.top, 0);
     }
     /// A read failure after commit blocks later edits until caret/history reconciliation succeeds.
     #[test]
@@ -1910,20 +1896,20 @@ mod tests {
         worker
             .action(Action::Command(Command::Move(Movement::Start, false)))
             .unwrap();
-        let before = worker.screen.position;
+        let before = worker.tab.screen.position;
         // Inject at the acknowledged-commit boundary, independently of storage's
         // own pre-commit read checks. The following caret lookup must be retriable.
         let response = worker
             .call(Request::Replace {
                 document: worker.document().unwrap(),
-                expected: worker.info.as_ref().unwrap().revision,
+                expected: worker.tab.info.as_ref().unwrap().revision,
                 range: TextRange::new(0, 0).unwrap(),
                 text: "X".into(),
             })
             .unwrap();
         assert!(matches!(response, Response::Changed { .. }));
-        worker.screen.view = None;
-        worker.pending_edit = Some(CommittedEdit {
+        worker.tab.screen.view = None;
+        worker.tab.pending_edit = Some(CommittedEdit {
             before,
             endpoint: 1,
             history_pruned: 0,
@@ -1934,17 +1920,17 @@ mod tests {
                 .action(Action::Insert("must not commit".into()))
                 .is_err()
         );
-        assert!(worker.pending_edit.is_some());
-        assert_eq!(worker.undo_views.len(), 1);
+        assert!(worker.tab.pending_edit.is_some());
+        assert_eq!(worker.tab.undo_views.len(), 1);
         fault.0.store(false, Ordering::Release);
         worker.action(Action::Command(Command::Undo)).unwrap();
         assert_eq!(contents(&mut worker), "ab");
-        assert_eq!(worker.screen.position, before);
-        assert!(worker.pending_edit.is_none());
+        assert_eq!(worker.tab.screen.position, before);
+        assert!(worker.tab.pending_edit.is_none());
         worker.action(Action::Command(Command::Redo)).unwrap();
         assert_eq!(contents(&mut worker), "Xab");
-        assert_eq!(worker.screen.position.caret, 1);
-        assert_eq!(worker.undo_views.len(), 2);
+        assert_eq!(worker.tab.screen.position.caret, 1);
+        assert_eq!(worker.tab.undo_views.len(), 2);
     }
     /// Document-start movement does not scan a long offscreen prefix just to compute its old column.
     #[test]
@@ -1976,7 +1962,7 @@ mod tests {
         worker
             .action(Action::Command(Command::Move(Movement::Start, false)))
             .unwrap();
-        assert_eq!(worker.screen.position.caret, 0);
+        assert_eq!(worker.tab.screen.position.caret, 0);
         assert!(fault.count.load(Ordering::Acquire) <= 4);
     }
 
@@ -2100,7 +2086,7 @@ mod tests {
             }
             worker.action(action).unwrap();
             assert_eq!(contents(&mut worker), text, "step {step}");
-            assert_eq!(worker.screen.position, position, "step {step}");
+            assert_eq!(worker.tab.screen.position, position, "step {step}");
         }
     }
     /// Measure managed resources and UI incorporation separately from terminal transport.
@@ -2128,7 +2114,11 @@ mod tests {
             .unwrap_or_else(|_| "64".into())
             .parse()
             .unwrap();
+        let selected = std::env::var("EDE_BENCH_CORPUS").ok();
         for corpus in ["ordinary", "dense", "long", "unicode"] {
+            if selected.as_deref().is_some_and(|name| name != corpus) {
+                continue;
+            }
             let directory = tempfile::tempdir().unwrap();
             let path = directory.path().join("input");
             let working = directory.path().join("working");
@@ -2158,7 +2148,9 @@ mod tests {
                 working_directory: Some(working.clone()),
                 ..OpenOptions::default()
             });
-            worker.action(Action::Open(path)).unwrap();
+            worker.add_new().unwrap();
+            worker.open_and_switch(&path).unwrap();
+            worker.summarize();
             let (width, height) = if corpus == "unicode" {
                 (240, 82)
             } else {
@@ -2172,7 +2164,7 @@ mod tests {
             let mut incorporation = Vec::new();
             let mut routing = Vec::new();
             let mut frames = Vec::new();
-            app.update(worker.screen.clone(), false);
+            app.update(worker.tab.screen.clone(), false);
             for _ in 0..40 {
                 let input = crate::input::Input::Text("Z".into());
                 let now = Instant::now();
@@ -2182,7 +2174,7 @@ mod tests {
                 routing.push(now.elapsed().as_secs_f64() * 1000.0);
                 worker.begin();
                 worker.action(action).unwrap();
-                let screen = worker.screen.clone();
+                let screen = worker.tab.screen.clone();
                 let now = Instant::now();
                 app.update(screen, false);
                 app.sync_layout(&layout);
@@ -2199,7 +2191,7 @@ mod tests {
             else {
                 panic!("expected usage");
             };
-            assert_eq!(revision, worker.info.as_ref().unwrap().revision);
+            assert_eq!(revision, worker.tab.info.as_ref().unwrap().revision);
             assert!(usage.cache_bytes <= (96 << 20));
             assert!(usage.cache_high_water_bytes <= (96 << 20));
             assert!(usage.buffer_high_water_bytes <= (32 << 20));
@@ -2289,14 +2281,14 @@ mod ordering_tests {
             Arc::new(ViewControl::default()),
         );
         worker.begin();
-        worker.replace_document(None).unwrap();
+        worker.add_new().unwrap();
         worker.cancel = envelope.paste_cancel.clone().unwrap();
         assert!(matches!(
             worker.action(envelope.action.clone()),
             Err(Error::Cancelled)
         ));
         assert_eq!(worker.snapshot().unwrap().len(), 0);
-        assert!(worker.undo_views.is_empty());
+        assert!(worker.tab.undo_views.is_empty());
     }
     /// Cancel reaches Open before execution; a later admitted replacement remains usable.
     #[test]
@@ -2320,19 +2312,19 @@ mod ordering_tests {
             Arc::new(ViewControl::default()),
         );
         worker.begin();
-        worker.replace_document(None).unwrap();
-        let original = worker.screen.document;
+        worker.add_new().unwrap();
+        let original = worker.tab.screen.document;
         let open = inbox.recv().unwrap();
         worker.begin_envelope(&open);
         assert!(matches!(
             worker.action(open.action.clone()),
             Err(Error::Cancelled)
         ));
-        assert_eq!(worker.screen.document, original);
+        assert_eq!(worker.tab.screen.document, original);
         let new = inbox.recv().unwrap();
         worker.begin_envelope(&new);
         worker.action(new.action.clone()).unwrap();
-        assert_ne!(worker.screen.document, original);
+        assert_ne!(worker.tab.screen.document, original);
     }
     /// A later resize preserves ordered navigation, while a guard cancels a not-yet-started seek.
     #[test]
@@ -2350,19 +2342,19 @@ mod ordering_tests {
             editor.view_cancel.clone(),
         );
         worker.begin();
-        worker.replace_document(None).unwrap();
+        worker.add_new().unwrap();
         worker.action(Action::Insert("abc".into())).unwrap();
         assert!(editor.submit(Action::GoTo { line: 0, column: 1 }));
         let seek = inbox.recv().unwrap();
         assert!(editor.submit(Action::Size(40, 6, 2)));
         worker.begin_envelope(&seek);
         worker.action(seek.action.clone()).unwrap();
-        assert_eq!(worker.screen.position.caret, 1);
-        assert!(worker.screen.view.is_none());
+        assert_eq!(worker.tab.screen.position.caret, 1);
+        assert!(worker.tab.screen.view.is_none());
         let size = inbox.recv().unwrap();
         worker.begin_envelope(&size);
         worker.action(size.action.clone()).unwrap();
-        assert_eq!(worker.screen.view.as_ref().unwrap().generation, 2);
+        assert_eq!(worker.tab.screen.view.as_ref().unwrap().generation, 2);
         assert!(editor.submit(Action::GoTo { line: 0, column: 3 }));
         let seek = inbox.recv().unwrap();
         assert!(editor.submit(Action::Guard(After::Quit)));
@@ -2371,7 +2363,7 @@ mod ordering_tests {
             worker.action(seek.action.clone()),
             Err(Error::Cancelled)
         ));
-        assert_eq!(worker.screen.position.caret, 1);
+        assert_eq!(worker.tab.screen.position.caret, 1);
         // Explicit cancellation delivered before a read token is constructed also persists.
         worker.begin();
         editor.cancel();
@@ -2395,14 +2387,14 @@ mod ordering_tests {
             Arc::new(ViewControl::default()),
         );
         worker.begin();
-        worker.replace_document(None).unwrap();
+        worker.add_new().unwrap();
         worker
             .action(Action::Insert("ab\t界xx\nx\nab\t界xx".into()))
             .unwrap();
-        let old = worker.info.as_ref().unwrap().revision;
+        let old = worker.tab.info.as_ref().unwrap().revision;
         let document = worker.document().unwrap();
         worker.action(Action::Insert("!".into())).unwrap();
-        let position = worker.screen.position;
+        let position = worker.tab.screen.position;
         worker
             .action(Action::Hit {
                 caret: 0,
@@ -2410,12 +2402,12 @@ mod ordering_tests {
                 generation: 0,
                 document,
                 revision: old,
-                top: worker.top,
-                left: worker.left,
+                top: worker.tab.top,
+                left: worker.tab.left,
                 gesture: PointerGesture::Press(1),
             })
             .unwrap();
-        assert_eq!(worker.screen.position, position);
+        assert_eq!(worker.tab.screen.position, position);
         worker
             .action(Action::Command(Command::Move(Movement::Start, false)))
             .unwrap();
@@ -2427,18 +2419,18 @@ mod ordering_tests {
         worker
             .action(Action::Command(Command::Move(Movement::Down, false)))
             .unwrap();
-        assert_eq!(worker.screen.view.as_ref().unwrap().column, 1);
+        assert_eq!(worker.tab.screen.view.as_ref().unwrap().column, 1);
         worker
             .action(Action::Command(Command::Move(Movement::Down, false)))
             .unwrap();
-        assert_eq!(worker.screen.view.as_ref().unwrap().column, 6);
+        assert_eq!(worker.tab.screen.view.as_ref().unwrap().column, 6);
         worker
             .action(Action::Command(Command::Move(Movement::Home, false)))
             .unwrap();
         worker
             .action(Action::Command(Command::Move(Movement::Up, false)))
             .unwrap();
-        assert_eq!(worker.screen.view.as_ref().unwrap().column, 0);
+        assert_eq!(worker.tab.screen.view.as_ref().unwrap().column, 0);
     }
     /// A failed cut must retain both document text and the previous clipboard, including selection.
     #[test]
@@ -2471,7 +2463,7 @@ mod ordering_tests {
             Arc::new(ViewControl::default()),
         );
         worker.begin();
-        worker.replace_document(None).unwrap();
+        worker.add_new().unwrap();
         worker
             .action(Action::Insert("old clipboard".into()))
             .unwrap();
@@ -2481,10 +2473,10 @@ mod ordering_tests {
             .action(Action::Insert("new selection".into()))
             .unwrap();
         worker.action(Action::Command(Command::SelectAll)).unwrap();
-        let position = worker.screen.position;
+        let position = worker.tab.screen.position;
         fault.0.store(true, Ordering::Release);
         assert!(worker.action(Action::Command(Command::Cut)).is_err());
-        assert_eq!(worker.screen.position, position);
+        assert_eq!(worker.tab.screen.position, position);
         assert_eq!(
             worker
                 .snapshot()

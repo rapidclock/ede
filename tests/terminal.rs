@@ -138,6 +138,22 @@ impl PtyChild {
             thread::sleep(Duration::from_millis(5));
         }
     }
+    /// Wait until an overlay is actually dismissed before sending a dependent key.
+    fn expect_absent(&mut self, text: &str) {
+        let deadline = Instant::now() + TIMEOUT;
+        loop {
+            self.drain();
+            let screen = self.parser.screen().contents();
+            if !screen.contains(text) {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "still showing {text:?}: {screen}"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
 
     /// Observe document rows rather than a matching filename, help label or status message.
     fn expect_body(&mut self, text: &str, timeout: Duration) {
@@ -448,10 +464,18 @@ impl PtyChild {
     }
     /// Supply an optional OS-native path through positional shell arguments, without interpolation.
     fn editor_with_path(term: Option<&str>, path: Option<&std::path::Path>) -> Self {
+        Self::editor_with_args(term, path)
+    }
+
+    /// Supply the original native arguments to the executable under job control.
+    fn editor_with_args(
+        term: Option<&str>,
+        args: impl IntoIterator<Item = impl AsRef<std::ffi::OsStr>>,
+    ) -> Self {
         // The interactive parent supplies job control and stays alive after ede exits,
         // allowing exact post-exit termios capture before Darwin revokes the slave PTY.
         let mut command = Command::new("/bin/sh");
-        let script = "# The nested shell expands its own PID and positional parameters.\n# shellcheck disable=SC2016\nif [ \"$1\" = unset ]; then unset TERM; else TERM=$2; export TERM; fi; /bin/sh -c 'printf \"EDE_PID:%s\\n\" \"$$\"; program=$1; shift; exec \"$program\" \"$@\"' ede-child \"$3\" ${4+\"$4\"}; result=$?; printf '\\nEDE_EXIT:%s\\n' \"$result\"; read -r _completion; exit \"$result\"";
+        let script = "# The nested shell expands its own PID and positional parameters.\n# shellcheck disable=SC2016\nif [ \"$1\" = unset ]; then unset TERM; else TERM=$2; export TERM; fi; shift 2; /bin/sh -c 'printf \"EDE_PID:%s\\n\" \"$$\"; program=$1; shift; exec \"$program\" \"$@\"' ede-child \"$@\"; result=$?; printf '\\nEDE_EXIT:%s\\n' \"$result\"; read -r _completion; exit \"$result\"";
         let script = if std::env::var_os("EDE_BENCH_PEAK_RSS").is_some() {
             script.replacen(
                 "; /bin/sh -c",
@@ -474,13 +498,206 @@ impl PtyChild {
             term.unwrap_or(""),
             env!("CARGO_BIN_EXE_ede"),
         ]);
-        if let Some(path) = path {
-            command.arg(path);
-        }
+        command.args(args);
         let mut child = Self::spawn(command);
         child.keep_alive = true;
         child
     }
+}
+
+/// Startup order, keyboard tab switching, and tab-local edit history reach the executable.
+#[test]
+fn startup_tabs_keep_independent_contents_and_history() {
+    let directory = tempfile::tempdir().unwrap();
+    let a = directory.path().join("alpha.txt");
+    let b = directory.path().join("beta.txt");
+    std::fs::write(&a, "alpha body").unwrap();
+    std::fs::write(&b, "beta body").unwrap();
+    let mut process = PtyChild::editor_with_args(Some("xterm-256color"), [&a, &b, &a]);
+    process.expect_body("alpha body", TIMEOUT);
+    process.expect_status("Ready");
+    process.send("界\x1b[19~".as_bytes()); // Next tab (F8).
+    process.expect_body("beta body", TIMEOUT);
+    process.send(b"B\x1b[18~"); // Previous tab (F7).
+    process.expect_body("界alpha body", TIMEOUT);
+    process.send(b"\x1a\x1b[19~");
+    process.expect_body("Bbeta body", TIMEOUT);
+    process.send(b"\x13");
+    process.expect_status("Saved");
+    assert_eq!(std::fs::read_to_string(&a).unwrap(), "alpha body");
+    assert_eq!(std::fs::read_to_string(&b).unwrap(), "Bbeta body");
+    process.send(b"\x17");
+    process.expect_body("alpha body", TIMEOUT);
+    process.send(b"\x17");
+    process.expect("No open tabs");
+    process.send(b"\x11");
+    assert!(process.wait().success());
+    process.assert_restored();
+}
+
+/// Cancelling quit on a later tab must retain every earlier unsaved buffer.
+#[test]
+fn cancel_quit_preserves_tabs_after_earlier_discard_choice() {
+    let mut process = PtyChild::editor();
+    process.expect_status("Ready");
+    process.send(b"first-unsaved\x0e");
+    process.expect("Untitled 2");
+    process.send(b"second-unsaved\x11");
+    process.expect("Unsaved changes");
+    process.expect("Quit — Untitled 1");
+    process.send(b"\t\t\r");
+    process.expect("Quit — Untitled 2");
+    process.send(b"\r"); // Default Cancel.
+    process.expect_body("second-unsaved", TIMEOUT);
+    process.send(b"\x1b[18~");
+    process.expect_body("first-unsaved", TIMEOUT);
+    process.send(b"\x11");
+    process.expect("Quit — Untitled 1");
+    process.send(b"\t\t\r");
+    process.expect("Quit — Untitled 2");
+    process.send(b"\t\t\r");
+    assert!(process.wait().success());
+    process.assert_restored();
+}
+
+/// The picker navigates native entries and accepts a pasted relative path literally.
+#[test]
+fn picker_browses_directories_and_opens_literal_pasted_path() {
+    let directory = tempfile::tempdir().unwrap();
+    let original = directory.path().join("original.txt");
+    let child = directory.path().join("child");
+    std::fs::create_dir(&child).unwrap();
+    std::fs::write(&original, "original body").unwrap();
+    std::fs::write(child.join(".file with spaces"), "picked body").unwrap();
+    let mut process = PtyChild::editor_with_path(Some("xterm-256color"), Some(&original));
+    process.expect_status("Ready");
+    process.send(b"\x0f");
+    process.expect("Open file");
+    process.expect("child/");
+    process.send(b"\r");
+    process.expect(".file with spaces");
+    process.send(b"\t\x1b[200~.file with spaces\x1b[201~\r");
+    process.expect_body("picked body", TIMEOUT);
+    process.send(b"\x1b[18~");
+    process.expect_body("original body", TIMEOUT);
+    process.send(b"\x11");
+    assert!(process.wait().success());
+    process.assert_restored();
+}
+
+/// Earlier accepted input is applied before a close prompt, even at a fresh tab.
+#[test]
+fn close_unnamed_save_as_cancel_collision_and_success() {
+    let directory = tempfile::tempdir().unwrap();
+    let other = directory.path().join("existing.txt");
+    let saved = directory.path().join("saved.txt");
+    std::fs::write(&other, "untouched").unwrap();
+    let mut process = PtyChild::editor_with_path(Some("xterm-256color"), Some(&other));
+    process.expect_status("Ready");
+    process.send(b"\x0e");
+    process.expect("Untitled 1");
+    process.send(b"local edits\x17");
+    process.expect("Close — Untitled 1");
+    process.send(b"\t\r");
+    process.expect("Save As (new path)");
+    process.send(b"\x1b");
+    process.expect_body("local edits", TIMEOUT);
+    process.expect_absent("Save As (new path)");
+    process.send(b"\x17");
+    process.expect("Close — Untitled 1");
+    process.send(b"\t\r");
+    process.expect("Save As (new path)");
+    process.send(other.as_os_str().as_encoded_bytes());
+    process.send(b"\r");
+    process.expect("destination is busy");
+    process.send(b"\x1b");
+    process.expect_body("local edits", TIMEOUT);
+    process.expect_absent("Save As (new path)");
+    process.expect_absent("Details");
+    process.send(b"\x17");
+    process.expect("Close — Untitled 1");
+    process.send(b"\t\r");
+    process.expect("Save As (new path)");
+    process.send(saved.as_os_str().as_encoded_bytes());
+    process.send(b"\r");
+    process.expect_body("untouched", TIMEOUT);
+    assert_eq!(std::fs::read_to_string(&saved).unwrap(), "local edits");
+    assert_eq!(std::fs::read_to_string(&other).unwrap(), "untouched");
+    process.send(b"\x11");
+    assert!(process.wait().success());
+    process.assert_restored();
+}
+
+/// Report every startup error, retain successful neighbors, and fall back if all fail.
+#[test]
+fn startup_reports_each_failure_and_falls_back() {
+    let directory = tempfile::tempdir().unwrap();
+    let a = directory.path().join("missing-A");
+    let b = directory.path().join("missing-B");
+    let good = directory.path().join("-dash");
+    std::fs::write(&good, "dash body").unwrap();
+    let mut process = PtyChild::editor_with_args(
+        Some("xterm-256color"),
+        [
+            std::ffi::OsStr::new("--"),
+            a.as_os_str(),
+            good.as_os_str(),
+            b.as_os_str(),
+        ],
+    );
+    process.expect("Open missing-A:");
+    process.send(b"\r");
+    process.expect("Open missing-B:");
+    process.expect("Details");
+    process.send(b"\r");
+    process.expect_absent("Details");
+    process.expect_body("dash body", TIMEOUT);
+    process.send(b"\x11");
+    assert!(process.wait().success());
+    process.assert_restored();
+
+    let mut process = PtyChild::editor_with_args(Some("xterm-256color"), [&a, &b]);
+    process.expect("Open missing-A:");
+    process.send(b"\r");
+    process.expect("Open missing-B:");
+    process.expect("Details");
+    process.send(b"\r");
+    process.expect_absent("Details");
+    process.expect_status("Ready");
+    process.expect("Untitled 1");
+    process.send(b"\x11");
+    assert!(process.wait().success());
+    process.assert_restored();
+}
+
+/// The overflow list closes an inactive tab by mouse and rejects a stale strip release.
+#[test]
+fn mouse_tabs_overflow_and_stale_release() {
+    let directory = tempfile::tempdir().unwrap();
+    let names: Vec<_> = (0..7)
+        .map(|n| directory.path().join(format!("tab-{n}")))
+        .collect();
+    for (n, path) in names.iter().enumerate() {
+        std::fs::write(path, format!("body-{n}")).unwrap();
+    }
+    let mut process = PtyChild::editor_with_args(Some("xterm-256color"), &names);
+    process.expect_body("body-0", TIMEOUT);
+    process.expect_status("Ready");
+    process.send(b"\x1b[<0;14;1M\x1b[19~"); // Press the next tab, then switch via F8.
+    process.expect_body("body-1", TIMEOUT);
+    process.send(b"\x1b[<0;14;1m\x1b[<0;52;1M\x1b[<0;52;1m");
+    process.expect("Tabs — Enter to switch");
+    process.expect("tab-6");
+    process.send(b"\x1b[<0;7;10M\x1b[<0;7;10m"); // Highlight tab 6.
+    process.send(b"\x1b[<0;7;21M\x1b[<0;7;21m"); // Close the highlighted inactive tab.
+    process.expect_body("body-1", TIMEOUT);
+    process.resize(40, 8);
+    process.expect("Tabs");
+    process.send(b"\x1b[18~\x1b[18~");
+    process.expect_body("body-5", TIMEOUT);
+    process.send(b"\x11");
+    assert!(process.wait().success());
+    process.assert_restored();
 }
 
 /// A real interactive shell owns job control: suspend returns cooked mode and fg resumes safely.
@@ -608,7 +825,7 @@ fn dirty_quit_at_tiny_size_requires_visible_confirmation() {
     process.expect("Resize");
     process.send(b"\x11");
     thread::sleep(Duration::from_millis(30));
-    process.send(b"\t\t\r");
+    process.send(b"\t\t\r\x1b");
     thread::sleep(Duration::from_millis(30));
     assert!(process.child.try_wait().unwrap().is_none());
     process.resize(80, 24);
@@ -681,8 +898,10 @@ fn large_file_interactive_benchmark() {
         "fixture={corpus} bytes={length} logical_lines={lines} generated warm on {}",
         directory.path().display()
     );
+    let other = directory.path().join("companion.txt");
+    std::fs::write(&other, "Companion tab").unwrap();
     let started = Instant::now();
-    let mut process = PtyChild::editor_with_path(Some("xterm-256color"), Some(&path));
+    let mut process = PtyChild::editor_with_args(Some("xterm-256color"), [&path, &other]);
     let first = if corpus == "ordinary" {
         "0123456789abcdef"
     } else {
@@ -692,6 +911,10 @@ fn large_file_interactive_benchmark() {
     let first_text = started.elapsed();
     process.expect_with_timeout("Ready", Duration::from_secs(120));
     let ready = started.elapsed();
+    process.send(b"\x1b[19~");
+    process.expect_body("Companion tab", TIMEOUT);
+    process.send(b"\x1b[18~");
+    process.expect_body(first, TIMEOUT);
     let pid = process.editor_pid();
     let rss = || {
         let output = Command::new("ps")

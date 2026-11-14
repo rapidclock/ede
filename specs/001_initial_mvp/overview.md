@@ -1,6 +1,6 @@
 # 001 — Initial MVP overview
 
-Status: **MVP scope and roadmap accepted — Stages 01–02 merged; Stage 03 local implementation reviewed, environment validation pending.**
+Status: **MVP scope and roadmap accepted — Stages 01–03 merged; Stage 04 implemented and locally validated.**
 
 Project: **ede**, a predominantly Rust terminal text editor for macOS and Linux.
 
@@ -419,9 +419,7 @@ authorized Stage 03 implementation after the Cmd and large-paste clarifications.
 
 The user accepted proceeding one stage at a time: detailed design, review,
 separately authorized implementation, validation, and stage PR before moving on.
-Stage 02 is merged as of 2026-11-03; Stage 03 local implementation is reviewed, environment validation remains pending, and later filenames
-identify future documents. Each detailed design must resolve its prerequisite
-decisions and define behavior,
+Each detailed design must resolve its prerequisite decisions and define behavior,
 interfaces, failure cases, and acceptance criteria before its implementation is
 authorized. The stages may be adjusted as we learn.
 
@@ -475,8 +473,8 @@ editing remains Stage 03.
 ### 03 — Interactive editing and mouse selection
 
 Design: [03_editing_and_mouse.md](03_editing_and_mouse.md). Depends on: 01–02.
-Status: local implementation reviewed on 2026-11-03, with an independent follow-up
-and regression fixes on 2026-11-04; unavailable environment validation remains pending.
+Status: merged through [PR #3](https://github.com/rapidclock/ede/pull/3).
+Unavailable environment validation remains pending.
 Branch: `stage/editing_and_mouse`; PR target: `feat/initial_mvp`.
 Evidence: [Stage 03 validation record](03_editing_and_mouse.md#validation-record) (local evidence recorded; remaining checks pending).
 
@@ -493,7 +491,10 @@ Evidence: [Stage 03 validation record](03_editing_and_mouse.md#validation-record
 
 ### 04 — Tabs and file selection
 
-Planned file: `04_tabs_and_file_picker.md`. Depends on: 03.
+Design: [04_tabs_and_file_picker.md](04_tabs_and_file_picker.md). Depends on: 03.
+Status: implemented, independently reviewed and locally validated.
+Branch: `stage/tabs_and_file_picker`; PR target: `feat/initial_mvp`.
+Evidence: [Stage 04 validation record](04_tabs_and_file_picker.md#validation-record).
 
 - Deliver multiple document tabs and a keyboard/mouse file picker with directory
   navigation solely for selecting files, plus direct path entry.
