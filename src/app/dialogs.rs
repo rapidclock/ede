@@ -212,7 +212,9 @@ impl AppState {
             }
             Command::Activate | Command::Newline => {
                 let action = match self.focus {
-                    Some(Control::TabList) => Action::Switch((*highlight)?),
+                    Some(Control::TabList | Control::TabListSwitch) => {
+                        Action::Switch((*highlight)?)
+                    }
                     Some(Control::TabListClose) => Action::Guard(After::Close((*highlight)?)),
                     Some(Control::PathCancel) => return self.command(Command::Cancel, layout),
                     _ => return None,

@@ -688,6 +688,14 @@ fn mouse_tabs_overflow_and_stale_release() {
     process.send(b"\x1b[<0;14;1m\x1b[<0;52;1M\x1b[<0;52;1m");
     process.expect("Tabs — Enter to switch");
     process.expect("tab-6");
+    process.send(b"\x1b[<0;7;9M\x1b[<0;7;9m"); // Highlight tab 5.
+    process.expect("[Switch]");
+    process.send(b"\x1b[<0;27;21M\x1b[<0;27;21m");
+    process.expect_body("body-5", TIMEOUT);
+    process.send(b"\x1b[18~\x1b[18~\x1b[18~\x1b[18~");
+    process.expect_body("body-1", TIMEOUT);
+    process.send(b"\x1b[<0;52;1M\x1b[<0;52;1m");
+    process.expect("Tabs — Enter to switch");
     process.send(b"\x1b[<0;7;10M\x1b[<0;7;10m"); // Highlight tab 6.
     process.send(b"\x1b[<0;7;21M\x1b[<0;7;21m"); // Close the highlighted inactive tab.
     process.expect_body("body-1", TIMEOUT);

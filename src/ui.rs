@@ -27,6 +27,7 @@ pub(crate) enum Control {
     TabList,
     TabListRow(TabId),
     TabListClose,
+    TabListSwitch,
     PickerList,
     PickerRow(usize),
     PickerUp,
@@ -80,6 +81,7 @@ impl Control {
             Self::Tabs => "Tabs",
             Self::TabClose => "×",
             Self::TabListClose => "Close",
+            Self::TabListSwitch => "Switch",
             Self::PickerUp => "Up",
             Self::PickerOpen => "Open",
             Self::PickerPrevious => "Prev",
@@ -262,6 +264,7 @@ impl LayoutSnapshot {
                 }
                 result.add(Control::TabListClose, Rect::new(overlay.x + 1, y, 8, 1));
                 result.add(Control::PathCancel, Rect::new(overlay.x + 10, y, 9, 1));
+                result.add(Control::TabListSwitch, Rect::new(overlay.x + 20, y, 9, 1));
             }
             Some(Modal::Open(dialog)) => {
                 let rows = overlay.height.saturating_sub(5);

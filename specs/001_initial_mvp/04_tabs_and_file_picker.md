@@ -72,7 +72,7 @@ and recovery. Directory browsing serves individual file selection. The
 | Action | Keyboard default | Mouse route |
 | --- | --- | --- |
 | New / Open | Ctrl+N / Ctrl+O, plus delivered Cmd+N / Cmd+O | Actions |
-| Previous / Next tab | F7 / F8, wrapping at the ends | Click a tab or choose from Tabs |
+| Previous / Next tab | F7 / F8, wrapping at the ends | Click a tab, or highlight it in Tabs and click Switch |
 | Close active tab | Ctrl+W, plus delivered Cmd+W | Active tab's close control or Actions |
 | Close highlighted tab in Tabs | Focus Close and press Enter | Click Close in Tabs |
 | Show Tabs | F2 then Tabs | Tabs control or Actions |
