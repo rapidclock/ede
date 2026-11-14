@@ -2,13 +2,15 @@
 use crate::{
     command::{Command, Movement},
     document::{Cancellation, JobId},
-    editor::{Action, After, Event, PointerGesture, SaveResult, Screen},
+    editor::{Action, After, Event, PointerGesture, SaveResult, Screen, TabId},
     input::Input,
+    picker::{self, Browse},
     status::{Severity, StatusMessage},
     ui::{Control, LayoutSnapshot},
 };
 use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{collections::VecDeque, path::PathBuf, sync::Arc, time::Duration};
+mod dialogs;
 
 /// Effects performed by the runtime, never by drawing or hit-testing.
 #[derive(Clone, Debug)]
@@ -18,11 +20,12 @@ pub(crate) enum Intent {
     MouseCapture(bool),
     Editor(Action),
     CancelWork,
+    Picker(picker::Request),
+    CancelPicker,
 }
 /// Direct-path dialog intent; paths remain separate from safe display labels.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PathKind {
-    Open,
     Save,
     GoTo,
 }
@@ -31,6 +34,8 @@ pub(crate) enum PathKind {
 pub(crate) enum Modal {
     Menu(usize),
     Path(PathKind, String),
+    Open(Box<picker::Dialog>),
+    Tabs(Option<TabId>),
     Confirm(After, Option<JobId>),
     Details(String),
     SaveError(String),
@@ -56,6 +61,12 @@ struct FieldPaste {
     bytes: usize,
     submit: bool,
 }
+/// The receiving surface owns the complete bracketed paste, even if focus changes.
+enum PasteTarget {
+    Field(u64),
+    Tab(Option<TabId>),
+    Ignore,
+}
 /// Shell state contains only bounded prepared data; document bytes remain with storage.
 pub(crate) struct AppState {
     pub help: bool,
@@ -70,8 +81,20 @@ pub(crate) struct AppState {
     opener: Option<Control>,
     capture: Option<Capture>,
     pointer_press: u64,
-    paste: Option<Cancellation>,
-    pending_after: Option<After>,
+    paste: Option<(Cancellation, PasteTarget)>,
+    launch_directory: PathBuf,
+    picker_generation: u64,
+    open_errors: VecDeque<String>,
+    pub save_error_tab: Option<TabId>,
+    path_tab: Option<TabId>,
+    guard_focus: Option<Control>,
+    guard_return: Option<Modal>,
+    quit_remaining: Option<VecDeque<TabId>>,
+    guard_busy: bool,
+    pub switching: Option<u64>,
+    guarded_path: Option<After>,
+    discarding: bool,
+    guard_after: Option<After>,
     save_dialog: Option<u64>,
     guard_request: Option<u64>,
     last_drag: Duration,
@@ -97,6 +120,9 @@ pub(crate) const MENU: &[(Command, &str)] = &[
     (Command::Help, "Help                F1"),
     (Command::Suspend, "Suspend"),
     (Command::Quit, "Quit                Ctrl+Q / Cmd+Q"),
+    (Command::Tabs, "Tabs                F7 / F8 switch"),
+    (Command::CloseTab, "Close tab           Ctrl+W / Cmd+W"),
+    (Command::TabDetails, "Tab details"),
 ];
 impl AppState {
     /// Begin with text focus and a visible asynchronous preparation state.
@@ -115,7 +141,19 @@ impl AppState {
             capture: None,
             pointer_press: 0,
             paste: None,
-            pending_after: None,
+            launch_directory: PathBuf::new(),
+            picker_generation: 0,
+            open_errors: VecDeque::new(),
+            save_error_tab: None,
+            path_tab: None,
+            guard_focus: None,
+            guard_return: None,
+            quit_remaining: None,
+            guard_busy: false,
+            switching: None,
+            guarded_path: None,
+            discarding: false,
+            guard_after: None,
             save_dialog: None,
             guard_request: None,
             last_drag: Duration::ZERO,
@@ -124,6 +162,26 @@ impl AppState {
             field_submit: None,
             field_error: None,
         }
+    }
+    /// Keep relative picker paths independent of the process's later environment.
+    pub fn set_launch_directory(&mut self, path: PathBuf) {
+        self.launch_directory = path;
+    }
+    /// True only while a save result owns the dialog and document input.
+    pub fn guard_waiting(&self) -> bool {
+        self.guard_request.is_some() && self.modal.is_none()
+    }
+
+    fn editor_focused(&self) -> bool {
+        !self.help && self.modal.is_none() && self.focus == Some(Control::Content)
+    }
+
+    fn ready(&self) -> bool {
+        !self.screen.loading && self.switching.is_none() && self.screen.document.is_some()
+    }
+
+    fn field_open(&self) -> bool {
+        matches!(self.modal, Some(Modal::Path(..) | Modal::Open(_)))
     }
     /// Preserve valid focus and invalidate capture after geometry or overlay changes.
     pub fn sync_layout(&mut self, layout: &LayoutSnapshot) {
@@ -159,7 +217,14 @@ impl AppState {
     }
     /// Install the latest prepared viewport; an Arc shares drawing and pointer geometry.
     pub fn update(&mut self, screen: Screen, pending: bool) {
-        if self.screen.document != screen.document
+        if self
+            .switching
+            .is_some_and(|sequence| screen.acknowledged >= sequence)
+        {
+            self.switching = None;
+        }
+        if self.screen.tab != screen.tab
+            || self.screen.document != screen.document
             || (!pending
                 && self.capture.is_some_and(|capture| {
                     capture.control == Control::Content
@@ -184,15 +249,17 @@ impl AppState {
     }
     /// Consume asynchronous guard/save events without allowing a stale save to close work.
     pub fn event(&mut self, event: Event) -> Option<Intent> {
-        if matches!(&event, Event::Guard(sequence,..)|Event::Proceed(sequence,..)|Event::Uncertain(sequence,..) if self.guard_request!=Some(*sequence))
+        if matches!(&event, Event::Guard(sequence,..)|Event::QuitTabs(sequence,..)|Event::Proceed(sequence,..)|Event::Uncertain(sequence,..) if self.guard_request!=Some(*sequence))
         {
             return None;
         }
         match event {
             Event::Failure(message) => {
+                self.abort_guard();
+                self.guard_return = None;
                 self.field_paste = None;
                 self.field_submit = None;
-                self.pending_after = None;
+                self.guarded_path = None;
                 self.guard_request = None;
                 self.save_dialog = None;
                 self.help = false;
@@ -201,7 +268,20 @@ impl AppState {
                 self.capture = None;
                 self.dirty = true;
             }
+            Event::OpenFailed(message) => {
+                if self.open_errors.len() < crate::TAB_LIMIT {
+                    self.open_errors.push_back(message);
+                }
+                self.show_open_error();
+            }
+            Event::QuitTabs(_, tabs) => {
+                self.quit_remaining = Some(tabs.into());
+                return self.next_quit_tab();
+            }
             Event::Guard(_, after, true) => {
+                self.guard_busy = false;
+                self.discarding = false;
+                self.guard_after = Some(after);
                 self.help = false;
                 self.modal = Some(Modal::Confirm(after, None));
                 self.focus = Some(Control::ConfirmCancel);
@@ -210,27 +290,45 @@ impl AppState {
             }
             Event::Guard(_, after, false) | Event::Proceed(_, after) => return self.proceed(after),
             Event::Uncertain(_, after, job) => {
+                self.guard_busy = false;
+                self.discarding = false;
+                self.guard_after = Some(after);
                 self.capture = None;
                 self.modal = Some(Modal::Confirm(after, Some(job)));
                 self.focus = Some(Control::ConfirmCancel);
                 self.dirty = true;
             }
-            Event::NeedSaveAs(sequence) => {
+            Event::NeedSaveAs(sequence, tab) => {
                 if self.save_dialog == Some(sequence) {
                     self.path(PathKind::Save);
+                    self.path_tab = Some(tab);
                 }
             }
-            Event::Saved(result, message) => {
-                if result == SaveResult::Saved {
-                    if let Some(after) = self.pending_after.take() {
-                        return Some(Intent::Editor(Action::Guard(after)));
-                    }
-                } else if result != SaveResult::Cancelled {
-                    if result == SaveResult::Failed {
-                        // A failure can arrive just before the worker takes a queued
-                        // Discard. Revoke that pending reply before it can hide the error.
-                        self.guard_request = None;
-                    }
+            Event::NeedGuardSaveAs(sequence, after, tab) => {
+                if self.guard_request == Some(sequence) {
+                    self.path(PathKind::Save);
+                    self.path_tab = Some(tab);
+                    self.guarded_path = Some(after);
+                }
+            }
+            Event::GuardSaveStopped(sequence) => {
+                if self.guard_request == Some(sequence) {
+                    self.restore_guard_surface();
+                    self.dirty = true;
+                }
+            }
+            Event::Saved(tab, result, message) => {
+                let guarded = self
+                    .guard_after
+                    .is_some_and(|after| after.target().or(self.screen.tab) == Some(tab));
+                self.message(&message);
+                if matches!(result, SaveResult::Failed | SaveResult::Uncertain)
+                    && !(self.discarding && guarded && result == SaveResult::Uncertain)
+                    && (guarded || (self.guard_request.is_none() && self.modal.is_none()))
+                {
+                    self.abort_guard();
+                    self.guard_return = None;
+                    self.save_error_tab = Some(tab);
                     self.capture = None;
                     self.help = false;
                     self.modal = Some(Modal::SaveError(message));
@@ -245,7 +343,7 @@ impl AppState {
                     self.field_paste = Some(pending);
                     return None;
                 }
-                if !matches!(self.modal, Some(Modal::Path(..))) {
+                if !self.field_open() {
                     return None;
                 }
                 let mut accepted = match result {
@@ -279,23 +377,53 @@ impl AppState {
     }
     /// Only the latest admitted close/replacement decision may act on the UI.
     pub fn expect_guard(&mut self, sequence: u64) {
+        if self.guard_focus.is_none() {
+            self.guard_focus = self.focus;
+        }
         self.guard_request = Some(sequence);
+    }
+    /// Remember which tab's asynchronous outcome can resolve a guard.
+    pub fn expect_guard_for(&mut self, sequence: u64, after: After) {
+        self.expect_guard(sequence);
+        self.guard_after = Some(after);
     }
     /// Begin a guarded next action once the document owner has acknowledged safety.
     fn proceed(&mut self, after: After) -> Option<Intent> {
-        self.guard_request = None;
         self.modal = None;
         self.help = false;
-        self.focus = Some(Control::Content);
         self.dirty = true;
         match after {
             After::Quit => Some(Intent::Quit),
-            After::New => Some(Intent::Editor(Action::New)),
-            After::Open => {
-                self.path(PathKind::Open);
-                None
+            After::QuitTab(_) => self.next_quit_tab(),
+            After::Close(tab) => {
+                self.abort_guard();
+                self.guard_return = None;
+                Some(Intent::Editor(Action::RemoveTab(tab)))
             }
         }
+    }
+    fn next_quit_tab(&mut self) -> Option<Intent> {
+        let next = self.quit_remaining.as_mut()?.pop_front();
+        self.modal = None;
+        self.dirty = true;
+        Some(next.map_or(Intent::Quit, |tab| {
+            Intent::Editor(Action::Guard(After::QuitTab(tab)))
+        }))
+    }
+    fn abort_guard(&mut self) {
+        self.guard_request = None;
+        self.guarded_path = None;
+        self.save_dialog = None;
+        self.quit_remaining = None;
+        self.guard_busy = false;
+        self.discarding = false;
+        self.guard_after = None;
+        self.focus = self.guard_focus.take().or(self.focus);
+    }
+
+    fn restore_guard_surface(&mut self) {
+        self.abort_guard();
+        self.modal = self.guard_return.take();
     }
     /// Open a path field with no shell interpretation.
     fn path(&mut self, kind: PathKind) {
@@ -303,27 +431,55 @@ impl AppState {
         self.field_paste = None;
         self.field_submit = None;
         self.field_error = None;
-        self.guard_request = None;
         self.save_dialog = None;
+        self.path_tab = self.screen.tab;
         self.help = false;
         self.modal = Some(Modal::Path(kind, String::new()));
         self.focus = Some(Control::PathField);
         self.capture = None;
         self.dirty = true;
     }
+
+    fn show_open_error(&mut self) {
+        if self.modal.is_none()
+            && self.guard_request.is_none()
+            && !self.help
+            && let Some(error) = self.open_errors.pop_front()
+        {
+            self.modal = Some(Modal::Details(error));
+            self.focus = Some(Control::DetailsClose);
+            self.help_scroll = 0;
+            self.capture = None;
+            self.dirty = true;
+        }
+    }
+
+    /// Look up the guarded tab's label even when it is inactive.
+    pub fn tab_label(&self, tab: Option<TabId>) -> &str {
+        self.screen
+            .tabs
+            .iter()
+            .find(|t| Some(t.id) == tab)
+            .map_or("Untitled", |t| &t.label)
+    }
+
+    /// Provide enough native path context to distinguish matching basenames.
+    pub fn tab_path_hint(&self, tab: Option<TabId>) -> Option<&str> {
+        self.screen
+            .tabs
+            .iter()
+            .find(|summary| Some(summary.id) == tab)?
+            .path_hint
+            .as_deref()
+    }
     /// Route one input to the owning modal, control, or text surface.
     pub fn input(&mut self, input: Input, layout: &LayoutSnapshot) -> Option<Intent> {
         match input {
             Input::Command(command) => self.command(command, layout),
             Input::Text(text) => {
-                if matches!(self.modal, Some(Modal::Path(..))) {
+                if self.field_open() && self.focus == Some(Control::PathField) {
                     self.edit_field(FieldEdit::Text(text));
-                } else if self.modal.is_none()
-                    && !self.help
-                    && self.focus == Some(Control::Content)
-                    && !self.screen.loading
-                    && self.guard_request.is_none()
-                {
+                } else if self.editor_focused() && self.ready() && self.guard_request.is_none() {
                     return Some(Intent::Editor(Action::Insert(text)));
                 }
                 None
@@ -331,45 +487,42 @@ impl AppState {
             Input::Pointer(mouse) => self.pointer(mouse, layout),
             Input::Paste(paste) => {
                 self.dirty = true;
-                if self
-                    .paste
-                    .take()
-                    .is_some_and(|cancel| cancel.is_cancelled())
-                {
-                    self.message("Paste cancelled");
-                    return None;
-                }
-                if matches!(self.modal, Some(Modal::Path(..)))
-                    && self.focus == Some(Control::PathField)
-                {
-                    if self.field_paste.is_some() {
-                        self.field_message("Busy: field paste rejected; retry when ready");
+                let target = match self.paste.take() {
+                    Some((cancel, _)) if cancel.is_cancelled() => {
+                        self.message("Paste cancelled");
                         return None;
                     }
-                    self.field_paste = Some(FieldPaste {
-                        generation: self.field_generation,
-                        edits: Vec::new(),
-                        bytes: 0,
-                        submit: false,
-                    });
-                    Some(Intent::Editor(Action::FieldPaste(
-                        paste,
-                        self.field_generation,
-                    )))
-                } else if self.modal.is_none()
-                    && !self.help
-                    && self.focus == Some(Control::Content)
-                    && !self.screen.loading
-                    && self.guard_request.is_none()
-                {
-                    Some(Intent::Editor(Action::Paste(paste)))
-                } else {
-                    self.message("Paste requires editor text focus");
-                    None
+                    Some((_, target)) => target,
+                    None => self.paste_target(),
+                };
+                match target {
+                    PasteTarget::Field(generation)
+                        if generation == self.field_generation && self.field_open() =>
+                    {
+                        if self.field_paste.is_some() {
+                            self.field_message("Busy: field paste rejected; retry when ready");
+                            return None;
+                        }
+                        self.field_paste = Some(FieldPaste {
+                            generation,
+                            edits: Vec::new(),
+                            bytes: 0,
+                            submit: false,
+                        });
+                        Some(Intent::Editor(Action::FieldPaste(paste, generation)))
+                    }
+                    PasteTarget::Tab(Some(tab)) => Some(Intent::Editor(Action::ForTab(
+                        tab,
+                        Box::new(Action::Paste(paste)),
+                    ))),
+                    _ => {
+                        self.message("Paste requires editor or path field focus");
+                        None
+                    }
                 }
             }
             Input::PasteStarted(cancel) => {
-                self.paste = Some(cancel);
+                self.paste = Some((cancel, self.paste_target()));
                 self.dirty = true;
                 None
             }
@@ -403,27 +556,57 @@ impl AppState {
     /// Handle named commands once for keyboard/menu/buttons, preserving modal ownership.
     fn command(&mut self, mut command: Command, layout: &LayoutSnapshot) -> Option<Intent> {
         if command == Command::Cancel {
-            self.field_paste = None;
-            self.field_submit = None;
-            self.pending_after = None;
-            self.save_dialog = None;
-            self.guard_request = None;
+            if self.guard_request.is_some() && (layout.area.width < 40 || layout.area.height < 8) {
+                return None;
+            }
             if self.cancel_receiving_paste() {
                 return None;
             }
-            if self.modal.take().is_some() || self.help {
+            self.field_paste = None;
+            self.field_submit = None;
+            self.save_dialog = None;
+            let guarded = self.guard_request.is_some();
+            let picker = matches!(self.modal, Some(Modal::Open(_)));
+            if self.modal.take().is_some() || self.help || guarded {
                 self.help = false;
                 self.focus = self.opener.take().or(Some(Control::Content));
-                self.pending_after = None;
+                if guarded {
+                    self.restore_guard_surface();
+                } else {
+                    self.abort_guard();
+                }
                 self.capture = None;
                 self.dirty = true;
-                return None;
+                self.show_open_error();
+                return if picker {
+                    Some(Intent::CancelPicker)
+                } else if guarded {
+                    Some(Intent::Editor(Action::CancelGuard))
+                } else {
+                    None
+                };
             }
-            if self.screen.loading || self.pending {
+            if self.switching.is_some() || (self.screen.loading && self.screen.tab.is_none()) {
+                return Some(Intent::Editor(Action::CancelActiveOpen(self.switching)));
+            }
+            if self.screen.loading
+                && let Some(tab) = self.screen.tab
+            {
+                return Some(Intent::Editor(Action::CancelOpen(tab)));
+            }
+            if self.pending {
                 return Some(Intent::CancelWork);
             }
             self.capture = None;
-            return Some(Intent::Editor(Action::ClearSelection));
+            return self
+                .ready()
+                .then_some(Intent::Editor(Action::ClearSelection));
+        }
+        if matches!(self.modal, Some(Modal::Open(_))) {
+            return self.picker_command(command, layout);
+        }
+        if matches!(self.modal, Some(Modal::Tabs(_))) {
+            return self.tabs_command(command, layout);
         }
         if self.help && matches!(command, Command::Move(..)) {
             self.help_scroll =
@@ -449,9 +632,10 @@ impl AppState {
                         self.field_submit = None;
                         self.modal = None;
                         self.focus = Some(Control::Content);
-                        self.pending_after = None;
+                        let guarded = self.guard_request.is_some();
+                        self.restore_guard_surface();
                         self.dirty = true;
-                        return None;
+                        return guarded.then_some(Intent::Editor(Action::CancelGuard));
                     }
                     if let Some(pending) = &mut self.field_paste {
                         pending.submit = true;
@@ -488,11 +672,14 @@ impl AppState {
                     self.modal = None;
                     self.focus = Some(Control::Content);
                     self.dirty = true;
-                    return Some(Intent::Editor(if kind == PathKind::Open {
-                        Action::Open(path)
+                    let action = if let Some(after) = self.guarded_path.take() {
+                        Action::SaveGuard(after, Some(path))
+                    } else if let Some(tab) = self.path_tab.take() {
+                        Action::ForTab(tab, Box::new(Action::Save(Some(path))))
                     } else {
                         Action::Save(Some(path))
-                    }));
+                    };
+                    return Some(Intent::Editor(action));
                 }
                 Command::Tab | Command::FocusNext | Command::FocusPrevious => {
                     self.focus = layout.next(self.focus, command == Command::FocusPrevious);
@@ -526,22 +713,28 @@ impl AppState {
             {
                 match self.focus {
                     Some(Control::ConfirmSave) => {
-                        self.pending_after = Some(after);
+                        if self.guard_busy {
+                            return None;
+                        }
+                        self.guard_busy = true;
                         self.dirty = true;
-                        return Some(Intent::Editor(Action::Save(None)));
+                        return Some(Intent::Editor(Action::SaveGuard(after, None)));
                     }
                     Some(Control::ConfirmDiscard) => {
-                        self.pending_after = None;
+                        if self.guard_busy {
+                            return None;
+                        }
+                        self.guard_busy = true;
+                        self.discarding = true;
                         self.dirty = true;
                         return Some(Intent::Editor(Action::Discard(after, uncertain)));
                     }
                     _ => {
                         self.modal = None;
-                        self.pending_after = None;
-                        self.guard_request = None;
-                        self.save_dialog = None;
                         self.focus = Some(Control::Content);
+                        self.restore_guard_surface();
                         self.dirty = true;
+                        return Some(Intent::Editor(Action::CancelGuard));
                     }
                 }
             }
@@ -563,11 +756,12 @@ impl AppState {
                     && self.focus == Some(Control::SaveErrorAs))
             {
                 self.path(PathKind::Save);
+                self.path_tab = self.save_error_tab.take();
                 return None;
             }
             if matches!(command, Command::Activate | Command::Newline) {
                 self.modal = None;
-                self.pending_after = None;
+                self.guarded_path = None;
                 self.guard_request = None;
                 self.save_dialog = None;
                 self.focus = Some(Control::Content);
@@ -595,7 +789,9 @@ impl AppState {
             }
             if matches!(command, Command::Activate | Command::Newline) {
                 self.modal = None;
+                self.focus = self.opener.take().or(Some(Control::Content));
                 self.dirty = true;
+                self.show_open_error();
             }
             return None;
         }
@@ -627,39 +823,96 @@ impl AppState {
                 }
                 _ => {}
             }
-            self.modal = None;
+            let from_menu = self.modal.take();
+            if matches!(command, Command::CloseTab | Command::Quit) && self.switching.is_none() {
+                self.guard_return = from_menu;
+                self.guard_focus = self.focus;
+            }
             self.focus = Some(Control::Content);
             self.dirty = true;
         }
-        if self.guard_request.is_some()
-            && self.modal.is_none()
-            && matches!(command, Command::Save | Command::SaveAs | Command::GoTo)
-        {
+        if self.guard_request.is_some() {
             return None;
         }
         match command {
             Command::Quit => {
-                self.pending_after = None;
+                if self.switching.is_some() {
+                    return None;
+                }
+                self.guarded_path = None;
                 self.guard_request = None;
                 self.save_dialog = None;
                 Some(Intent::Editor(Action::Guard(After::Quit)))
             }
-            Command::New | Command::Open => {
-                Some(Intent::Editor(Action::Guard(if command == Command::New {
-                    After::New
-                } else {
-                    After::Open
-                })))
+            Command::New => self.tab_change(Action::New),
+            Command::Open => {
+                if self.switching.is_some() {
+                    return None;
+                }
+                let directory = self
+                    .screen
+                    .path
+                    .as_deref()
+                    .and_then(std::path::Path::parent)
+                    .map_or_else(|| self.launch_directory.clone(), std::path::Path::to_owned);
+                self.field_generation = self.field_generation.wrapping_add(1);
+                self.field_error = None;
+                self.field_paste = None;
+                self.field_submit = None;
+                self.opener = self.focus;
+                self.help = false;
+                self.modal = Some(Modal::Open(Box::new(picker::Dialog::new(
+                    directory.clone(),
+                ))));
+                self.focus = Some(Control::PickerList);
+                self.request_picker(directory, Some(Browse::First))
             }
-            Command::Save => Some(Intent::Editor(Action::Save(None))),
-            Command::GoTo => {
+            Command::Tabs => {
+                self.opener = self.focus;
+                self.help = false;
+                self.modal = Some(Modal::Tabs(
+                    self.screen.tab.or(self.screen.tabs.first().map(|t| t.id)),
+                ));
+                self.focus = Some(Control::TabList);
+                self.capture = None;
+                self.dirty = true;
+                None
+            }
+            Command::PreviousTab | Command::NextTab => {
+                self.tab_change(Action::CycleTab(command == Command::PreviousTab))
+            }
+            Command::CloseTab => {
+                if self.switching.is_some() {
+                    return None;
+                }
+                Some(Intent::Editor(Action::Guard(After::Close(
+                    self.screen.tab?,
+                ))))
+            }
+            Command::TabDetails => {
+                let label = self.screen.path.as_ref().map_or_else(
+                    || self.tab_label(self.screen.tab).to_owned(),
+                    |path| crate::text::safe(&path.to_string_lossy()),
+                );
+                self.modal = Some(Modal::Details(label));
+                self.focus = Some(Control::DetailsClose);
+                self.help_scroll = 0;
+                self.capture = None;
+                self.dirty = true;
+                None
+            }
+            Command::Save if self.ready() && self.screen.tab.is_some() => {
+                Some(Intent::Editor(Action::Save(None)))
+            }
+            Command::GoTo if self.ready() => {
                 self.path(PathKind::GoTo);
                 None
             }
-            Command::SaveAs => {
+            Command::SaveAs if self.ready() && self.screen.tab.is_some() => {
                 self.path(PathKind::Save);
                 None
             }
+            Command::Save | Command::GoTo | Command::SaveAs => None,
             Command::Suspend => Some(Intent::Suspend),
             Command::MouseCapture => {
                 self.mouse_capture = !self.mouse_capture;
@@ -673,7 +926,7 @@ impl AppState {
             }
             Command::Menu => {
                 self.guard_request = None;
-                self.pending_after = None;
+                self.guarded_path = None;
                 self.save_dialog = None;
                 self.help = false;
                 self.opener = self.focus;
@@ -684,7 +937,7 @@ impl AppState {
             }
             Command::Help if !self.help => {
                 self.guard_request = None;
-                self.pending_after = None;
+                self.guarded_path = None;
                 self.save_dialog = None;
                 self.opener = self.focus;
                 self.help = true;
@@ -707,14 +960,17 @@ impl AppState {
             Command::Activate | Command::Newline
                 if self.help || self.focus != Some(Control::Content) =>
             {
-                self.focus
-                    .and_then(Control::command)
-                    .and_then(|command| self.command(command, layout))
+                match self.focus {
+                    Some(Control::Tab(tab)) => self.tab_change(Action::Switch(tab)),
+                    focus => focus
+                        .and_then(Control::command)
+                        .and_then(|command| self.command(command, layout)),
+                }
             }
             Command::Help | Command::Cancel => None,
             _ if self.help
                 || self.focus != Some(Control::Content)
-                || self.screen.loading
+                || !self.ready()
                 || self.guard_request.is_some() =>
             {
                 None
@@ -733,6 +989,9 @@ impl AppState {
         ) && (self.help || self.modal.is_some())
         {
             let up = mouse.kind == MouseEventKind::ScrollUp;
+            if self.dialog_wheel(up, layout) {
+                return None;
+            }
             if let Some(Modal::Menu(index)) = &mut self.modal {
                 *index = if up {
                     index.saturating_sub(1)
@@ -752,7 +1011,7 @@ impl AppState {
             return None;
         }
         let hit = layout.hit(mouse.column, mouse.row);
-        if hit == Some(Control::Content) && (self.screen.loading || self.guard_request.is_some()) {
+        if hit == Some(Control::Content) && (!self.ready() || self.guard_request.is_some()) {
             return None;
         }
         match mouse.kind {
@@ -814,13 +1073,20 @@ impl AppState {
                                 PointerGesture::Drag(capture.press),
                             );
                         }
-                    } else if hit == Some(capture.control)
-                        && let Some(command) = capture.control.command()
-                    {
+                    } else if hit == Some(capture.control) {
+                        if self.dialog_click(capture.control) {
+                            return None;
+                        }
                         // Keyboard focus may have changed while the button was held.
                         // Activate the clicked control, not another focused button.
                         self.focus = Some(capture.control);
-                        return self.command(command, layout);
+                        if let Control::Tab(tab) = capture.control {
+                            if self.guard_request.is_none() {
+                                return self.tab_change(Action::Switch(tab));
+                            }
+                        } else if let Some(command) = capture.control.command() {
+                            return self.command(command, layout);
+                        }
                     }
                 }
             }
@@ -851,7 +1117,7 @@ impl AppState {
         layout: &LayoutSnapshot,
         gesture: PointerGesture,
     ) -> Option<Intent> {
-        if self.screen.loading {
+        if !self.ready() {
             return None;
         }
         let view = self.screen.view.as_ref()?;
@@ -885,8 +1151,9 @@ impl AppState {
     }
     /// Timer-driven drag autoscroll does not depend on another motion event.
     pub fn tick(&mut self, now: Duration, layout: &LayoutSnapshot) -> Option<Intent> {
+        self.show_open_error();
         if self.field_submit == Some(self.field_generation)
-            && matches!(self.modal, Some(Modal::Path(..)))
+            && self.field_open()
             && layout.area.width >= 40
             && layout.area.height >= 8
         {
@@ -941,7 +1208,7 @@ impl AppState {
     }
     /// Cancel a live paste without interpreting bytes inside its terminal frame.
     pub fn cancel_receiving_paste(&mut self) -> bool {
-        if let Some(paste) = &self.paste {
+        if let Some((paste, _)) = &self.paste {
             paste.cancel();
             self.dirty = true;
             true
@@ -951,7 +1218,7 @@ impl AppState {
     }
     /// Live ingress feedback takes precedence over unrelated worker status updates.
     pub fn receiving_paste_status(&self) -> Option<String> {
-        self.paste.as_ref().map(|paste| {
+        self.paste.as_ref().map(|(paste, _)| {
             if paste.is_cancelled() {
                 "Cancelling paste".into()
             } else {
@@ -987,8 +1254,10 @@ impl AppState {
     }
     /// Apply field data without interpreting any pasted control bytes as commands.
     fn apply_field_edit(&mut self, edit: FieldEdit) -> bool {
-        let Some(Modal::Path(_, field)) = &mut self.modal else {
-            return false;
+        let field = match &mut self.modal {
+            Some(Modal::Path(_, field)) => field,
+            Some(Modal::Open(picker)) => &mut picker.field,
+            _ => return false,
         };
         match edit {
             FieldEdit::Text(text) => {
@@ -1039,7 +1308,7 @@ mod tests {
         assert!(
             matches!(app.tick(Duration::ZERO, &layout), Some(Intent::Editor(Action::Save(Some(path)))) if path == std::path::Path::new("destination.txt"))
         );
-        app.path(PathKind::Open);
+        app.path(PathKind::GoTo);
         app.input(Input::Paste(paste), &layout);
         let generation = app.field_generation;
         app.input(Input::Command(Command::Cancel), &layout);
@@ -1058,10 +1327,10 @@ mod tests {
         let layout = LayoutSnapshot::for_app(Rect::new(0, 0, 40, 8), &app, 1);
         assert!(app.input(Input::Text("ignored".into()), &layout).is_none());
         assert!(app.input(Input::Command(Command::Quit), &layout).is_none());
-        assert!(
-            app.input(Input::Command(Command::Newline), &layout)
-                .is_none()
-        );
+        assert!(matches!(
+            app.input(Input::Command(Command::Newline), &layout),
+            Some(Intent::Editor(Action::CancelGuard))
+        ));
         assert!(app.modal.is_none());
         app.path(PathKind::Save);
         let layout = LayoutSnapshot::for_app(Rect::new(0, 0, 40, 8), &app, 2);
@@ -1096,7 +1365,7 @@ mod tests {
         assert_eq!(app.focus, Some(Control::ConfirmDiscard));
         assert!(matches!(
             app.input(mouse(MouseEventKind::Up(MouseButton::Left)), &layout),
-            Some(Intent::Editor(Action::Save(None)))
+            Some(Intent::Editor(Action::SaveGuard(After::Quit, None)))
         ));
         app.input(mouse(MouseEventKind::Down(MouseButton::Left)), &layout);
         app.expect_guard(2);
@@ -1141,16 +1410,16 @@ mod tests {
         app.focus = Some(Control::ConfirmSave);
         assert!(matches!(
             app.input(Input::Command(Command::Newline), &layout),
-            Some(Intent::Editor(Action::Save(None)))
+            Some(Intent::Editor(Action::SaveGuard(After::Quit, None)))
         ));
         app.expect_save_dialog(11);
         app.input(Input::Command(Command::Cancel), &layout);
         assert!(app.modal.is_none());
-        app.event(Event::NeedSaveAs(11));
+        app.event(Event::NeedSaveAs(11, TabId(1)));
         assert!(app.modal.is_none());
         assert!(app.event(Event::Guard(10, After::Quit, false)).is_none());
         assert!(
-            app.event(Event::Saved(SaveResult::Saved, "Saved".into()))
+            app.event(Event::Saved(TabId(1), SaveResult::Saved, "Saved".into()))
                 .is_none()
         );
         app.expect_guard(20);

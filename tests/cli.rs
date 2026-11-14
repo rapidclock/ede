@@ -32,11 +32,7 @@ fn informational_flags_and_argument_errors() {
         assert!(output.stderr.is_empty());
         assert_plain(&output.stdout);
     }
-    for args in [
-        vec!["one", "two"],
-        vec!["--unknown"],
-        vec!["--help", "extra"],
-    ] {
+    for args in [vec!["--unknown"], vec!["--help", "extra"], vec!["file"; 65]] {
         let output = command().args(args).output().unwrap();
         assert_eq!(output.status.code(), Some(2));
         assert!(output.stdout.is_empty());
@@ -77,13 +73,15 @@ fn redirected_stdout_fails_before_terminal_mutation() {
     assert_eq!(nix::sys::termios::tcgetattr(&pty.slave).unwrap(), original);
 }
 
-/// One OS-native path and -- are accepted before terminal validation, including non-UTF-8 arguments.
+/// Native paths and -- are accepted before terminal validation.
 #[test]
 fn file_paths_are_accepted_without_consuming_redirected_input() {
     use std::{ffi::OsString, os::unix::ffi::OsStringExt};
     for args in [
         vec![OsString::from("file.txt")],
+        vec!["file.txt".into(), "another.txt".into()],
         vec!["--".into(), "--help".into()],
+        vec!["--".into(), "-first".into(), "-second".into()],
         vec![OsString::from_vec(b"source-\xff".to_vec())],
         vec!["--".into()],
     ] {

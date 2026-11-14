@@ -132,7 +132,8 @@ pub(crate) fn run(
     session: &mut TerminalSession<UnixTerminal>,
     signals: &Signals,
     inbox: StatusInbox,
-    path: Option<PathBuf>,
+    launch_directory: PathBuf,
+    paths: Vec<PathBuf>,
 ) -> io::Result<Exit> {
     let (width, height) = crossterm::terminal::size()?;
     // The event loop owns resize/layout changes. A fixed viewport prevents Ratatui
@@ -143,7 +144,8 @@ pub(crate) fn run(
             viewport: Viewport::Fixed(Rect::new(0, 0, width, height)),
         },
     )?;
-    let mut editor = Editor::new(path)?;
+    let mut editor = Editor::new(launch_directory.clone(), paths)?;
+    let picker = crate::picker::Picker::new()?;
     let mut host = TerminalHost {
         terminal,
         session,
@@ -151,13 +153,19 @@ pub(crate) fn run(
         started: Instant::now(),
         ingress: Ingress::new()?,
     };
-    let result = event_loop_impl(&mut host, inbox, Some(&mut editor));
+    let mut app = AppState::new();
+    app.set_launch_directory(launch_directory);
+    let result = event_loop_impl(&mut host, inbox, Some(&mut editor), Some(&picker), app);
     host.ingress.stop();
     let worker = editor.shutdown();
+    let picker_worker = picker.shutdown();
     let restoration = host.session.restore();
     host.ingress.join();
     drop(host);
     if let Some(worker) = worker {
+        let _ = worker.join();
+    }
+    if let Some(worker) = picker_worker {
         let _ = worker.join();
     }
     restoration?;
@@ -169,8 +177,9 @@ fn event_loop_impl(
     host: &mut impl Host,
     inbox: StatusInbox,
     mut editor: Option<&mut Editor>,
+    picker: Option<&crate::picker::Picker>,
+    mut app: AppState,
 ) -> io::Result<Exit> {
-    let mut app = AppState::new();
     let mut area = host.area()?;
     let mut layout = LayoutSnapshot::new(area, app.help, 0);
     let mut rendered_generation = None;
@@ -200,7 +209,7 @@ fn event_loop_impl(
                 if drag_scroll && !pending {
                     drag_scroll = false;
                     if let Some(intent) = app.drag_hit(&layout)
-                        && effect(intent, host, &mut app, Some(bridge))?
+                        && effect(intent, host, &mut app, Some(bridge), picker)?
                     {
                         return Ok(Exit { code: 0 });
                     }
@@ -211,11 +220,17 @@ fn event_loop_impl(
                     break;
                 };
                 if let Some(intent) = app.event(event)
-                    && effect(intent, host, &mut app, Some(bridge))?
+                    && effect(intent, host, &mut app, Some(bridge), picker)?
                 {
                     return Ok(Exit { code: 0 });
                 }
             }
+        }
+        if let Some(reply) = picker.and_then(crate::picker::Picker::poll)
+            && let Some(intent) = app.picker_reply(reply)
+            && effect(intent, host, &mut app, editor.as_deref_mut(), picker)?
+        {
+            return Ok(Exit { code: 0 });
         }
         if let Some(signal) = host.termination() {
             return Ok(Exit { code: 128 + signal });
@@ -241,7 +256,7 @@ fn event_loop_impl(
         reconcile_layout(area, &mut app, &mut layout);
         if let Some(intent) = app.tick(host.now(), &layout) {
             drag_scroll = true;
-            if effect(intent, host, &mut app, editor.as_deref_mut())? {
+            if effect(intent, host, &mut app, editor.as_deref_mut(), picker)? {
                 return Ok(Exit { code: 0 });
             }
         }
@@ -312,7 +327,7 @@ fn event_loop_impl(
         }
         if let Some(intent) = app.input(input, &layout) {
             let suspended = matches!(intent, Intent::Suspend);
-            if effect(intent, host, &mut app, editor.as_deref_mut())? {
+            if effect(intent, host, &mut app, editor.as_deref_mut(), picker)? {
                 return Ok(Exit { code: 0 });
             }
             if suspended {
@@ -337,11 +352,22 @@ fn effect(
     host: &mut impl Host,
     app: &mut AppState,
     editor: Option<&mut Editor>,
+    picker: Option<&crate::picker::Picker>,
 ) -> io::Result<bool> {
     match intent {
         Intent::Quit => return Ok(true),
         Intent::Suspend => suspend(host, app)?,
         Intent::MouseCapture(enabled) => host.mouse(enabled)?,
+        Intent::Picker(request) => {
+            if let Some(picker) = picker {
+                picker.request(request);
+            }
+        }
+        Intent::CancelPicker => {
+            if let Some(picker) = picker {
+                picker.cancel();
+            }
+        }
         Intent::CancelWork => {
             if let Some(editor) = editor {
                 editor.cancel();
@@ -349,18 +375,44 @@ fn effect(
         }
         Intent::Editor(action) => {
             if let Some(editor) = editor {
-                if matches!(action, Action::Guard(_)) && app.screen.loading {
-                    editor.cancel();
-                }
-                let save_dialog = matches!(action, Action::Save(None));
-                let guard = matches!(action, Action::Guard(_) | Action::Discard(..));
-                let replacing = matches!(action, Action::New | Action::Open(_));
+                let action = match (app.screen.tab, action) {
+                    (
+                        Some(tab),
+                        action @ (Action::Command(_)
+                        | Action::Insert(_)
+                        | Action::Paste(_)
+                        | Action::Save(_)
+                        | Action::Scroll(..)
+                        | Action::Hit { .. }
+                        | Action::ClearSelection
+                        | Action::GoTo { .. }),
+                    ) => Action::ForTab(tab, Box::new(action)),
+                    (_, action) => action,
+                };
+                let save_dialog = matches!(action, Action::Save(None))
+                    || matches!(&action, Action::ForTab(_, inner) if matches!(**inner, Action::Save(None)));
+                let guard = match action {
+                    Action::Guard(after)
+                    | Action::Discard(after, _)
+                    | Action::SaveGuard(after, _) => Some(after),
+                    _ => None,
+                };
+                let switching = matches!(
+                    action,
+                    Action::New
+                        | Action::Open(_)
+                        | Action::Switch(_)
+                        | Action::CycleTab(_)
+                        | Action::RemoveTab(_)
+                        | Action::CancelOpen(_)
+                        | Action::CancelActiveOpen(_)
+                );
                 if editor.submit(action) {
-                    if guard {
-                        app.expect_guard(editor.sequence());
+                    if let Some(after) = guard {
+                        app.expect_guard_for(editor.sequence(), after);
                     }
-                    if replacing {
-                        app.screen.loading = true;
+                    if switching {
+                        app.switching = Some(editor.sequence());
                     }
                     if save_dialog {
                         app.expect_save_dialog(editor.sequence());
@@ -385,7 +437,7 @@ fn effect(
 #[cfg(test)]
 /// Exercise the scheduler independently of real storage or worker timing.
 fn event_loop(host: &mut impl Host, inbox: StatusInbox) -> io::Result<Exit> {
-    event_loop_impl(host, inbox, None)
+    event_loop_impl(host, inbox, None, None, AppState::new())
 }
 
 /// Draw and update scheduler bookkeeping in one place, including forced pointer-layout frames.
@@ -441,6 +493,7 @@ mod tests {
         let area = Rect::new(0, 0, 80, 24);
         let mut app = AppState::new();
         app.screen.loading = false;
+        app.screen.document = Some(crate::document::DocumentId(1));
         app.modal = Some(Modal::Path(PathKind::Save, String::new()));
         app.focus = Some(Control::PathField);
         let mut layout = LayoutSnapshot::for_app(area, &app, 1);
