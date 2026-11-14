@@ -51,7 +51,9 @@ and recovery. Directory browsing serves individual file selection. The
   or the displayed directory for picker input. Compare the native bytes of
   the resulting absolute spelling. Distinct spellings, including symlink
   aliases, may have independent tabs. Stage 02 save checks apply to each
-  tab's own baseline. To reload a file explicitly, close it and open it again.
+  tab's own baseline. In Stage 04, close and reopen a tab to load external
+  changes. [Stage 05](overview.md#05--persistent-scratch-documents-recovery-and-automatic-file-refresh)
+  adds the automatic refresh required for MVP release.
 - Tab order is creation order. Closing an inactive tab preserves the active
   tab. Closing the last tab leaves an empty session with New, Open, and Quit
   available. Unnamed tabs get distinct session labels. Named tabs show a

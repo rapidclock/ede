@@ -86,8 +86,14 @@ test them; do not claim universal support for every protocol/version combination
   does not automatically imply binary content. No binary viewer or hex editor is
   required.
 - Report open/save failures clearly and preserve unsaved work on failure.
-- Detect relevant external changes and define an explicit reload/conflict policy;
-  do not silently overwrite another process's changes.
+- Detect changes saved by another process and automatically refresh clean named
+  editing tabs, including inactive tabs. Refresh requires no command, tab
+  switch, or terminal focus change. Preserve the caret and viewport where
+  possible and show brief feedback when the refresh completes.
+- Preserve unsaved edits if the file changes on disk or while a refresh is in
+  progress. Keep a visible on-disk change warning while the conflict remains
+  and retain the guarded save policy. Automatic refresh of clean tabs and
+  protection of modified tabs are required for MVP release.
 - Define safe saving behavior for permissions, symlinks, hard links, and file
   replacement before implementation of file persistence.
 
@@ -502,7 +508,7 @@ Evidence: [Stage 04 validation record](04_tabs_and_file_picker.md#validation-rec
   modified tabs are protected and file-access errors leave other tabs usable.
   Tab and dialog controls must work with both keyboard and mouse. Covers FR-05.
 
-### 05 — Persistent scratch documents and recovery
+### 05 — Persistent scratch documents, recovery, and automatic file refresh
 
 Planned file: `05_scratch_recovery.md`. Depends on: 02–04.
 
@@ -512,6 +518,13 @@ Planned file: `05_scratch_recovery.md`. Depends on: 02–04.
 - Complete when quitting/relaunching retains current contents and tab state, and
   forced termination restores the last complete checkpoint even when the next
   write was interrupted. Persistence failures must be visible. Covers FR-10.
+- Automatically refresh clean named editing tabs after external saves, without
+  interrupting editing or changing the active tab. Preserve local changes and
+  warn on conflicts. The stage design must specify the refresh timing and
+  behavior for undo history, temporarily missing or invalid files, and retries.
+- Verify that in-place writes and rename-based saves refresh clean tabs on
+  macOS and Linux without user input. Verify background tabs, save conflicts,
+  and edits made while a refresh is in flight. Covers FR-02.
 
 ### 06 — Search and replacement
 
@@ -571,6 +584,8 @@ Planned file: `10_mvp_validation.md`. Depends on: 01–09.
   baseline, long-line/stream workloads, and a larger-than-RAM file have been
   exercised; and measured latency/memory results are recorded. Resolve missed
   goals through fixes or explicit user-approved requirement changes.
+- Verify automatic refresh of ordinary editing tabs and preservation of local
+  edits during external saves before releasing the MVP.
 - Supply concise build/use/configuration guidance and supported-terminal details.
   Finish at package version `0.0.1`, with development prereleases used beforehand.
   Distribution and deployment remain outside scope.
