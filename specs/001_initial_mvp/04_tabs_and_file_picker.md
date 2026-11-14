@@ -272,6 +272,9 @@ cargo test --release --locked --lib
 editor::tests::interactive_resource_and_incorporation_measurements --
 --ignored --exact --nocapture`.
 
-Native Linux and constrained-memory CI are tracked on the stage PR. Graphical
-terminal key delivery, remote transport, and cold-cache latency remain outside
-the local validation.
+The [Stage 04 CI run](https://github.com/rapidclock/ede/actions/runs/43539099227)
+passed on Ubuntu and macOS for revision `5d79e09`. Ubuntu also passed the
+constrained-memory storage and interactive editing checks, including 1 GiB
+ordinary, dense, and long-line editing with a 256 MiB memory cap and swap
+disabled. Graphical terminal key delivery, remote transport, and cold-cache
+latency remain outside this validation.
