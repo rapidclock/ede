@@ -7,6 +7,7 @@ mod editor;
 mod ingress;
 mod input;
 mod picker;
+mod recovery;
 mod runtime;
 mod spool;
 pub mod status;
@@ -99,12 +100,13 @@ fn run_session(inbox: StatusInbox, paths: Vec<PathBuf>) -> Result<Exit, Failure>
     }
     terminal::validate()?;
     let launch_directory = std::env::current_dir()?;
+    let recovery = recovery::Store::open(recovery::Options::environment()?)?;
     // Keep signal subscriptions alive through explicit restoration and the Drop retry.
     let signals = Signals::register()?;
     let mut session = TerminalSession::new(UnixTerminal);
     guarded(&mut session, |session| {
         session.acquire()?;
-        runtime::run(session, &signals, inbox, launch_directory, paths)
+        runtime::run(session, &signals, inbox, launch_directory, paths, recovery)
     })
 }
 

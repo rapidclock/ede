@@ -20,7 +20,7 @@ impl Document {
     /// Reclaim unreachable text, nodes and history without materializing the document.
     /// External leases require retry; cancellation/failure preserves the old generation.
     pub fn compact(&mut self, cancel: &Cancellation) -> Result<(), Error> {
-        if self.leases.load(Ordering::Acquire) != 0 {
+        if self.blocking_leases.load(Ordering::Acquire) != 0 {
             return Err(Error::Busy);
         }
         let old_arc = self.store.clone();
@@ -37,6 +37,8 @@ impl Document {
             faults: old.source.faults.clone(),
         };
         let (mut fresh, _) = Store::empty(&options, old.source.resources.clone(), None)?;
+        fresh.source.uncached = old.source.uncached;
+        fresh.tree.uncached = old.tree.uncached;
         fresh.original_longest = old.original_longest;
         fresh.cloned = old.cloned;
         let page = old.source.limits.text_page_bytes as u64;

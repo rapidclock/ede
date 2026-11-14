@@ -7,10 +7,37 @@ use std::{
     io,
     os::{
         fd::AsRawFd,
-        unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
+        unix::fs::{FileExt, MetadataExt, OpenOptionsExt, PermissionsExt},
     },
     path::{Path, PathBuf},
 };
+
+/// Copy a captured immutable prefix without holding an owner or shared cache lock.
+pub(super) fn copy_prefix(
+    input: &File,
+    output: &File,
+    length: u64,
+    buffer: &mut [u8],
+    cancel: &super::Cancellation,
+    faults: Option<&dyn super::FaultInjector>,
+) -> Result<(), Error> {
+    let mut offset = 0;
+    while offset < length {
+        cancel.check()?;
+        let count = (length - offset).min(buffer.len() as u64) as usize;
+        if let Some(faults) = faults {
+            faults.check(super::IoPoint::Read)?;
+        }
+        input.read_exact_at(&mut buffer[..count], offset)?;
+        if let Some(faults) = faults {
+            faults.check(super::IoPoint::Write)?;
+        }
+        output.write_all_at(&buffer[..count], offset)?;
+        offset += count as u64;
+    }
+    output.set_len(length)?;
+    Ok(())
+}
 
 /// File identity and observed version; contents are additionally compared on save.
 #[derive(Clone, Debug, Eq, PartialEq)]

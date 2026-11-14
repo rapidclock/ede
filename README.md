@@ -1,9 +1,9 @@
 # ede
 
 A Rust terminal text editor for macOS and Linux, built in reviewed stages.
-Current version: **0.0.1-dev.2**. Stage 4 adds document tabs and file selection.
+Current version: **0.0.1-dev.5**. Stage 5 adds persistent scratches and automatic file refresh.
 See the [MVP overview](specs/001_initial_mvp/overview.md) and the
-[Stage 4 validation record](specs/001_initial_mvp/04_tabs_and_file_picker.md#validation-record).
+[Stage 5 validation record](specs/001_initial_mvp/05_scratch_recovery.md#validation-record).
 
 ## Build and run
 
@@ -21,7 +21,7 @@ cargo run --locked -- -- -filename.txt
 Run in a terminal with a usable `TERM`, at least 40 columns by 8 rows. Smaller
 windows preserve work and show a resize prompt; return to a supported size to
 answer unsaved-change prompts. `--help` and `--version` work without a terminal.
-Pipes, recovery, search, and highlighting belong to later stages.
+Pipes, search, and highlighting belong to later stages.
 
 Opening validates a private UTF-8 snapshot in the background. Its initial preview
 is read-only; Escape cancels preparation. Once ready, files remain editable
@@ -58,7 +58,7 @@ New and Open add tabs, and switching restores each tab's caret, selection,
 scrolling, and undo history. Use the Tabs button or Actions → Tabs to select or
 close a tab outside the strip. Actions → Tab details shows the active file's
 path. The strip marks active (`>`), modified (`*`), waiting (`…`), loading
-(`↓`), queued save (`⇡`), saving (`↑`), and save attention (`!`).
+(`↓`), queued save (`⇡`), saving (`↑`), scratch (`~`), and attention (`!`).
 
 Open starts in the active file's parent directory or the launch directory.
 Use arrows or the wheel to select an entry and Enter to open it. Up and the
@@ -87,9 +87,34 @@ paste before it commits once the terminal has sent the closing marker.
 Save As creates a new destination; it does not overwrite an existing path. Normal
 Save checks the previously acknowledged destination for external changes. Editing
 can continue during saving; a save of older content leaves newer edits unsaved.
-Close and Quit protect modified tabs, with Cancel selected initially. Quit checks
-tabs in creation order and keeps all unsaved buffers if you cancel a later prompt.
+Close protects every scratch, including empty ones, with Save / Discard / Cancel
+and Cancel selected initially. Quit automatically retains scratches and checks
+modified named tabs in creation order. Canceling a later prompt keeps the session.
 An uncertain save explicitly reports that the destination may have changed.
+
+Scratches checkpoint every five seconds and flush their final contents on normal
+Quit. Relaunch restores text, tab order, active scratch, caret, selection, and
+viewport with fresh undo history. Each running instance owns a separate scratch
+set; a new instance claims scratches from exited or crashed instances. Excess
+entries beyond 64 open tabs remain in Actions → Recovery, with Open, Retry,
+Discard, and paging. A crash restores the last complete checkpoint; unsaved
+named-file edits are outside this recovery scope.
+
+Recovery state lives in `$HOME/Library/Application Support/ede` on macOS, or
+`$XDG_STATE_HOME/ede` on Linux (falling back to `$HOME/.local/state/ede`). Set an
+absolute `EDE_STATE_DIR` to use another profile. Unusable state or a corrupt
+catalog stops startup with a diagnostic. Failed objects remain listed with their
+location and error so they can be repaired and retried. Persistence errors offer
+Retry, Save As, and Cancel; failed Close retries Close. Tab details keeps the
+checkpoint status and unresolved error visible.
+
+Clean named tabs refresh automatically after external saves, including inactive
+tabs and rename saves. Local edits and paste reception prevent replacement;
+guarded Save still checks for conflicts. Refresh preserves the latest view and
+adds one undo step within the 256 MiB history budget. If the previous text exceeds
+that budget, refresh resets history and reports it. Missing or invalid sources
+leave the last good text intact and retry with backoff. Actions → Retry refresh
+and Tab details provide an immediate retry.
 
 ## Cmd delivery
 
@@ -132,16 +157,19 @@ control of iTerm2, so its real key delivery remains unverified.
 | `picker` | Bounded native directory pages and cancellable background I/O |
 | `editor` / `text` | Ordered storage coordination, clipboard/history positions, chunked Unicode layout |
 | `document` | Paged text, immutable snapshots, edits, undo/redo, guarded saves |
+| `recovery` | Owner locks, immutable scratch objects, atomic catalog, bounded persistence worker |
 | `status` | Bounded notifications |
 
 `ede::document::Document` is a blocking storage API. Interactive clients use
 `StorageService`: bounded submit/poll/cancel operations, a document owner,
 separate workers for immutable reads and file preparation, and at most one
 independent save worker. Prepared files are installed and saves reconcile on
-the owner before acknowledgement. Snapshot leases pin their storage generation;
-release them before compaction. Terminal restoration precedes worker shutdown
-waits. SIGINT/SIGTERM/SIGHUP use best-effort cleanup and exit `128 + signal`;
-scratch recovery remains Stage 5.
+the owner before acknowledgement. Public snapshot leases block compaction;
+internal background readers pin older immutable generations and allow foreground
+compaction. Refresh builds a complete private generation and maps its view before
+a short guarded owner swap. Terminal restoration precedes worker shutdown waits.
+SIGINT/SIGTERM/SIGHUP use best-effort cleanup and exit `128 + signal`; abnormal
+termination retains the last complete scratch checkpoint.
 
 Ratatui/Crossterm provide rendering and mode commands. A dedicated bounded VT
 reader avoids Crossterm's whole-string paste allocation. The Unicode segmentation
@@ -162,6 +190,10 @@ EDE_PASTE_MIB=64 cargo test --release --locked --test terminal \
   large_paste_memory_benchmark -- --ignored --exact --nocapture
 EDE_RESOURCE_MIB=256 cargo test --release --locked --lib \
   interactive_resource_and_incorporation_measurements -- --ignored --nocapture
+EDE_BENCH_MIB=1024 EDE_PASTE_MIB=64 cargo test --release --locked --test terminal \
+  large_recovery_and_refresh_benchmark -- --ignored --exact --nocapture
+EDE_BENCH_MIB=1024 cargo test --release --locked --lib \
+  document::refresh::tests::large_refresh_storage_measurements -- --ignored --exact --nocapture
 cargo test --locked --test terminal isolated_tmux_editing_and_suspend_smoke \
   -- --ignored --exact --nocapture
 ```

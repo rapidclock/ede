@@ -28,6 +28,7 @@ const TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Test terminal, retained slave attributes, process, and a bounded diagnostic transcript.
 struct PtyChild {
+    _state_root: Option<tempfile::TempDir>,
     child: Child,
     master: File,
     slave: File,
@@ -41,6 +42,16 @@ struct PtyChild {
 impl PtyChild {
     /// Spawn with a controlling terminal. Unsafe operations run only between fork and exec.
     fn spawn(mut command: Command) -> Self {
+        let state_root = if command
+            .get_envs()
+            .any(|(name, value)| name == "EDE_STATE_DIR" && value.is_some())
+        {
+            None
+        } else {
+            let directory = tempfile::tempdir().unwrap();
+            command.env("EDE_STATE_DIR", directory.path().join("state"));
+            Some(directory)
+        };
         let pty = openpty(
             Some(&Winsize {
                 ws_row: 24,
@@ -75,6 +86,7 @@ impl PtyChild {
         let child = command.spawn().unwrap();
         fcntl(&pty.master, FcntlArg::F_SETFL(OFlag::O_NONBLOCK)).unwrap();
         Self {
+            _state_root: state_root,
             child,
             master: File::from(pty.master),
             slave,
@@ -392,8 +404,6 @@ fn real_shortcuts_paste_and_cleanup() {
     process.expect("<U+0011>");
     assert!(process.child.try_wait().unwrap().is_none());
     process.send(b"\x11");
-    process.expect("Unsaved changes");
-    process.send(b"\t\t\r");
     assert!(process.wait().success());
     process.assert_restored();
 }
@@ -472,6 +482,15 @@ impl PtyChild {
         term: Option<&str>,
         args: impl IntoIterator<Item = impl AsRef<std::ffi::OsStr>>,
     ) -> Self {
+        Self::editor_with_state(term, args, None)
+    }
+
+    /// Share only the selected recovery profile across otherwise independent processes.
+    fn editor_with_state(
+        term: Option<&str>,
+        args: impl IntoIterator<Item = impl AsRef<std::ffi::OsStr>>,
+        state: Option<&std::path::Path>,
+    ) -> Self {
         // The interactive parent supplies job control and stays alive after ede exits,
         // allowing exact post-exit termios capture before Darwin revokes the slave PTY.
         let mut command = Command::new("/bin/sh");
@@ -499,10 +518,177 @@ impl PtyChild {
             env!("CARGO_BIN_EXE_ede"),
         ]);
         command.args(args);
+        if let Some(state) = state {
+            command.env("EDE_STATE_DIR", state);
+        }
         let mut child = Self::spawn(command);
         child.keep_alive = true;
         child
     }
+}
+
+/// R01: Quit retains scratch text without asking for a filename or discard decision.
+#[test]
+fn scratch_quit_and_relaunch_retains_text_without_save_prompts() {
+    let state = tempfile::tempdir().unwrap();
+    let profile = state.path().join("state");
+    let mut first = PtyChild::editor_with_state(
+        Some("xterm-256color"),
+        std::iter::empty::<&str>(),
+        Some(&profile),
+    );
+    first.expect("Ready");
+    first.send("retained scratch 界e\u{301}".as_bytes());
+    first.expect_body("retained scratch", TIMEOUT);
+    first.send(b"\x11");
+    assert!(first.wait().success());
+    first.assert_restored();
+    let mut second = PtyChild::editor_with_state(
+        Some("xterm-256color"),
+        std::iter::empty::<&str>(),
+        Some(&profile),
+    );
+    second.expect_body("retained scratch 界e\u{301}", TIMEOUT);
+    second.send(b"\x1a");
+    second.expect_body("retained scratch 界e\u{301}", TIMEOUT);
+    second.send(b"\x11");
+    assert!(second.wait().success());
+    second.assert_restored();
+}
+
+/// F01: An external named-file save refreshes the displayed text without terminal input.
+#[test]
+fn clean_named_file_refreshes_without_user_input() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("refresh.txt");
+    std::fs::write(&path, "original disk contents").unwrap();
+    let mut process = PtyChild::editor_with_path(Some("xterm-256color"), Some(&path));
+    process.expect_body("original disk contents", TIMEOUT);
+    process.expect("Ready");
+    std::fs::write(&path, "updated by another process").unwrap();
+    process.expect_body("updated by another process", TIMEOUT);
+    process.send(b"\x11");
+    assert!(process.wait().success());
+    process.assert_restored();
+}
+
+/// A valid Linux XDG state root does not depend on HOME being set.
+#[test]
+#[cfg(target_os = "linux")]
+fn xdg_state_root_works_without_home() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut command = Command::new("/bin/sh");
+    command.args([
+        "-c",
+        "unset HOME EDE_STATE_DIR; exec \"$1\"",
+        "ede-xdg",
+        env!("CARGO_BIN_EXE_ede"),
+    ]);
+    command.env("XDG_STATE_HOME", directory.path());
+    let mut process = PtyChild::spawn(command);
+    process.expect_status("Ready");
+    process.send(b"\x11");
+    assert!(process.wait().success());
+    assert!(directory.path().join("ede/catalog").exists());
+}
+
+/// F01/F04: symlink retargets, rename saves and transient invalid sources preserve last-good text.
+#[test]
+fn refresh_recovers_after_missing_invalid_and_retargeted_sources() {
+    use std::os::unix::fs::symlink;
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("watched");
+    std::fs::write(&path, "last good text").unwrap();
+    let mut process = PtyChild::editor_with_path(Some("xterm-256color"), Some(&path));
+    process.expect_body("last good text", TIMEOUT);
+    process.expect_status("Ready");
+    std::fs::remove_file(&path).unwrap();
+    process.expect("File refresh unavailable");
+    process.expect_body("last good text", TIMEOUT);
+    std::fs::write(&path, b"\xffinvalid").unwrap();
+    process.expect("File refresh failed");
+    process.expect_body("last good text", TIMEOUT);
+    let target = directory.path().join("target");
+    std::fs::write(&target, "valid symlink target").unwrap();
+    std::fs::remove_file(&path).unwrap();
+    symlink(&target, &path).unwrap();
+    process.expect_body("valid symlink target", TIMEOUT);
+    let replacement = directory.path().join("replacement");
+    std::fs::write(&replacement, "rename saved").unwrap();
+    std::fs::rename(&replacement, &target).unwrap();
+    process.expect_body("rename saved", TIMEOUT);
+    process.send(b"local ");
+    process.expect_body("local rename saved", TIMEOUT);
+    std::fs::write(&target, "external while dirty").unwrap();
+    process.expect("local edits preserved");
+    process.expect_body("local rename saved", TIMEOUT);
+    process.send(b"\x13");
+    process.expect("work retained");
+    assert_eq!(
+        std::fs::read_to_string(&target).unwrap(),
+        "external while dirty"
+    );
+    process.send(b"\x1b");
+    process.expect_absent("work retained");
+    process.send(b"\x11");
+    process.expect("Unsaved changes");
+    process.send(b"\t\t\r");
+    assert!(process.wait().success());
+    process.assert_restored();
+}
+
+/// R04/R05/I01: retired profiles combine, while excess scratches stay operable through Recovery.
+#[test]
+fn independent_instances_restore_overflow_and_open_after_freeing_a_slot() {
+    let directory = tempfile::tempdir().unwrap();
+    let profile = directory.path().join("state");
+    let launch = || {
+        PtyChild::editor_with_state(
+            Some("xterm-256color"),
+            std::iter::empty::<&str>(),
+            Some(&profile),
+        )
+    };
+    let mut a = launch();
+    a.expect_status("Ready");
+    let mut b = launch();
+    b.expect_status("Ready");
+    a.send(&[0x0e; 32]);
+    a.expect("Untitled 33");
+    b.send(&[0x0e; 32]);
+    b.expect("Untitled 33");
+    a.send(b"\x11");
+    assert!(a.wait().success());
+    b.send(b"\x11");
+    assert!(b.wait().success());
+    let mut c = launch();
+    c.expect_with_timeout("Untitled 33", Duration::from_secs(15));
+    c.expect_status("Ready");
+    let recovery_menu = [
+        b"\x1bOQ".as_slice(),
+        b"\x1b[B".repeat(18).as_slice(),
+        b"\r".as_slice(),
+    ]
+    .concat();
+    c.send(&recovery_menu);
+    c.expect("Recovery — retained scratches");
+    c.expect("Scratch 65");
+    c.expect("Scratch 66");
+    c.send(b"\r");
+    c.expect("64 open tabs");
+    c.send(b"\x1b");
+    c.expect_absent("Details");
+    c.send(b"\x17");
+    c.expect("Unsaved changes");
+    c.send(b"\t\t\r");
+    c.expect("> ~Untitled 34");
+    c.send(&recovery_menu);
+    c.expect("Scratch 65");
+    c.send(b"\r");
+    c.expect("> ~Untitled 65");
+    c.send(b"\x11");
+    assert!(c.wait().success());
+    c.assert_restored();
 }
 
 /// Startup order, keyboard tab switching, and tab-local edit history reach the executable.
@@ -538,23 +724,34 @@ fn startup_tabs_keep_independent_contents_and_history() {
 /// Cancelling quit on a later tab must retain every earlier unsaved buffer.
 #[test]
 fn cancel_quit_preserves_tabs_after_earlier_discard_choice() {
-    let mut process = PtyChild::editor();
+    let directory = tempfile::tempdir().unwrap();
+    let first = directory.path().join("first.txt");
+    let second = directory.path().join("second.txt");
+    std::fs::write(&first, "").unwrap();
+    std::fs::write(&second, "").unwrap();
+    let mut process = PtyChild::editor_with_args(Some("xterm-256color"), [&first, &second]);
     process.expect_status("Ready");
-    process.send(b"first-unsaved\x0e");
-    process.expect("Untitled 2");
-    process.send(b"second-unsaved\x11");
+    process.send(b"first-unsaved");
+    process.expect_body("first-unsaved", TIMEOUT);
+    process.send(b"\x1b[19~");
+    process.expect("> second.txt");
+    process.send(b"second-unsaved");
+    process.expect_body("second-unsaved", TIMEOUT);
+    process.send(b"\x11");
     process.expect("Unsaved changes");
-    process.expect("Quit — Untitled 1");
+    process.expect("first.txt");
     process.send(b"\t\t\r");
-    process.expect("Quit — Untitled 2");
+    process.expect("second.txt");
     process.send(b"\r"); // Default Cancel.
+    process.expect_absent("Unsaved changes");
     process.expect_body("second-unsaved", TIMEOUT);
     process.send(b"\x1b[18~");
     process.expect_body("first-unsaved", TIMEOUT);
     process.send(b"\x11");
-    process.expect("Quit — Untitled 1");
+    process.expect("Unsaved changes");
+    process.expect("first.txt");
     process.send(b"\t\t\r");
-    process.expect("Quit — Untitled 2");
+    process.expect("second.txt");
     process.send(b"\t\t\r");
     assert!(process.wait().success());
     process.assert_restored();
@@ -825,10 +1022,13 @@ fn external_large_paste_save_undo_and_redo() {
 /// A prompt at tiny geometry cannot accept a hidden Discard/Save button.
 #[test]
 fn dirty_quit_at_tiny_size_requires_visible_confirmation() {
-    let mut process = PtyChild::editor();
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("guarded.txt");
+    std::fs::write(&path, "").unwrap();
+    let mut process = PtyChild::editor_with_path(Some("xterm-256color"), Some(&path));
     process.expect("Ready");
     process.send(b"work");
-    process.expect("work");
+    process.expect_body("work", TIMEOUT);
     process.resize(20, 4);
     process.expect("Resize");
     process.send(b"\x11");
@@ -863,6 +1063,131 @@ fn enhanced_cmd_delivery_and_restoration() {
     assert!(process.wait().success());
     process.assert_restored();
     assert!(process.output.windows(5).any(|bytes| bytes == b"\x1b[<1u"));
+}
+
+/// I02: checkpoint/restore a large scratch while a GiB refresh keeps another tab usable.
+#[test]
+#[ignore = "large recovery/refresh benchmark: EDE_BENCH_MIB=1024 EDE_PASTE_MIB=64"]
+fn large_recovery_and_refresh_benchmark() {
+    use std::os::unix::fs::{FileExt, MetadataExt};
+    let mib: u64 = std::env::var("EDE_BENCH_MIB")
+        .unwrap_or_else(|_| "1024".into())
+        .parse()
+        .unwrap();
+    let scratch_mib: u64 = std::env::var("EDE_PASTE_MIB")
+        .unwrap_or_else(|_| "64".into())
+        .parse()
+        .unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let profile = directory.path().join("state");
+    let path = directory.path().join("large");
+    let replacement = directory.path().join("replacement");
+    let companion = directory.path().join("companion");
+    let mut chunk = vec![b'x'; 1 << 20];
+    for index in (63..chunk.len()).step_by(64) {
+        chunk[index] = b'\n';
+    }
+    for (fixture, marker) in [
+        (&path, b"ORIGINAL".as_slice()),
+        (&replacement, b"REFRESHED".as_slice()),
+    ] {
+        let mut file = File::create(fixture).unwrap();
+        for _ in 0..mib {
+            file.write_all(&chunk).unwrap();
+        }
+        file.write_all_at(marker, 0).unwrap();
+        file.sync_all().unwrap();
+    }
+    std::fs::write(&companion, "Companion").unwrap();
+    let started = Instant::now();
+    let mut process =
+        PtyChild::editor_with_state(Some("xterm-256color"), [&path, &companion], Some(&profile));
+    process.expect_body("ORIGINAL", Duration::from_secs(120));
+    let first_text = started.elapsed();
+    process.expect_with_timeout("Ready", Duration::from_secs(120));
+    let ready = started.elapsed();
+    let pid = process.editor_pid();
+    let rss = || {
+        let output = Command::new("ps")
+            .args(["-o", "rss=", "-p", &pid.as_raw().to_string()])
+            .output()
+            .unwrap();
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .trim()
+            .parse::<u64>()
+            .unwrap()
+    };
+    let mut peak_rss = rss();
+    process.send(b"\x0e");
+    process.expect("Untitled");
+    process.expect_status("Ready");
+    let paste_started = Instant::now();
+    process.send(b"\x1b[200~");
+    for index in 0..scratch_mib * 16 {
+        process.send(&chunk[..64 << 10]);
+        if index.is_multiple_of(128) {
+            peak_rss = peak_rss.max(rss());
+        }
+    }
+    process.send(b"SCRATCH_END\x1b[201~");
+    process.expect_body("SCRATCH_END", Duration::from_secs(120));
+    let paste_ready = paste_started.elapsed();
+    process.send(b"\x1b[18~");
+    process.expect_body("Companion", TIMEOUT);
+    std::fs::rename(&replacement, &path).unwrap();
+    let refresh_started = Instant::now();
+    let mut latency = Vec::new();
+    for count in 1..=50 {
+        let event = Instant::now();
+        process.send(b"Z");
+        process.expect_body(&"Z".repeat(count), TIMEOUT);
+        latency.push(event.elapsed().as_secs_f64() * 1000.0);
+        peak_rss = peak_rss.max(rss());
+        thread::sleep(Duration::from_millis(100));
+    }
+    process.send(b"\x1b[18~");
+    process.expect_body("REFRESHED", Duration::from_secs(120));
+    let refresh_visible = refresh_started.elapsed();
+    latency.sort_by(f64::total_cmp);
+    process.send(b"\x11");
+    process.expect("Unsaved changes");
+    process.send(b"\t\t\r");
+    let quit = Instant::now();
+    assert!(process.wait().success());
+    let flush = quit.elapsed();
+    process.assert_restored();
+    let mut object_bytes = 0;
+    let mut object_allocated = 0;
+    for entry in std::fs::read_dir(profile.join("objects")).unwrap() {
+        let metadata = entry.unwrap().metadata().unwrap();
+        object_bytes += metadata.len();
+        object_allocated += metadata.blocks() * 512;
+    }
+    let restored_at = Instant::now();
+    let mut restored = PtyChild::editor_with_state(
+        Some("xterm-256color"),
+        std::iter::empty::<&str>(),
+        Some(&profile),
+    );
+    restored.expect_body("SCRATCH_END", Duration::from_secs(120));
+    let restore = restored_at.elapsed();
+    restored.send(b"\x11");
+    assert!(restored.wait().success());
+    restored.assert_restored();
+    eprintln!(
+        "recovery_refresh named_MiB={mib} scratch_MiB={scratch_mib} first_text_ms={:.3} ready_ms={:.3} paste_ready_ms={:.3} refresh_observed_ms={:.3} quit_flush_ms={:.3} restore_ms={:.3} input_p50_ms={:.3} input_p95_ms={:.3} input_max_ms={:.3} sampled_RSS_KiB={peak_rss} recovery_logical_bytes={object_bytes} recovery_allocated_bytes={object_allocated}",
+        first_text.as_secs_f64() * 1000.0,
+        ready.as_secs_f64() * 1000.0,
+        paste_ready.as_secs_f64() * 1000.0,
+        refresh_visible.as_secs_f64() * 1000.0,
+        flush.as_secs_f64() * 1000.0,
+        restore.as_secs_f64() * 1000.0,
+        latency[25],
+        latency[47],
+        latency[49]
+    );
+    process.report_peak_rss();
 }
 
 /// Real allocated-file terminal benchmark; opt in so ordinary tests remain small and repeatable.

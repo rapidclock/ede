@@ -11,11 +11,13 @@ use crate::{
 use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use std::{collections::VecDeque, path::PathBuf, sync::Arc, time::Duration};
 mod dialogs;
+pub(crate) mod recovery;
 
 /// Effects performed by the runtime, never by drawing or hit-testing.
 #[derive(Clone, Debug)]
 pub(crate) enum Intent {
     Quit,
+    QuitConfirmed,
     Suspend,
     MouseCapture(bool),
     Editor(Action),
@@ -39,6 +41,9 @@ pub(crate) enum Modal {
     Confirm(After, Option<JobId>),
     Details(String),
     SaveError(String),
+    PersistenceError(String),
+    Recovery(Box<recovery::Dialog>),
+    DiscardRecovery(Box<recovery::Dialog>, crate::recovery::Id),
 }
 /// Captured pointer target and its geometry; text capture never activates crossed controls.
 #[derive(Clone, Copy)]
@@ -86,6 +91,7 @@ pub(crate) struct AppState {
     picker_generation: u64,
     open_errors: VecDeque<String>,
     pub save_error_tab: Option<TabId>,
+    persistence_retry: After,
     path_tab: Option<TabId>,
     guard_focus: Option<Control>,
     guard_return: Option<Modal>,
@@ -123,6 +129,8 @@ pub(crate) const MENU: &[(Command, &str)] = &[
     (Command::Tabs, "Tabs                F7 / F8 switch"),
     (Command::CloseTab, "Close tab           Ctrl+W / Cmd+W"),
     (Command::TabDetails, "Tab details"),
+    (Command::Recovery, "Recovery"),
+    (Command::RetryRefresh, "Retry refresh"),
 ];
 impl AppState {
     /// Begin with text focus and a visible asynchronous preparation state.
@@ -145,6 +153,7 @@ impl AppState {
             picker_generation: 0,
             open_errors: VecDeque::new(),
             save_error_tab: None,
+            persistence_retry: After::Quit,
             path_tab: None,
             guard_focus: None,
             guard_return: None,
@@ -249,12 +258,43 @@ impl AppState {
     }
     /// Consume asynchronous guard/save events without allowing a stale save to close work.
     pub fn event(&mut self, event: Event) -> Option<Intent> {
-        if matches!(&event, Event::Guard(sequence,..)|Event::QuitTabs(sequence,..)|Event::Proceed(sequence,..)|Event::Uncertain(sequence,..) if self.guard_request!=Some(*sequence))
+        if matches!(&event, Event::Guard(sequence,..)|Event::QuitTabs(sequence,..)|Event::Proceed(sequence,..)|Event::Uncertain(sequence,..)|Event::QuitReady(sequence) if self.guard_request!=Some(*sequence))
         {
             return None;
         }
         match event {
+            Event::PersistenceFailed(tab, after, message) => {
+                let guarded = self.guard_request.is_some();
+                self.abort_guard();
+                self.guard_return = None;
+                self.save_error_tab = Some(tab);
+                self.persistence_retry = after;
+                self.modal = Some(Modal::PersistenceError(message));
+                self.focus = Some(Control::RecoveryErrorCancel);
+                self.capture = None;
+                self.help_scroll = 0;
+                self.dirty = true;
+                if guarded {
+                    return Some(Intent::Editor(Action::CancelGuard));
+                }
+            }
+            Event::RecoveryPage(generation, page) => {
+                if let Some(Modal::Recovery(dialog)) = &mut self.modal
+                    && dialog.generation == generation
+                {
+                    dialog.page = page;
+                    dialog.highlight = dialog
+                        .highlight
+                        .min(dialog.page.rows.len().saturating_sub(1));
+                    dialog.loading = false;
+                    dialog.revision = dialog.revision.wrapping_add(1);
+                    self.capture = None;
+                    self.dirty = true;
+                }
+            }
+            Event::QuitReady(_) => return Some(Intent::QuitConfirmed),
             Event::Failure(message) => {
+                let guarded = self.guard_request.is_some();
                 self.abort_guard();
                 self.guard_return = None;
                 self.field_paste = None;
@@ -267,6 +307,9 @@ impl AppState {
                 self.help_scroll = 0;
                 self.capture = None;
                 self.dirty = true;
+                if guarded {
+                    return Some(Intent::Editor(Action::CancelGuard));
+                }
             }
             Event::OpenFailed(message) => {
                 if self.open_errors.len() < crate::TAB_LIMIT {
@@ -326,6 +369,7 @@ impl AppState {
                     && !(self.discarding && guarded && result == SaveResult::Uncertain)
                     && (guarded || (self.guard_request.is_none() && self.modal.is_none()))
                 {
+                    let had_guard = self.guard_request.is_some();
                     self.abort_guard();
                     self.guard_return = None;
                     self.save_error_tab = Some(tab);
@@ -335,6 +379,9 @@ impl AppState {
                     self.focus = Some(Control::PathCancel);
                     self.help_scroll = 0;
                     self.dirty = true;
+                    if had_guard {
+                        return Some(Intent::Editor(Action::CancelGuard));
+                    }
                 }
             }
             Event::FieldPaste(generation, result) => {
@@ -473,6 +520,13 @@ impl AppState {
             .as_deref()
     }
     /// Route one input to the owning modal, control, or text surface.
+    pub fn receiving_paste_tab(&self) -> Option<TabId> {
+        match &self.paste {
+            Some((cancel, PasteTarget::Tab(tab))) if !cancel.is_cancelled() => *tab,
+            _ => None,
+        }
+    }
+    /// Route one input to the owning modal, control, or text surface.
     pub fn input(&mut self, input: Input, layout: &LayoutSnapshot) -> Option<Intent> {
         match input {
             Input::Command(command) => self.command(command, layout),
@@ -608,6 +662,12 @@ impl AppState {
         if matches!(self.modal, Some(Modal::Tabs(_))) {
             return self.tabs_command(command, layout);
         }
+        if matches!(
+            self.modal,
+            Some(Modal::Recovery(_) | Modal::DiscardRecovery(..))
+        ) {
+            return self.recovery_command(command, layout);
+        }
         if self.help && matches!(command, Command::Move(..)) {
             self.help_scroll =
                 if matches!(command, Command::Move(Movement::Up | Movement::PageUp, _)) {
@@ -740,6 +800,31 @@ impl AppState {
             }
             return None;
         }
+        if let Some(Modal::PersistenceError(_)) = self.modal {
+            if matches!(
+                command,
+                Command::Tab | Command::FocusNext | Command::FocusPrevious
+            ) {
+                self.focus = layout.next(self.focus, command == Command::FocusPrevious);
+                self.dirty = true;
+            }
+            if command == Command::SaveAs
+                || (matches!(command, Command::Activate | Command::Newline)
+                    && self.focus == Some(Control::SaveErrorAs))
+            {
+                self.path(PathKind::Save);
+                self.path_tab = self.save_error_tab.take();
+            } else if matches!(command, Command::Activate | Command::Newline) {
+                let retry = self.focus == Some(Control::RecoveryErrorRetry);
+                self.modal = None;
+                self.focus = Some(Control::Content);
+                self.dirty = true;
+                if retry {
+                    return Some(Intent::Editor(Action::Guard(self.persistence_retry)));
+                }
+            }
+            return None;
+        }
         if let Some(Modal::SaveError(_)) = self.modal {
             if matches!(command, Command::Move(..)) {
                 self.help_scroll =
@@ -778,6 +863,23 @@ impl AppState {
             return None;
         }
         if let Some(Modal::Details(_)) = self.modal {
+            if matches!(
+                command,
+                Command::Tab | Command::FocusNext | Command::FocusPrevious
+            ) {
+                self.focus = layout.next(self.focus, command == Command::FocusPrevious);
+                self.dirty = true;
+                return None;
+            }
+            if command == Command::RetryRefresh
+                || (matches!(command, Command::Activate | Command::Newline)
+                    && self.focus == Some(Control::RetryRefresh))
+            {
+                self.modal = None;
+                self.focus = Some(Control::Content);
+                self.dirty = true;
+                return Some(Intent::Editor(Action::RetryRefresh(self.screen.tab?)));
+            }
             if matches!(command, Command::Move(..)) {
                 self.help_scroll =
                     if matches!(command, Command::Move(Movement::Up | Movement::PageUp, _)) {
@@ -890,16 +992,35 @@ impl AppState {
                 ))))
             }
             Command::TabDetails => {
-                let label = self.screen.path.as_ref().map_or_else(
+                let mut label = self.screen.path.as_ref().map_or_else(
                     || self.tab_label(self.screen.tab).to_owned(),
                     |path| crate::text::safe(&path.to_string_lossy()),
                 );
+                if let Some(tab) = self
+                    .screen
+                    .tabs
+                    .iter()
+                    .find(|tab| Some(tab.id) == self.screen.tab)
+                {
+                    if tab.scratch {
+                        label.push_str(&format!("\nScratch — {}", tab.retention));
+                    }
+                    if let Some(warning) = &tab.warning {
+                        label.push_str(&format!("\n{warning}"));
+                    }
+                }
                 self.modal = Some(Modal::Details(label));
                 self.focus = Some(Control::DetailsClose);
                 self.help_scroll = 0;
                 self.capture = None;
                 self.dirty = true;
                 None
+            }
+            Command::Recovery => self.open_recovery(),
+            Command::RetryRefresh => {
+                self.modal = None;
+                self.focus = Some(Control::Content);
+                Some(Intent::Editor(Action::RetryRefresh(self.screen.tab?)))
             }
             Command::Save if self.ready() && self.screen.tab.is_some() => {
                 Some(Intent::Editor(Action::Save(None)))

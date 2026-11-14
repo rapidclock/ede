@@ -1,6 +1,6 @@
 # 001 — Initial MVP overview
 
-Status: **MVP scope and roadmap accepted — Stages 01–03 merged; Stage 04 implemented and locally validated.**
+Status: **MVP scope and roadmap accepted — Stages 01–04 merged; Stage 05 implemented, with final checks in progress.**
 
 Project: **ede**, a predominantly Rust terminal text editor for macOS and Linux.
 
@@ -299,9 +299,10 @@ key delivery are current proposals.
   remote session, scratch storage lives on the remote machine; cross-machine
   synchronization is not required.
 
-Persistence location, concurrent-instance behavior, undo-history restoration, and
-power-loss durability need detailed design. Normal-exit retention and restoration
-of the last complete checkpoint after an application crash are required.
+[Stage 05](05_scratch_recovery.md) defines machine-local storage, independent live
+owners, restoration of retired owners, and fresh undo history on recovery.
+Normal-exit retention and restoration of the last complete checkpoint after an
+application crash are required; power-loss durability is not promised.
 
 ## 4. Proposed architectural direction
 
@@ -390,7 +391,7 @@ storage. Avoid assuming that an open file descriptor or memory map freezes data.
 | Highlighting | User-agreed engine/dependencies, bundled or external prerequisites, and any language/embedded-syntax deferrals |
 | Storage | Unified or separate backends; stable snapshots; indexing and undo resource budgets |
 | Saving | Atomic replacement policy, metadata/links, cancellation, disk exhaustion, and external-change conflicts |
-| Scratch persistence | Storage location, concurrent instances, undo restoration, power-loss durability, and whether named-file unsaved edits also persist |
+| Scratch persistence | Resolved in Stage 05: machine-local state, independent live owners, recovery of retired owners, fresh restored history, and scratch-only recovery; power-loss guarantees remain outside scope |
 | Live content | Direct file-follow semantics, log rotation, retention quotas, and producer-error handling |
 | Search | ripgrep library integration, whole-word semantics, Unicode case behavior, multi-document replacement and cancellation |
 | Performance | Benchmark corpus and CPU/storage details for the agreed 1 GiB / 8 GiB RAM baseline; measurement methods, memory budgets, and validation of agreed latency/highlighting defaults |
@@ -498,7 +499,7 @@ Evidence: [Stage 03 validation record](03_editing_and_mouse.md#validation-record
 ### 04 — Tabs and file selection
 
 Design: [04_tabs_and_file_picker.md](04_tabs_and_file_picker.md). Depends on: 03.
-Status: implemented, independently reviewed and locally validated.
+Status: complete; [PR #4](https://github.com/rapidclock/ede/pull/4) merged into `feat/initial_mvp`.
 Branch: `stage/tabs_and_file_picker`; PR target: `feat/initial_mvp`.
 Evidence: [Stage 04 validation record](04_tabs_and_file_picker.md#validation-record).
 
@@ -510,7 +511,18 @@ Evidence: [Stage 04 validation record](04_tabs_and_file_picker.md#validation-rec
 
 ### 05 — Persistent scratch documents, recovery, and automatic file refresh
 
-Planned file: `05_scratch_recovery.md`. Depends on: 02–04.
+Design: [05_scratch_recovery.md](05_scratch_recovery.md). Depends on: 02–04.
+Status: implemented; native validation and independent reviews passed; final checks pending.
+Branch: `stage/scratch_recovery`; PR target: `feat/initial_mvp`.
+Evidence: [Stage 05 validation record](05_scratch_recovery.md#validation-record)
+(native results recorded; Linux CI pending).
+
+The accepted design gives each live instance an independent scratch set. A new
+instance restores the retained scratches of all retired owners; overflow beyond
+64 tabs remains available through Recovery. Restored undo history starts fresh.
+Named-file refresh is undoable within the existing 256 MiB history budget, with
+explicit feedback when that limit requires resetting history. General recovery
+of unsaved named-file edits remains outside this stage.
 
 - Deliver unnamed scratch tabs, five-second checkpoints while modified, restoration
   on launch, save-as, and explicit discard. Resolve storage location and concurrent

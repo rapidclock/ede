@@ -18,11 +18,15 @@ pub(crate) struct TabSummary {
     pub saving: bool,
     pub queued_save: bool,
     pub attention: bool,
+    pub scratch: bool,
+    pub retention: &'static str,
+    pub warning: Option<Arc<str>>,
 }
 
 /// The active or a parked document's editor state. Only the active tab has a layout.
 #[derive(Default)]
 pub(super) struct TabState {
+    pub(super) input: Arc<InputEpoch>,
     pub screen: Screen,
     pub info: Option<DocumentInfo>,
     pub uncertain: Option<JobId>,
@@ -32,12 +36,15 @@ pub(super) struct TabState {
     pub top: u64,
     pub left: u64,
     pub preferred: Option<u64>,
-    attention: bool,
+    pub(super) attention: bool,
+    pub(super) scratch: Option<RetainedScratch>,
+    pub(super) watch: Watch,
+    pub(super) view_retry: Option<std::time::Instant>,
 }
 
 /// Creation order stays stable; the active entry's state lives in the coordinator.
 pub(super) struct Tab {
-    id: TabId,
+    pub(super) id: TabId,
     label: Arc<str>,
     path_hint: Option<Arc<str>>,
     startup: bool,
@@ -55,14 +62,14 @@ pub(super) struct OpenJob {
 
 /// The destination and its charge are retained until the save outcome is reconciled.
 pub(super) struct SaveIntent {
-    tab: TabId,
+    pub(super) tab: TabId,
     destination: Option<(Arc<Path>, document::Permit)>,
 }
 
 pub(super) struct RunningSave {
     pub job: Job,
     request: u64,
-    intent: SaveIntent,
+    pub(super) intent: SaveIntent,
 }
 
 pub(super) struct WaitingGuard {
@@ -158,10 +165,13 @@ impl Coordinator {
         if let Some(first) = self.tabs.first() {
             self.activate(first.id);
         }
+        if let Err(error) = self.restore_startup() {
+            self.event(Event::OpenFailed(format!("Scratch recovery: {error}")));
+        }
     }
 
     /// Resolve a tab to its active or parked state without disturbing the active view.
-    fn state(&self, id: TabId) -> Option<&TabState> {
+    pub(super) fn state(&self, id: TabId) -> Option<&TabState> {
         if self.tab.screen.tab == Some(id) {
             Some(&self.tab)
         } else {
@@ -169,7 +179,7 @@ impl Coordinator {
         }
     }
 
-    fn state_mut(&mut self, id: TabId) -> Option<&mut TabState> {
+    pub(super) fn state_mut(&mut self, id: TabId) -> Option<&mut TabState> {
         if self.tab.screen.tab == Some(id) {
             Some(&mut self.tab)
         } else {
@@ -236,7 +246,31 @@ impl Coordinator {
                     .as_ref()
                     .is_some_and(|save| save.intent.tab == tab.id),
                 queued_save: self.saves.iter().any(|save| save.tab == tab.id),
-                attention: state.attention,
+                attention: state.attention
+                    || state.uncertain.is_some()
+                    || state.watch.warning.is_some(),
+                scratch: state.screen.path.is_none(),
+                retention: if self
+                    .retention
+                    .as_ref()
+                    .is_some_and(|retention| retention.checkpointing(tab.id))
+                {
+                    "Checkpointing"
+                } else {
+                    state.scratch.as_ref().map_or("", |scratch| {
+                        scratch.status(state.info.as_ref().map(|info| info.revision))
+                    })
+                },
+                warning: state
+                    .scratch
+                    .as_ref()
+                    .and_then(|scratch| scratch.warning.as_deref())
+                    .or(state.watch.warning.as_deref())
+                    .map(Arc::from)
+                    .or_else(|| {
+                        (state.attention || state.uncertain.is_some())
+                            .then(|| Arc::from(state.screen.message.as_str()))
+                    }),
             }
         });
         if !summaries.clone().eq(self.summaries.iter().cloned()) {
@@ -260,7 +294,7 @@ impl Coordinator {
     }
 
     /// Charge retained path copies and the bounded Stage 02 history positions up front.
-    fn admit_tab(&mut self, path: Option<PathBuf>) -> Result<TabId, Error> {
+    pub(super) fn admit_tab(&mut self, path: Option<PathBuf>) -> Result<TabId, Error> {
         let cancelling = self
             .opening
             .as_ref()
@@ -290,6 +324,11 @@ impl Coordinator {
             },
             ..TabState::default()
         };
+        self.view_cancel
+            .targets
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .push((id, state.input.clone()));
         self.tabs.push(Tab {
             id,
             label,
@@ -317,6 +356,7 @@ impl Coordinator {
                 self.tab.screen.document = Some(document);
                 self.tab.screen.loading = false;
                 self.tab.screen.message = "Ready".into();
+                self.tab.scratch = self.fresh_scratch()?;
                 self.refresh()?;
                 self.layout(true)
             }
@@ -353,7 +393,7 @@ impl Coordinator {
     }
 
     /// Drop the outgoing layout, preserving the exact viewport coordinates and selection.
-    fn activate(&mut self, id: TabId) -> bool {
+    pub(super) fn activate(&mut self, id: TabId) -> bool {
         if self.tab.screen.tab == Some(id) {
             return false;
         }
@@ -366,6 +406,16 @@ impl Coordinator {
             return false;
         };
         let mut old = std::mem::replace(&mut self.tab, next);
+        *self
+            .view_cancel
+            .current
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = Some(id);
+        if let Some(retention) = &mut self.retention
+            && let Some(scratch) = &self.tab.scratch
+        {
+            retention.active = Some(scratch.id);
+        }
         old.screen.view = None;
         old.screen.tabs = Arc::default();
         old.screen.reserved_paths = Arc::default();
@@ -411,12 +461,22 @@ impl Coordinator {
             self.service.close(document);
         }
         let removed = self.tabs.remove(index);
+        self.view_cancel
+            .targets
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .retain(|(tab, _)| *tab != id);
         if let Some(opening) = self.opening.as_mut().filter(|job| job.tab == id) {
             opening.job.cancel();
             self.service.close(opening.job.document);
             opening.released = Some(removed);
         }
         if active {
+            *self
+                .view_cancel
+                .current
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner()) = None;
             self.tab = TabState::default();
             self.tab.screen.loading = false;
             self.tab.screen.message = "No open tabs".into();
@@ -481,19 +541,32 @@ impl Coordinator {
                     changed = true;
                 }
             }
-        } else if let Some((tab, path)) = self.tabs.iter().find_map(|t| {
+        } else if let Some((tab, path, restore)) = self.tabs.iter().find_map(|t| {
             let state = t.state.as_ref().unwrap_or(&self.tab);
             if state.screen.loading {
-                state.screen.path.clone().map(|path| (t.id, path))
+                if let Some(scratch) = &state.scratch
+                    && let Some((entry, path)) = &scratch.restore
+                {
+                    Some((t.id, path.clone(), Some(*entry)))
+                } else {
+                    state.screen.path.clone().map(|path| (t.id, path, None))
+                }
             } else {
                 None
             }
         }) {
             self.counter += 1;
-            match self
-                .service
-                .submit(self.counter, Request::Open(path.clone()))
-            {
+            match self.service.submit(
+                self.counter,
+                restore.map_or_else(
+                    || Request::Open(path.clone()),
+                    |entry| Request::Restore {
+                        path: path.clone(),
+                        format: entry.format,
+                        len: entry.len,
+                    },
+                ),
+            ) {
                 Ok(job) => {
                     self.opening = Some(OpenJob {
                         tab,
@@ -532,6 +605,8 @@ impl Coordinator {
     pub(super) fn open_completed(&mut self, completion: document::Completion) -> Result<(), Error> {
         let opening = self.opening.take().expect("matching open job");
         let id = opening.tab;
+        let startup = self.tabs.iter().any(|tab| tab.id == id && tab.startup);
+        let failed = completion.result.is_err();
         let Some(state) = self.state_mut(id) else {
             self.service.close(completion.document);
             return Ok(());
@@ -542,12 +617,24 @@ impl Coordinator {
                     Ok(info) => info,
                     Err(error) => {
                         self.service.close(document);
+                        self.record_restore_error(id, &error);
                         let path = self
                             .state(id)
-                            .and_then(|state| state.screen.path.clone())
+                            .and_then(|state| {
+                                state.screen.path.clone().or_else(|| {
+                                    state
+                                        .scratch
+                                        .as_ref()
+                                        .and_then(|scratch| scratch.restore.as_ref())
+                                        .map(|(_, path)| path.clone())
+                                })
+                            })
                             .unwrap_or_default();
                         self.remove_tab(id)?;
                         self.open_error(&path, &error);
+                        if startup {
+                            self.restore_startup()?;
+                        }
                         return Ok(());
                     }
                 };
@@ -558,18 +645,36 @@ impl Coordinator {
                 state.screen.preview = None;
                 state.screen.message = "Ready".into();
                 state.info = Some(info);
+                let restored = self.restore_view(id)?;
                 if self.tab.screen.tab == Some(id) {
-                    self.layout(true)?;
+                    self.layout(!restored)?;
                 }
             }
             result => {
-                let path = state.screen.path.clone().unwrap_or_default();
-                self.remove_tab(id)?;
+                let path = state
+                    .screen
+                    .path
+                    .clone()
+                    .or_else(|| {
+                        state
+                            .scratch
+                            .as_ref()
+                            .and_then(|scratch| scratch.restore.as_ref())
+                            .map(|(_, path)| path.clone())
+                    })
+                    .unwrap_or_default();
                 let error = result.err().unwrap_or(Error::CorruptStorage);
+                if !matches!(error, Error::Cancelled) {
+                    self.record_restore_error(id, &error);
+                }
+                self.remove_tab(id)?;
                 if !matches!(error, Error::Cancelled) {
                     self.open_error(&path, &error);
                 }
             }
+        }
+        if startup && failed {
+            self.restore_startup()?;
         }
         Ok(())
     }
@@ -895,7 +1000,18 @@ impl Coordinator {
                 self.refresh_tab(id, document)?;
             }
             let state = self.state(id).expect("checked tab");
-            dirty = state.screen.modified || state.uncertain.is_some();
+            dirty = (state.screen.modified || state.uncertain.is_some())
+                && !(self.retention.is_some()
+                    && state.screen.path.is_none()
+                    && state.scratch.is_some()
+                    && !matches!(after, After::Close(_)));
+            if self.retention.is_some()
+                && state.screen.path.is_none()
+                && state.scratch.is_some()
+                && matches!(after, After::Close(_))
+            {
+                dirty = true;
+            }
             let saving = self
                 .saving
                 .as_ref()
@@ -934,7 +1050,13 @@ impl Coordinator {
         }
     }
 
-    fn finish_discard(&self, after: After, id: TabId, sequence: u64, acknowledged: Option<JobId>) {
+    fn finish_discard(
+        &mut self,
+        after: After,
+        id: TabId,
+        sequence: u64,
+        acknowledged: Option<JobId>,
+    ) {
         if let Some(job) = self
             .state(id)
             .and_then(|state| state.uncertain)
@@ -942,6 +1064,9 @@ impl Coordinator {
         {
             self.event(Event::Uncertain(sequence, after, job));
         } else {
+            if matches!(after, After::Close(_)) && self.retire_before_close(id, after, sequence) {
+                return;
+            }
             self.event(Event::Proceed(sequence, after));
         }
     }

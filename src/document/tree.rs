@@ -47,6 +47,7 @@ pub(super) struct Tree {
     capacity: usize,
     generation: u64,
     cache: Arc<Mutex<Cache>>,
+    pub(super) uncached: bool,
 }
 impl Tree {
     /// Create an empty arena; each page contains a header and 24-byte entries.
@@ -59,6 +60,7 @@ impl Tree {
             capacity,
             generation,
             cache,
+            uncached: false,
         }
     }
     /// Independent reader of this already-published immutable page prefix.
@@ -70,7 +72,45 @@ impl Tree {
             capacity: self.capacity,
             generation: self.generation,
             cache: self.cache.clone(),
+            uncached: self.uncached,
         })
+    }
+    /// A background copy must never hold the foreground cache mutex during filesystem I/O.
+    pub(super) fn uncached_reader(&self) -> Result<Self, Error> {
+        let mut reader = self.reader()?;
+        reader.uncached = true;
+        Ok(reader)
+    }
+    /// Fork immutable node IDs into a private writable generation using bounded storage buffers.
+    pub(super) fn fork_to(
+        &self,
+        file: File,
+        source: &Source,
+        cancel: &Cancellation,
+    ) -> Result<Self, Error> {
+        let _permit = source
+            .resources
+            .buffers
+            .acquire(source.limits.text_page_bytes)?;
+        source.reserve(self.disk_bytes())?;
+        let mut bytes = vec![0; source.limits.text_page_bytes];
+        super::platform::copy_prefix(
+            &self.file,
+            &file,
+            self.disk_bytes(),
+            &mut bytes,
+            cancel,
+            source.faults.as_deref(),
+        )?;
+        let mut tree = Self::new(
+            file,
+            self.page_size,
+            source.generation.0,
+            source.resources.nodes.clone(),
+        );
+        tree.pages = self.pages;
+        tree.uncached = true;
+        Ok(tree)
     }
     /// Allocated disk bytes, including not-yet-reclaimed old versions.
     pub fn disk_bytes(&self) -> u64 {
@@ -96,13 +136,18 @@ impl Tree {
             return Err(Error::CorruptStorage);
         }
         let mut page = vec![0; self.page_size];
-        self.cache.lock().map_err(|_| Error::CorruptStorage)?.read(
-            Key(self.generation, 1, root.entry.id),
-            &self.file,
-            root.entry.id * self.page_size as u64,
-            self.page_size,
-            &mut page,
-        )?;
+        if self.uncached {
+            self.file
+                .read_exact_at(&mut page, root.entry.id * self.page_size as u64)?;
+        } else {
+            self.cache.lock().map_err(|_| Error::CorruptStorage)?.read(
+                Key(self.generation, 1, root.entry.id),
+                &self.file,
+                root.entry.id * self.page_size as u64,
+                self.page_size,
+                &mut page,
+            )?;
+        }
         if &page[..8] != b"EDEPAGE2" {
             return Err(Error::CorruptStorage);
         }
