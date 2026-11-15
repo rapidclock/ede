@@ -1,6 +1,6 @@
 # 07 — Syntax highlighting
 
-Status — **Implemented on the stage branch. Acceptance validation in progress.**
+Status — **Implemented, independently reviewed, and validated on the stage branch.**
 
 Branch — `stage/syntax_highlighting`, based on `feat/initial_mvp` at `9714b09`.
 PR target — `feat/initial_mvp`.
@@ -348,9 +348,9 @@ in the record below.
 
 ## Validation record
 
-**Stage 07 acceptance validation in progress.** The built-in Language picker and
-Tab Details implement part of H03. Measurements below are from a standalone
-probe. No language or embedding deferral has been approved.
+**Stage 07 acceptance validation complete on the stage branch.** The design
+and standalone probe are recorded first, followed by the integrated checks.
+No language or embedding deferral has been approved.
 
 Design baseline on 2026-11-14 — merged Stage 06 at `9714b09`, native macOS
 27.2 arm64 and Rust 1.99.1. The branch includes the explicit `ede` binary
@@ -492,17 +492,25 @@ On native macOS 27.2 arm64 (MacBookPro18,2, 32 GiB RAM, local APFS), the
 stripped release executable is 8,113,408 bytes. The release helper heap-ceiling
 test `oversized_projection_reaches_fixed_heap_ceiling`, timed with
 `/usr/bin/time -l`, exited with the budget code and 48,807,936 bytes peak RSS.
-The H08 release PTY `large_highlighting_and_search_overlap` used a warm
+The final H08 release PTY `large_highlighting_and_search_overlap` used a warm
 20,889,622-byte Rust document and an allocated 1 GiB file in an inactive tab.
 It observed syntax worker CPU while search scanned the 1 GiB tab. First text
-took 173.8 ms. Eight ordinary input samples had a 20.3 ms maximum. Sampled
-RSS during the scan was 7,056 KiB for the editor and 26,880 KiB for its worker.
-The editor command's kernel lifetime peak was 26,976 KiB. The metrics cover
+took 259.4 ms. Eight ordinary input samples had a 21.2 ms maximum. Sampled
+RSS during the scan was 7,056 KiB for the editor and 26,896 KiB for its worker.
+The editor command's kernel lifetime peak was 26,896 KiB. The metrics cover
 the local PTY and its prepared files. Native Linux CI exercises the same
 overlap under a 256 MiB no-swap cgroup. The first Linux attempt was killed at
 the cgroup limit while using a fixture generator that synced only at EOF.
 The benchmark now syncs and drops prepared pages in intervals on Linux and
 reports when fixture preparation finishes.
+
+A direct release worker run on a comparable 20,889,615-byte Rust corpus
+received and checked the UTF-8 payload over pipes in 8.83 ms. Parse and first
+projection took 112.36 ms. A later projection reused the trees and took
+0.06 ms. Peak charged arena use was 23,130,501 bytes. The direct run excludes
+storage snapshot I/O and editor-side preflight. The rebuilt binary also
+emitted Markdown heading color for `FUTURE.md` in an isolated PTY and quit
+cleanly.
 
 The integrated local workspace run passed 248 tests with nine opt-in checks
 ignored. The capped helper and 1 GiB overlap release probes passed separately
@@ -515,3 +523,13 @@ Linux's unoptimized debug build timed out on the combined nested-language
 fixture. The development profile optimizes the Tree-sitter runtime, regular
 expression dependencies and fixed-arena allocator. The runtime deadlines
 and release profile are identical to the approved implementation.
+
+The [full CI matrix](https://github.com/rapidclock/ede/actions/runs/43707728892)
+passed for code revision `50691b2` on the hosted macOS and Ubuntu runners
+using Rust 1.99.1. The Linux release helper exited with the expected budget
+code and 49,344 KiB peak RSS. The Linux overlap ran in a cgroup with
+`MemoryMax=256M` and `MemorySwapMax=0`. First text took 24.1 ms and the slowest
+of eight input samples took 16.8 ms. Sampled RSS was 7,888 KiB for the editor
+and 28,540 KiB for its worker. systemd reported a 256 MiB cgroup peak with
+zero swap. The same run passed the existing Linux constrained storage,
+editing, recovery, refresh, and search and replacement regressions.
