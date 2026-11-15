@@ -5,6 +5,9 @@ use std::{
     process::{Command, Output, Stdio},
 };
 
+/// The wire category for level-one headings, independent of the active palette.
+const HEADING_1: u8 = 15;
+
 /// Build a worker request from original logical bytes and one scalar-aligned viewport.
 fn request(language: u8, text: &str, rules: &[(u8, &str)]) -> Vec<u8> {
     let mut input = vec![b'O', language];
@@ -116,7 +119,7 @@ impl Reply {
 #[test]
 fn installed_worker_highlights_all_bundled_languages() {
     for (id, source, token, category) in [
-        (1, "# Heading\n\nOrdinary text", "Heading", 6),
+        (1, "# Heading\n\nOrdinary text", "Heading", HEADING_1),
         (2, "[table]\nnumber = 42\n", "42", 2),
         (3, "top: &here 'é'\nvalue: *here\n", "value", 5),
         (4, r#"{"key": 42}"#, "\"key", 5),
@@ -221,7 +224,7 @@ fn strict_markdown_frontmatter_and_multiline_prefixes() {
         let reply = Reply::parse(run_worker(request(1, source, &[])));
         assert_eq!(
             reply.at(source, "Ordinary"),
-            Some(6),
+            Some(HEADING_1),
             "{source:?}: {reply:?}"
         );
     }
@@ -277,7 +280,7 @@ fn quoted_markdown_fence_has_logical_frontmatter() {
     let reply = Reply::parse(run_worker(request(1, source, &[])));
     assert_eq!(reply.at(source, "title"), Some(5));
     assert_eq!(reply.at(source, "> title"), Some(10));
-    assert_eq!(reply.at(source, "Done"), Some(6));
+    assert_eq!(reply.at(source, "Done"), Some(HEADING_1));
 }
 
 /// Recovery still highlights unambiguous properties, values and punctuation around invalid text.

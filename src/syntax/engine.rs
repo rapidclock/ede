@@ -604,6 +604,9 @@ fn builtin_category(name: &str) -> Option<Category> {
     Some(match name {
         "text.literal" => Code,
         "string.special.key" => Property,
+        _ if name.starts_with("heading_") || name == "list_marker" => {
+            return Category::named(name);
+        }
         _ => match name.split('.').next()? {
             "comment" => Comment,
             "string" | "character" | "escape" => String,

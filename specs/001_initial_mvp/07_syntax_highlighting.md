@@ -58,7 +58,10 @@ the previous selection and detection intact.
 
 Markdown uses CommonMark source constructs plus GitHub-style pipe tables, task
 markers and strikethrough. Highlight headings, lists, quotes, emphasis, links,
-inline code, and fence delimiters. Recognize YAML frontmatter bounded by `---`
+inline code, and fence delimiters. Both built-in themes assign distinct colors
+to the six heading levels. Setext text and underlines use the heading level's
+color. Unordered and ordered list markers have their own color, and ordinary
+list text uses the terminal foreground. Recognize YAML frontmatter bounded by `---`
 on the first logical line and a later standalone `---` line, accepting LF and
 CRLF. An unmatched opener follows ordinary Markdown rules. In backtick and
 tilde fences, take the first whitespace-delimited word of the info string and
@@ -142,7 +145,9 @@ keys, language IDs and how to obtain the bundled queries as starting points.
   user theme. Each `[themes.<name>]` entry sets `base` to `dark` or `light`
   and supplies any overrides in `[themes.<name>.colors]`. Accept ANSI color
   names and `#RRGGBB` foreground values for documented capture categories.
-  Unspecified categories inherit the base. Reject duplicate or reserved theme
+  Unspecified categories inherit the base. An explicit `markup` override fills
+  unspecified `heading_1`–`heading_6` colors. An explicit `punctuation` override
+  fills an unspecified `list_marker` color. Reject duplicate or reserved theme
   names and unknown categories. The F2 choice lasts for the session and the
   file supplies the persistent default. On reload, retain an explicit session
   choice that still exists. Otherwise use the file's default or Dark.
@@ -328,7 +333,7 @@ relaxing limits.
 | ID | Required observable evidence |
 | --- | --- |
 | H01 | Fixtures assert semantic categories by logical byte range for each listed language, including representative incomplete text. Adding a registry entry yields detection, chooser and styling without TUI changes. A release build highlights offline on both platforms. |
-| H02 | Markdown fixtures cover block/inline, task markers, tables and strikethrough; first-line YAML with LF/CRLF and unterminated/noninitial delimiters; tilde/backtick, indented and unclosed fences with known, unknown and absent identifiers. HTML fixtures assert JavaScript/CSS within HTML, unknown types staying neutral, and embedding within an HTML fence. Check original offsets and multiline context when scrolled. |
+| H02 | Markdown fixtures cover block/inline, six heading levels, Setext underlines, ordered and unordered list markers, task markers, tables and strikethrough; first-line YAML with LF/CRLF and unterminated/noninitial delimiters; tilde/backtick, indented and unclosed fences with known, unknown and absent identifiers. HTML fixtures assert JavaScript/CSS within HTML, unknown types staying neutral, and embedding within an HTML fence. Check original offsets and multiline context when scrolled. |
 | H03 | PTY and layout checks use keyboard/mouse to choose Language and Theme, cancel, resize and reach every option. Cover mixed-case suffixes, non-UTF-8 stems, unknown and unnamed tabs, Save As success/failure, manual override across refresh and switches, explicit Plain Text, and repaint without reparse on theme change. |
 | H04 | At sizes just below, at and above both byte limits, verify pre-read size rejection and offscreen long-line fallback. Include multibyte scalars, BOM, CRLF across read windows and trailing CR. Use a controlled clock/worker to force timeout during root parse, nested parse and query, and prove a real noncooperating helper is killed and reaped. Verify whole-document fallback, retained reason, no automatic timeout retry, explicit Retry and re-eligibility after shrinking. |
 | H05 | Synchronize old work against edit, Undo/Redo, Replace All, refresh, Save As, language switch, scroll/resize, tab switch, close and Quit. Gate preflight/transfer while verifying that foreground input and save/maintenance publication can proceed. Assert stale output is rejected, cancelled Quit keeps the tab usable, and leases/children are reclaimed. Inject read failure, helper memory exhaustion, helper exit and malformed replies, including a mid-scalar endpoint and a span over unmapped text. Verify fallback and recovery. In a job-control PTY, suspend with an active uncooperative helper, verify analysis has stopped while the editor is suspended, then resume and verify terminal modes and fresh results. |
@@ -555,3 +560,13 @@ tests also passed locally with a hard limit of 512. The full workspace
 suite passed in release mode. The [follow-up CI matrix](https://github.com/rapidclock/ede/actions/runs/43755157165)
 passed for `9802a1c`, including the low-limit workspace tests on both hosts
 and all Linux constrained-memory checks.
+
+The Markdown palette follow-up adds H02 terminal assertions for six distinct
+heading colors, Setext text and underlines, all five list marker forms,
+neutral prose and switching to Plain Text. Its H09 terminal check covers
+per-heading and list-marker overrides, inherited `markup` and `punctuation`
+colors, and a custom Markdown query across a palette reload. Both checks
+failed before the palette change and passed in debug and release on macOS.
+Independent review and worker probes against `6d0125be` found no production
+issues and verified partial heading projections, nested Markdown and inline
+style precedence.

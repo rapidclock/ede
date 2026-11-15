@@ -158,6 +158,8 @@ base = "dark"
 [themes.Ocean.colors]
 keyword = "#68D5F7"
 comment = "bright-black"
+heading_2 = "bright-cyan"
+list_marker = "bright-yellow"
 
 [files.names]
 ".env" = "ini"
@@ -173,7 +175,14 @@ Theme bases are `dark` and `light`. Colors accept `#RRGGBB` or the ANSI names
 `black`, `red`, `green`, `yellow`, `blue`, `magenta`, `cyan`, and `white`, each
 with an optional `bright-` prefix. Category names are `comment`, `string`,
 `number`, `keyword`, `type`, `property`, `markup`, `function`, `constant`,
-`operator`, `punctuation`, `variable`, `tag`, `attribute`, and `code`.
+`operator`, `punctuation`, `variable`, `tag`, `attribute`, `code`,
+`heading_1` through `heading_6`, and `list_marker`.
+
+Markdown headings have a different color for each level, including headings
+underlined with `=` or `-`. List marker colors cover bullets and ordered list
+numbers with their punctuation. In custom themes, an explicit `markup` color
+also applies to any heading level without its own override. An explicit
+`punctuation` color applies to list markers when `list_marker` is unspecified.
 
 Language IDs are `markdown`, `toml`, `yaml`, `json`, `javascript`, `typescript`,
 `python`, `rust`, `ini`, `xml`, `html`, and `css`. Association targets can also

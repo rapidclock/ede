@@ -31,34 +31,45 @@ const TIMEOUT: Duration = Duration::from_secs(5);
 fn markdown_source_renders_syntax_colors() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("notes.md");
-    std::fs::write(&path, b"# Heading\n\nOrdinary prose\n").unwrap();
+    std::fs::write(
+        &path,
+        concat!(
+            "# Heading\n## Second\n### Third\n#### Fourth\n##### Fifth\n###### Sixth\n\n",
+            "Setext One\n==========\n\nSetext Two\n----------\n\n",
+            "- Dash\n+ Plus\n* Star\n\n1. Dot\n\n1) Paren\n\nOrdinary prose\n",
+        ),
+    )
+    .unwrap();
     let mut process = PtyChild::editor_with_path(Some("xterm-256color"), Some(&path));
     process.expect("# Heading");
-    let deadline = Instant::now() + TIMEOUT;
-    while process.parser.screen().cell(1, 2).unwrap().fgcolor() == vt100::Color::Default {
-        assert!(
-            Instant::now() < deadline,
-            "Markdown heading stayed uncolored: {} {:?}",
-            process.parser.screen().contents(),
-            String::from_utf8_lossy(&process.output)
+    for (index, color) in [13, 14, 12, 10, 11, 9].into_iter().enumerate() {
+        syntax_color(&mut process, index as u16 + 1, 0, vt100::Color::Idx(color));
+        syntax_color(
+            &mut process,
+            index as u16 + 1,
+            index as u16 + 2,
+            vt100::Color::Idx(color),
         );
-        process.drain();
-        thread::sleep(Duration::from_millis(5));
     }
-    assert_eq!(
-        process.parser.screen().cell(3, 0).unwrap().fgcolor(),
-        vt100::Color::Default
-    );
+    for (row, color) in [(8, 13), (9, 13), (11, 14), (12, 14)] {
+        syntax_color(&mut process, row, 0, vt100::Color::Idx(color));
+    }
+    for (row, marker_len) in [(14, 1), (15, 1), (16, 1), (18, 2), (20, 2)] {
+        for column in 0..marker_len {
+            syntax_color(&mut process, row, column, vt100::Color::Idx(11));
+        }
+        syntax_color(&mut process, row, marker_len + 1, vt100::Color::Default);
+    }
+    process.expect("Ordinary prose");
+    syntax_color(&mut process, 22, 0, vt100::Color::Default);
     let open_language = [b"\x1bOQ".as_slice(), &b"\x1b[B".repeat(27), b"\r"].concat();
     process.send(&open_language);
     process.expect("Auto (Markdown)");
     process.send(b"\x1b[B\r");
     process.expect_absent("Auto (Markdown)");
     process.expect("# Heading");
-    assert_eq!(
-        process.parser.screen().cell(1, 2).unwrap().fgcolor(),
-        vt100::Color::Default
-    );
+    syntax_color(&mut process, 1, 2, vt100::Color::Default);
+    syntax_color(&mut process, 14, 0, vt100::Color::Default);
     process.send(b"\x11");
     assert!(process.wait().success());
     process.assert_restored();
@@ -2064,11 +2075,53 @@ fn syntax_color(process: &mut PtyChild, line: u16, column: u16, color: vt100::Co
         }
         assert!(
             Instant::now() < deadline,
-            "waiting for {color:?}: {}",
+            "waiting for {color:?} at ({line}, {column}): {}",
             process.parser.screen().contents()
         );
         thread::sleep(Duration::from_millis(5));
     }
+}
+
+/// Custom colors and query captures can address headings and list markers independently.
+#[test]
+fn markdown_theme_can_override_headings_and_list_markers() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("notes.md");
+    let config = directory.path().join("ede");
+    let queries = config.join("queries/markdown");
+    std::fs::create_dir_all(&queries).unwrap();
+    std::fs::write(&path, "# One\n## Two\n\n- Dash\n+ Plus\n").unwrap();
+    let file = config.join("highlighting.toml");
+    let base = concat!(
+        "default_theme = 'Notes'\n[themes.Notes]\nbase = 'light'\n",
+        "[themes.Notes.colors]\nmarkup = '#884411'\nheading_2 = '#225588'\n",
+        "punctuation = '#664488'\n",
+    );
+    std::fs::write(&file, format!("{base}list_marker = '#116633'\n")).unwrap();
+    std::fs::write(
+        queries.join("highlights.scm"),
+        "(list_marker_plus) @heading_2\n",
+    )
+    .unwrap();
+    let mut process = PtyChild::editor_with_options(
+        Some("xterm-256color"),
+        [&path],
+        None,
+        Some(directory.path()),
+        None,
+    );
+    process.expect("## Two");
+    syntax_color(&mut process, 1, 2, vt100::Color::Rgb(0x88, 0x44, 0x11));
+    syntax_color(&mut process, 2, 3, vt100::Color::Rgb(0x22, 0x55, 0x88));
+    syntax_color(&mut process, 4, 0, vt100::Color::Rgb(0x11, 0x66, 0x33));
+    syntax_color(&mut process, 5, 0, vt100::Color::Rgb(0x22, 0x55, 0x88));
+    std::fs::write(&file, base.replace("#225588", "#334499")).unwrap();
+    syntax_action(&mut process, 29);
+    syntax_color(&mut process, 4, 0, vt100::Color::Rgb(0x66, 0x44, 0x88));
+    syntax_color(&mut process, 5, 0, vt100::Color::Rgb(0x33, 0x44, 0x99));
+    process.send(b"\x11");
+    assert!(process.wait().success());
+    process.assert_restored();
 }
 
 /// H09: real fresh config, palette repaint, user query, failed reload, and reset.

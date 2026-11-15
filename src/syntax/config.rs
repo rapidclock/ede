@@ -35,9 +35,13 @@ impl Palette {
     /// Built-in colors with equivalent contrast intent on dark and light terminals.
     fn built_in(light: bool) -> Self {
         let values = if light {
-            [8, 2, 5, 4, 6, 4, 5, 4, 5, 0, 8, 4, 5, 6, 2]
+            [
+                8, 2, 5, 4, 6, 4, 5, 4, 5, 0, 8, 4, 5, 6, 2, 5, 6, 4, 2, 1, 8, 4,
+            ]
         } else {
-            [8, 10, 13, 14, 11, 12, 13, 12, 13, 15, 7, 12, 14, 11, 10]
+            [
+                8, 10, 13, 14, 11, 12, 13, 12, 13, 15, 7, 12, 14, 11, 10, 13, 14, 12, 10, 11, 9, 11,
+            ]
         };
         Self(values.map(Foreground::Ansi))
     }
@@ -182,13 +186,27 @@ impl Config {
                 Some("light") => Palette::built_in(true),
                 _ => return Err(format!("{name}: base must be dark or light")),
             };
-            for (key, value) in take_table(&mut theme, "colors")? {
-                let category = Category::named(&key)
+            let colors = take_table(&mut theme, "colors")?;
+            for (key, value) in &colors {
+                let category = Category::named(key)
                     .ok_or_else(|| format!("{name}: unknown category {key:?}"))?;
                 let color = value.as_str().and_then(color).ok_or_else(|| {
                     format!("{name}.{key}: expected an ANSI color name or #RRGGBB")
                 })?;
                 palette.0[category as usize] = color;
+            }
+            // Preserve explicitly themed markup and punctuation for older custom themes.
+            if colors.contains_key("markup") {
+                for &(category, key) in
+                    &Category::ALL[Category::Heading1 as usize..=Category::Heading6 as usize]
+                {
+                    if !colors.contains_key(key) {
+                        palette.0[category as usize] = palette.color(Category::Markup);
+                    }
+                }
+            }
+            if colors.contains_key("punctuation") && !colors.contains_key("list_marker") {
+                palette.0[Category::ListMarker as usize] = palette.color(Category::Punctuation);
             }
             empty(&theme, &name)?;
             themes.insert(name, palette);

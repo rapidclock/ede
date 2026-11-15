@@ -127,6 +127,13 @@ pub(crate) enum Category {
     Tag,
     Attribute,
     Code,
+    Heading1,
+    Heading2,
+    Heading3,
+    Heading4,
+    Heading5,
+    Heading6,
+    ListMarker,
 }
 
 impl Category {
@@ -147,6 +154,13 @@ impl Category {
         (Self::Tag, "tag"),
         (Self::Attribute, "attribute"),
         (Self::Code, "code"),
+        (Self::Heading1, "heading_1"),
+        (Self::Heading2, "heading_2"),
+        (Self::Heading3, "heading_3"),
+        (Self::Heading4, "heading_4"),
+        (Self::Heading5, "heading_5"),
+        (Self::Heading6, "heading_6"),
+        (Self::ListMarker, "list_marker"),
     ];
 
     /// Read a canonical name from user configuration.
