@@ -1,9 +1,9 @@
 # ede
 
 A Rust terminal text editor for macOS and Linux, built in reviewed stages.
-Current version: **0.0.1-dev.5**. Stage 5 adds persistent scratches and automatic file refresh.
+Current version: **0.0.1-dev.6**. Stage 6 adds literal search and atomic replacement.
 See the [MVP overview](specs/001_initial_mvp/overview.md) and the
-[Stage 5 validation record](specs/001_initial_mvp/05_scratch_recovery.md#validation-record).
+[Stage 6 validation record](specs/001_initial_mvp/06_search_and_replace.md#validation-record).
 
 ## Build and run
 
@@ -21,7 +21,7 @@ cargo run --locked -- -- -filename.txt
 Run in a terminal with a usable `TERM`, at least 40 columns by 8 rows. Smaller
 windows preserve work and show a resize prompt; return to a supported size to
 answer unsaved-change prompts. `--help` and `--version` work without a terminal.
-Pipes, search, and highlighting belong to later stages.
+Pipes and syntax highlighting belong to later stages.
 
 Opening validates a private UTF-8 snapshot in the background. Its initial preview
 is read-only; Escape cancels preparation. Once ready, files remain editable
@@ -45,6 +45,8 @@ binary data report errors.
 | Move / extend selection | Arrows, Home, End, Page Up/Down; Shift extends | Same |
 | Document start / end | Ctrl+Home / Ctrl+End | Same |
 | Go to line or line:cell | Ctrl+G; numbers start at 1 | Same |
+| Find / Replace | Ctrl+F / Ctrl+H | Cmd+F / Cmd+H |
+| Next / previous match | F3 / Shift+F3 | Same |
 | Help / actions | F1 / F2 | Same |
 | Leave text / previous control | F6 / Shift+F6 | Same |
 | Activate / cancel | Enter / Escape | Same |
@@ -59,6 +61,21 @@ scrolling, and undo history. Use the Tabs button or Actions → Tabs to select o
 close a tab outside the strip. Actions → Tab details shows the active file's
 path. The strip marks active (`>`), modified (`*`), waiting (`…`), loading
 (`↓`), queued save (`⇡`), saving (`↑`), scratch (`~`), and attention (`!`).
+
+Find and Replace search the current document or all open tabs, including unsaved
+scratches. Queries are literal, with optional Unicode case folding and whole-word
+matching. Tab / Shift+Tab cycles panel controls; F6 returns to text. Fields accept
+up to 4096 UTF-8 bytes and preserve literal paste. Insert Tab, LF and CRLF controls
+insert actual characters; displayed escapes are not query syntax. Portable
+Backspace uses DEL (`0x7f`); Ctrl+H (`0x08`) opens Replace.
+
+F3 / Shift+F3 wraps explicitly. Replace next reveals a match before changing it
+and advances without wrapping. Replace all confirms the scope with Cancel selected
+initially. Each changed document gets one Undo step; replacement does not save
+files. Cross-tab failures preserve completed documents and report unprocessed
+ones in Search summary. Escape cancels active work, then closes the panel.
+Search highlights the exact match separately from ordinary selection; navigation
+clears the old selection and keeps the caret on a grapheme boundary.
 
 Open starts in the active file's parent directory or the launch directory.
 Use arrows or the wheel to select an entry and Enter to open it. Up and the
@@ -194,6 +211,9 @@ EDE_BENCH_MIB=1024 EDE_PASTE_MIB=64 cargo test --release --locked --test termina
   large_recovery_and_refresh_benchmark -- --ignored --exact --nocapture
 EDE_BENCH_MIB=1024 cargo test --release --locked --lib \
   document::refresh::tests::large_refresh_storage_measurements -- --ignored --exact --nocapture
+EDE_BENCH_MIB=1024 EDE_BENCH_CORPUS=ordinary EDE_BENCH_PEAK_RSS=1 \
+  cargo test --release --locked --test terminal \
+  large_search_and_replace_benchmark -- --ignored --exact --nocapture
 cargo test --locked --test terminal isolated_tmux_editing_and_suspend_smoke \
   -- --ignored --exact --nocapture
 ```
@@ -205,8 +225,10 @@ middle and end, and checks saving during edits. Corpus choices are `ordinary`,
 `dense`, and `long`; sizes are MiB. Fixtures are isolated and removed afterwards.
 Generated files are warm, and a PTY observer does not measure a graphical terminal
 or remote transport. Linux CI exercises storage, editing, scratch recovery, and
-refresh with 256 MiB and swap disabled. Native and CI measurements are recorded
-in the Stage 5 validation record.
+refresh and search/replacement with 256 MiB and swap disabled. The search benchmark
+counts and replaces one marker per MiB, measures input during a dense-match scan,
+cancels, verifies saved bytes, and undoes. Native and CI measurements are recorded
+in the Stage 5 and Stage 6 validation records.
 
 The resource probe runs the coordinator and UI against ordinary, dense, long-line
 and mixed Unicode files. It records managed allocation high waters, working-file

@@ -11,7 +11,12 @@ impl AppState {
     }
 
     pub(super) fn paste_target(&self) -> PasteTarget {
-        if self.field_open() && self.focus == Some(Control::PathField) {
+        if self.search_field_focused() {
+            return PasteTarget::SearchField(self.field_generation, self.search.field);
+        }
+        if self.field_open()
+            && (self.focus == Some(Control::PathField) || self.search_field_focused())
+        {
             PasteTarget::Field(self.field_generation)
         } else if self.editor_focused() && self.ready() && self.guard_request.is_none() {
             PasteTarget::Tab(self.screen.tab)

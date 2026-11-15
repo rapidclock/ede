@@ -12,6 +12,7 @@ use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use std::{collections::VecDeque, path::PathBuf, sync::Arc, time::Duration};
 mod dialogs;
 pub(crate) mod recovery;
+pub(crate) mod search;
 
 /// Effects performed by the runtime, never by drawing or hit-testing.
 #[derive(Clone, Debug)]
@@ -34,6 +35,7 @@ pub(crate) enum PathKind {
 /// Only one overlay owns keyboard and pointer interaction at a time.
 #[derive(Clone, Debug)]
 pub(crate) enum Modal {
+    ReplaceAll(crate::editor::search::SearchRequest),
     Menu(usize),
     Path(PathKind, String),
     Open(Box<picker::Dialog>),
@@ -61,6 +63,7 @@ enum FieldEdit {
 }
 /// Preserve ordering without doing clipboard file I/O on the terminal thread.
 struct FieldPaste {
+    search_field: Option<u8>,
     generation: u64,
     edits: Vec<FieldEdit>,
     bytes: usize,
@@ -69,11 +72,13 @@ struct FieldPaste {
 /// The receiving surface owns the complete bracketed paste, even if focus changes.
 enum PasteTarget {
     Field(u64),
+    SearchField(u64, u8),
     Tab(Option<TabId>),
     Ignore,
 }
 /// Shell state contains only bounded prepared data; document bytes remain with storage.
 pub(crate) struct AppState {
+    pub search: search::Panel,
     pub help: bool,
     pub help_scroll: u16,
     pub modal: Option<Modal>,
@@ -107,6 +112,7 @@ pub(crate) struct AppState {
     field_generation: u64,
     field_paste: Option<FieldPaste>,
     field_submit: Option<u64>,
+    search_submit_field: Option<u8>,
     pub field_error: Option<String>,
 }
 /// Discoverable menu actions; every item shares keyboard command dispatch.
@@ -131,11 +137,19 @@ pub(crate) const MENU: &[(Command, &str)] = &[
     (Command::TabDetails, "Tab details"),
     (Command::Recovery, "Recovery"),
     (Command::RetryRefresh, "Retry refresh"),
+    (Command::Find, "Find                Ctrl+F / Cmd+F"),
+    (Command::Replace, "Replace             Ctrl+H"),
+    (Command::FindNext, "Find next           F3"),
+    (Command::FindPrevious, "Find previous       Shift+F3"),
+    (Command::ReplaceNext, "Replace next"),
+    (Command::ReplaceAll, "Replace all"),
+    (Command::CancelSearch, "Cancel search"),
 ];
 impl AppState {
     /// Begin with text focus and a visible asynchronous preparation state.
     pub fn new() -> Self {
         Self {
+            search: search::Panel::default(),
             help: false,
             help_scroll: 0,
             modal: None,
@@ -169,6 +183,7 @@ impl AppState {
             field_generation: 0,
             field_paste: None,
             field_submit: None,
+            search_submit_field: None,
             field_error: None,
         }
     }
@@ -190,10 +205,13 @@ impl AppState {
     }
 
     fn field_open(&self) -> bool {
-        matches!(self.modal, Some(Modal::Path(..) | Modal::Open(_)))
+        matches!(self.modal, Some(Modal::Path(..) | Modal::Open(_))) || self.search_field_focused()
     }
     /// Preserve valid focus and invalidate capture after geometry or overlay changes.
     pub fn sync_layout(&mut self, layout: &LayoutSnapshot) {
+        if let Some(Control::Search(index @ (0 | 1))) = self.focus {
+            self.search.field = index;
+        }
         if layout.next(None, false).is_none() {
             self.capture = None;
             return;
@@ -299,6 +317,7 @@ impl AppState {
                 self.guard_return = None;
                 self.field_paste = None;
                 self.field_submit = None;
+                self.search_submit_field = None;
                 self.guarded_path = None;
                 self.guard_request = None;
                 self.save_dialog = None;
@@ -390,11 +409,15 @@ impl AppState {
                     self.field_paste = Some(pending);
                     return None;
                 }
-                if !self.field_open() {
+                if !self.field_open()
+                    && !(pending.search_field.is_some() && self.search.open && self.modal.is_none())
+                {
                     return None;
                 }
                 let mut accepted = match result {
-                    Ok(text) => self.apply_field_edit(FieldEdit::Text(text)),
+                    Ok(text) => {
+                        self.apply_target_field_edit(pending.search_field, FieldEdit::Text(text))
+                    }
                     Err(error) => {
                         self.field_message(&error);
                         false
@@ -402,7 +425,7 @@ impl AppState {
                 };
                 let mut error = self.field_error.clone();
                 for edit in pending.edits {
-                    if !self.apply_field_edit(edit) {
+                    if !self.apply_target_field_edit(pending.search_field, edit) {
                         accepted = false;
                         error = self.field_error.clone();
                     }
@@ -414,6 +437,13 @@ impl AppState {
                     self.field_submit = Some(generation);
                 }
                 self.dirty = true;
+                if let Some(field) = pending.search_field {
+                    return Some(Intent::Editor(if field == 1 {
+                        Action::InvalidateReplacement
+                    } else {
+                        Action::InvalidateSearch
+                    }));
+                }
             }
         }
         None
@@ -477,6 +507,7 @@ impl AppState {
         self.field_generation = self.field_generation.wrapping_add(1);
         self.field_paste = None;
         self.field_submit = None;
+        self.search_submit_field = None;
         self.field_error = None;
         self.save_dialog = None;
         self.path_tab = self.screen.tab;
@@ -531,6 +562,10 @@ impl AppState {
         match input {
             Input::Command(command) => self.command(command, layout),
             Input::Text(text) => {
+                if self.search_field_focused() {
+                    self.edit_field(FieldEdit::Text(text));
+                    return Some(self.search_field_changed());
+                }
                 if self.field_open() && self.focus == Some(Control::PathField) {
                     self.edit_field(FieldEdit::Text(text));
                 } else if self.editor_focused() && self.ready() && self.guard_request.is_none() {
@@ -558,6 +593,25 @@ impl AppState {
                             return None;
                         }
                         self.field_paste = Some(FieldPaste {
+                            search_field: None,
+                            generation,
+                            edits: Vec::new(),
+                            bytes: 0,
+                            submit: false,
+                        });
+                        Some(Intent::Editor(Action::FieldPaste(paste, generation)))
+                    }
+                    PasteTarget::SearchField(generation, field)
+                        if generation == self.field_generation
+                            && self.search.open
+                            && self.modal.is_none() =>
+                    {
+                        if self.field_paste.is_some() {
+                            self.field_message("Busy: field paste rejected");
+                            return None;
+                        }
+                        self.field_paste = Some(FieldPaste {
+                            search_field: Some(field),
                             generation,
                             edits: Vec::new(),
                             bytes: 0,
@@ -609,6 +663,12 @@ impl AppState {
     }
     /// Handle named commands once for keyboard/menu/buttons, preserving modal ownership.
     fn command(&mut self, mut command: Command, layout: &LayoutSnapshot) -> Option<Intent> {
+        if let Some(result) = self.search_command(command, layout) {
+            return result;
+        }
+        if command == Command::PreviousControl {
+            command = Command::FocusPrevious;
+        }
         if command == Command::Cancel {
             if self.guard_request.is_some() && (layout.area.width < 40 || layout.area.height < 8) {
                 return None;
@@ -618,6 +678,7 @@ impl AppState {
             }
             self.field_paste = None;
             self.field_submit = None;
+            self.search_submit_field = None;
             self.save_dialog = None;
             let guarded = self.guard_request.is_some();
             let picker = matches!(self.modal, Some(Modal::Open(_)));
@@ -690,6 +751,7 @@ impl AppState {
                     if self.focus == Some(Control::PathCancel) {
                         self.field_paste = None;
                         self.field_submit = None;
+                        self.search_submit_field = None;
                         self.modal = None;
                         self.focus = Some(Control::Content);
                         let guarded = self.guard_request.is_some();
@@ -937,6 +999,13 @@ impl AppState {
             return None;
         }
         match command {
+            Command::Find
+            | Command::Replace
+            | Command::FindNext
+            | Command::FindPrevious
+            | Command::ReplaceNext
+            | Command::ReplaceAll
+            | Command::CancelSearch => self.search_command(command, layout).flatten(),
             Command::Quit => {
                 if self.switching.is_some() {
                     return None;
@@ -961,6 +1030,7 @@ impl AppState {
                 self.field_error = None;
                 self.field_paste = None;
                 self.field_submit = None;
+                self.search_submit_field = None;
                 self.opener = self.focus;
                 self.help = false;
                 self.modal = Some(Modal::Open(Box::new(picker::Dialog::new(
@@ -1104,6 +1174,26 @@ impl AppState {
         if !self.mouse_capture {
             return None;
         }
+        if self.search.open
+            && self.modal.is_none()
+            && matches!(
+                layout.hit(mouse.column, mouse.row),
+                Some(Control::Search(_))
+            )
+            && matches!(
+                mouse.kind,
+                MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+            )
+        {
+            let controls = self.search.controls();
+            self.search.row = if mouse.kind == MouseEventKind::ScrollUp {
+                self.search.row.saturating_sub(1)
+            } else {
+                (self.search.row + 1).min(controls.len().saturating_sub(2))
+            };
+            self.dirty = true;
+            return None;
+        }
         if matches!(
             mouse.kind,
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
@@ -1120,7 +1210,10 @@ impl AppState {
                     (*index + 1).min(MENU.len() - 1)
                 };
             } else if self.help
-                || matches!(self.modal, Some(Modal::Details(_) | Modal::SaveError(_)))
+                || matches!(
+                    self.modal,
+                    Some(Modal::Details(_) | Modal::SaveError(_) | Modal::ReplaceAll(_))
+                )
             {
                 self.help_scroll = if up {
                     self.help_scroll.saturating_sub(3)
@@ -1244,7 +1337,7 @@ impl AppState {
         let view = self.screen.view.as_ref()?;
         if view.generation != layout.generation
             || view.width != layout.area.width
-            || view.height != layout.area.height.saturating_sub(2)
+            || view.height != layout.content_height()
         {
             self.message("View pending; retry selection when ready");
             return None;
@@ -1254,7 +1347,7 @@ impl AppState {
             .min(layout.area.width.saturating_sub(1));
         let y = y
             .saturating_sub(layout.area.y + 1)
-            .min(layout.area.height.saturating_sub(3));
+            .min(layout.content_height().saturating_sub(1));
         let caret = view.rows.get(y as usize).map_or_else(
             || view.rows.last().map_or(0, |row| row.end),
             |row| row.hit(view.left + x as u64),
@@ -1279,7 +1372,11 @@ impl AppState {
             && layout.area.height >= 8
         {
             self.field_submit = None;
-            self.focus = Some(Control::PathField);
+            self.focus = self
+                .search_submit_field
+                .take()
+                .map(Control::Search)
+                .or(Some(Control::PathField));
             return self.command(Command::Newline, layout);
         }
         if now.saturating_sub(self.last_drag) < Duration::from_millis(50) {
@@ -1295,7 +1392,7 @@ impl AppState {
         }
         let vertical = if capture.y <= layout.area.y {
             -1
-        } else if capture.y >= layout.area.bottom() - 1 {
+        } else if capture.y >= layout.area.y + 1 + layout.content_height() {
             1
         } else {
             0
@@ -1358,6 +1455,15 @@ impl AppState {
     }
     /// Admit bounded edits behind the asynchronous paste, preserving their arrival order.
     fn edit_field(&mut self, edit: FieldEdit) {
+        let target = self.search_field_focused().then_some(self.search.field);
+        if self
+            .field_paste
+            .as_ref()
+            .is_some_and(|pending| pending.search_field != target)
+        {
+            self.apply_field_edit(edit);
+            return;
+        }
         if let Some(pending) = &mut self.field_paste {
             let bytes = match &edit {
                 FieldEdit::Text(text) => text.len(),
@@ -1375,10 +1481,23 @@ impl AppState {
     }
     /// Apply field data without interpreting any pasted control bytes as commands.
     fn apply_field_edit(&mut self, edit: FieldEdit) -> bool {
-        let field = match &mut self.modal {
-            Some(Modal::Path(_, field)) => field,
-            Some(Modal::Open(picker)) => &mut picker.field,
-            _ => return false,
+        let target = self.search_field_focused().then_some(self.search.field);
+        self.apply_target_field_edit(target, edit)
+    }
+    /// Paste completion targets its original field even after the user changes focus.
+    fn apply_target_field_edit(&mut self, target: Option<u8>, edit: FieldEdit) -> bool {
+        let field = if let Some(field) = target {
+            if field == 1 {
+                &mut self.search.replacement
+            } else {
+                &mut self.search.query.literal
+            }
+        } else {
+            match &mut self.modal {
+                Some(Modal::Path(_, field)) => field,
+                Some(Modal::Open(picker)) => &mut picker.field,
+                _ => return false,
+            }
         };
         match edit {
             FieldEdit::Text(text) => {

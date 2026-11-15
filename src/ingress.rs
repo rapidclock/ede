@@ -378,7 +378,7 @@ fn decode(bytes: &[u8]) -> Decoded {
             0 => return key(KeyCode::Char(' '), KeyModifiers::CONTROL, press),
             9 => KeyCode::Tab,
             10 | 13 => KeyCode::Enter,
-            127 | 8 => KeyCode::Backspace,
+            127 => KeyCode::Backspace,
             1..=26 => {
                 return key(
                     KeyCode::Char((bytes[0] + b'a' - 1) as char),
