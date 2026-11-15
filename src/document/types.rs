@@ -135,7 +135,7 @@ impl Cancellation {
         }
     }
     /// Return a typed cancellation failure at a safe operation boundary.
-    pub(super) fn check(&self) -> Result<(), Error> {
+    pub(crate) fn check(&self) -> Result<(), Error> {
         if self.is_cancelled() {
             Err(Error::Cancelled)
         } else {
@@ -162,6 +162,8 @@ pub enum Error {
     InvalidRange,
     /// A mutation did not name the current revision.
     StaleRevision,
+    /// Current document capability forbids editing or replacement.
+    ReadOnly,
     /// Operation stopped before its commit point.
     Cancelled,
     /// A configured resource budget would be exceeded.
@@ -193,6 +195,7 @@ impl fmt::Display for Error {
             Self::SourceChanged => f.write_str("Source changed while opening; retry explicitly"),
             Self::InvalidRange => f.write_str("Invalid text range"),
             Self::StaleRevision => f.write_str("Document revision changed"),
+            Self::ReadOnly => f.write_str("Document is read-only"),
             Self::Cancelled => f.write_str("Operation cancelled"),
             Self::ResourceLimit(reason) => write!(f, "Storage resource limit: {reason}"),
             Self::SaveConflict => f.write_str("Destination changed; save conflict"),
@@ -242,6 +245,10 @@ pub enum IoPoint {
     DirectorySync,
     /// Verify the published destination identity.
     Verify,
+    /// Observe private-generation disposal on the reclaimer; errors are ignored.
+    Cleanup,
+    /// Observe atomic edit publication before acknowledgement; errors are ignored.
+    EditCommitted,
 }
 /// Optional failure/interleaving seam for deterministic filesystem tests.
 pub trait FaultInjector: Send + Sync + fmt::Debug {

@@ -262,7 +262,7 @@ fn append_replacement(
         bytes: offset,
         lines: store.source.lines(first, offset)?,
     };
-    let super::source::Store { tree, source, .. } = &mut *store;
+    let super::source::StoreData { tree, source, .. } = &mut **store;
     let state = State {
         root: tree.initial(piece, source)?,
         format: input.format(),

@@ -26,6 +26,7 @@ pub(crate) struct TabSummary {
 /// The active or a parked document's editor state. Only the active tab has a layout.
 #[derive(Default)]
 pub(super) struct TabState {
+    pub(super) capability: crate::search::Capability,
     pub(super) input: Arc<InputEpoch>,
     pub screen: Screen,
     pub info: Option<DocumentInfo>,

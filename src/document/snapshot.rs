@@ -21,6 +21,10 @@ pub struct Snapshot {
     pub(super) blocking_leases: Option<Arc<AtomicUsize>>,
 }
 impl Snapshot {
+    /// Charge a background client's resident work against the shared buffer pool.
+    pub(crate) fn reserve_work(&self, bytes: usize) -> Result<Permit, Error> {
+        self.reader.source.resources.buffers.acquire(bytes)
+    }
     /// Originating document identity, retained after close for stale-result checks.
     pub fn document(&self) -> DocumentId {
         self.document

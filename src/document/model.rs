@@ -126,7 +126,7 @@ impl Document {
             bytes: version.len - skip,
             lines: store.source.index.total(),
         };
-        let root = store.tree.initial(piece, &store.source)?;
+        let root = store.initial(piece)?;
         store.original_longest = validator.longest;
         let state = State {
             root,
@@ -152,7 +152,7 @@ impl Document {
         resources: Arc<Resources>,
     ) -> Result<Self, Error> {
         let (mut store, _) = Store::empty(&options, resources, None)?;
-        let root = store.tree.initial(Entry::default(), &store.source)?;
+        let root = store.initial(Entry::default())?;
         let state = State {
             root,
             format: Format::default(),
@@ -285,8 +285,26 @@ impl Document {
     /// Commit one fully staged transaction or leave content, revision and history unchanged.
     pub fn apply_staged(
         &mut self,
+        transaction: StagedTransaction,
+        cancel: &Cancellation,
+    ) -> Result<Revision, Error> {
+        self.apply_staged_with_compaction(transaction, cancel, true)
+    }
+    /// Private forks retain source/tree offsets for live and in-flight save roots.
+    /// Compaction is an owner maintenance decision after the guarded handoff.
+    pub(super) fn apply_private_staged(
+        &mut self,
+        transaction: StagedTransaction,
+        cancel: &Cancellation,
+    ) -> Result<Revision, Error> {
+        self.apply_staged_with_compaction(transaction, cancel, false)
+    }
+    /// Shared atomic staging path, optionally reclaiming owner-safe generations.
+    fn apply_staged_with_compaction(
+        &mut self,
         mut transaction: StagedTransaction,
         cancel: &Cancellation,
+        compact: bool,
     ) -> Result<Revision, Error> {
         if transaction.document != self.id || transaction.expected != self.revision {
             return Err(Error::StaleRevision);
@@ -294,7 +312,7 @@ impl Document {
         cancel.check()?;
         let next_revision = self.next_revision()?;
         let needs_compaction = self.requires_compaction()?;
-        if needs_compaction {
+        if compact && needs_compaction {
             self.compact(cancel)?;
         }
         let mut store = self.store.lock().map_err(|_| Error::CorruptStorage)?;
@@ -426,9 +444,7 @@ impl Document {
                         lines: store.source.lines(source_start, length)?,
                     })
                 };
-                root = store
-                    .tree
-                    .replace(root, start, end, piece, &store.source, cancel)?;
+                root = store.replace_root(root, start, end, piece, cancel)?;
                 changed = true;
             }
             tail = record_start;

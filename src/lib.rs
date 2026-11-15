@@ -9,6 +9,7 @@ mod input;
 mod picker;
 mod recovery;
 mod runtime;
+pub mod search;
 mod spool;
 pub mod status;
 mod terminal;

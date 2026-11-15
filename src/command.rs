@@ -18,12 +18,20 @@ pub(crate) enum Movement {
 /// Actions independent of their invoking device.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Command {
+    Find,
+    Replace,
+    FindNext,
+    FindPrevious,
+    ReplaceNext,
+    ReplaceAll,
+    CancelSearch,
     Quit,
     Help,
     Menu,
     Cancel,
     FocusNext,
     FocusPrevious,
+    PreviousControl,
     Activate,
     New,
     Open,
@@ -79,6 +87,17 @@ use KeyCode as K;
 use KeyModifiers as M;
 /// Portable defaults plus explicit delivered Super/Cmd aliases. No blanket modifier substitution.
 pub(crate) const BINDINGS: &[Binding] = &[
+    Binding::new(K::Char('f'), M::CONTROL, C::Find, "Ctrl+F"),
+    Binding::new(K::Char('f'), M::SUPER, C::Find, "Cmd+F"),
+    Binding::new(K::Char('h'), M::CONTROL, C::Replace, "Ctrl+H"),
+    Binding::new(
+        K::Char('h'),
+        M::SUPER.union(M::SHIFT),
+        C::Replace,
+        "Cmd+Shift+H",
+    ),
+    Binding::new(K::F(3), M::NONE, C::FindNext, "F3"),
+    Binding::new(K::F(3), M::SHIFT, C::FindPrevious, "Shift+F3"),
     Binding::new(K::Char('q'), M::CONTROL, C::Quit, "Ctrl+Q"),
     Binding::new(K::Char('n'), M::CONTROL, C::New, "Ctrl+N"),
     Binding::new(K::Char('o'), M::CONTROL, C::Open, "Ctrl+O"),
@@ -122,7 +141,7 @@ pub(crate) const BINDINGS: &[Binding] = &[
     Binding::new(K::F(8), M::NONE, C::NextTab, "F8"),
     Binding::new(K::Esc, M::NONE, C::Cancel, "Escape"),
     Binding::new(K::Tab, M::NONE, C::Tab, "Tab"),
-    Binding::new(K::BackTab, M::SHIFT, C::FocusPrevious, "Shift+Tab"),
+    Binding::new(K::BackTab, M::SHIFT, C::PreviousControl, "Shift+Tab"),
     Binding::new(K::Enter, M::NONE, C::Newline, "Enter"),
     Binding::new(K::Backspace, M::NONE, C::Backspace, "Backspace"),
     Binding::new(K::Delete, M::NONE, C::Delete, "Delete"),
@@ -131,12 +150,20 @@ impl Command {
     /// Human-readable name shared by keyboard help and command discovery.
     pub(crate) const fn label(self) -> &'static str {
         match self {
+            Self::Find => "Find",
+            Self::Replace => "Replace",
+            Self::FindNext => "Find next",
+            Self::FindPrevious => "Find previous",
+            Self::ReplaceNext => "Replace next",
+            Self::ReplaceAll => "Replace all",
+            Self::CancelSearch => "Cancel search",
             Self::Quit => "Quit",
             Self::Help => "Help",
             Self::Menu => "Actions",
             Self::Cancel => "Cancel",
             Self::FocusNext => "Next control",
             Self::FocusPrevious => "Previous control",
+            Self::PreviousControl => "Previous field/control",
             Self::Activate => "Activate",
             Self::New => "New",
             Self::Open => "Open",
