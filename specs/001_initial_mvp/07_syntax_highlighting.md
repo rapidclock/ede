@@ -393,9 +393,8 @@ the focused reducer and PTY checks.
 The separately locked [Rust probe](../../examples/syntax_probe/Cargo.toml)
 builds published generated grammars with a C compiler, using this inventory.
 The probe uses Tree-sitter `0.27.2` (MIT). The listed grammars declare MIT
-except INI, which declares Apache-2.0. Any distributed builds need applicable
-license and copyright notices. The notice inventory for upstream query assets
-and transitive dependencies is pending.
+except INI, which declares Apache-2.0. The release uses the assets at the pinned
+crate revisions and includes the [Stage 7 dependency notices](../../licenses/stage07).
 
 | Grammar crate | Version | Grammar ABI |
 | --- | --- | --- |
@@ -443,7 +442,71 @@ place before that timer. These runs used warm binary/cache state.
 The dense run demonstrates that a deadline alone does not enforce the helper
 memory budget. Inspection of the published C sources found direct libc
 allocations in the Markdown and Python scanners, which bypass Tree-sitter's
-allocator hook. A helper-wide allocation ceiling that covers native scanners,
-independent deadline enforcement, Linux feasibility, and integrated H08 tests
-under 256 MiB with swap disabled remain pending. Tree-sitter remains a candidate.
-Its dependencies are confined to the probe until the engine decision.
+allocator hook. This baseline was measured before linking the editor's capped
+worker. The subsequent implementation and validation are recorded below.
+
+### Integrated implementation checks on 2026-11-15
+
+The editor build uses the selected grammars above, `tree-sitter` `0.27.2`,
+`toml` `1.2.1+spec-1.1.0`, and `rlsf` `0.2.3`. The private helper receives an
+immutable UTF-8 snapshot through pipes. Rust allocations and the linked
+Tree-sitter and scanner allocator entry points share one 64 MiB anonymous
+mapping. Darwin uses linker aliases and Linux uses GNU-compatible link wraps.
+The editor runs on the system allocator. An independent Darwin disassembly
+check verified that the Markdown and Python scanners call the arena aliases.
+
+The editor-side syntax allowance includes 396 KiB of working reservation,
+up to two 194 KiB published copies, and a 224 KiB plus 256-byte reservation
+for the 48 KiB transfer window with the default storage page size. Snapshot
+leases use the existing background storage admission. The receiver checks the
+projection nonce, syntax category, glyph boundaries, and complete mapped
+coverage before publishing. It shrinks the working reservation to the retained
+range allocation and releases the tab's projection when parking the tab.
+
+- H01–H02 — Installed helper fixtures cover every grammar, Markdown inline
+  and block syntax, unclosed fences, the strict YAML prefix, quoted/indented
+  embeddings with disjoint offsets, eligible HTML types, and neutral unknown
+  types. Runtime assertions check the worker's allocation routing counters.
+- H03/H06 — PTY checks verify source coloring, per-tab language choice across
+  Save As and switches, syntax foreground under selection and current search
+  matches, wide and combining text, and fallback with editable/searchable
+  text. The layout-floor test exercises keyboard and mouse at 40×8.
+- H04/H05 — Tests cover CRLF across transfer windows, standalone CR, byte
+  limits, offscreen line fallback and refresh recovery, invalid helper offsets
+  and IDs, stale viewport failure, and a real uncooperative child killed and
+  reaped at deadline and on suspension. Sixty-four highlighted tabs retain
+  an available foreground edit/save budget. Isolated mutations reproduced
+  the stale viewport fallback and parked-tab projection leak. An embedded
+  host PTY mutation reproduced re-execution of the host when the helper was
+  incorrectly inferred from the process executable.
+- H07 — A synthetic retained read-only tab remains searchable, projects its
+  manual Rust choice from an immutable snapshot, rejects the earlier viewport
+  after retained-base eviction, and keeps its choice through editable EOF.
+  Real pipe ingestion follows in Stage 8.
+- H09 — PTY checks exercise a custom palette, association, query, palette-only
+  repaint, failed reload, and removal of overrides. A gated loader test proves
+  a superseded revision cannot publish. Helper tests cover the Markdown inline
+  query, later user capture priority and valid/invalid query source.
+
+On native macOS 27.2 arm64 (MacBookPro18,2, 32 GiB RAM, local APFS), the
+stripped release executable is 8,113,408 bytes. The release helper heap-ceiling
+test `oversized_projection_reaches_fixed_heap_ceiling`, timed with
+`/usr/bin/time -l`, exited with the budget code and 48,807,936 bytes peak RSS.
+The H08 release PTY `large_highlighting_and_search_overlap` used a warm
+20,889,622-byte Rust document and an allocated 1 GiB file in an inactive tab.
+It observed syntax worker CPU while search scanned the 1 GiB tab. First text
+took 173.8 ms. Eight ordinary input samples had a 20.3 ms maximum. Sampled
+RSS during the scan was 7,056 KiB for the editor and 26,880 KiB for its worker.
+The editor command's kernel lifetime peak was 26,976 KiB. The metrics cover
+the local PTY and its prepared files. Native Linux CI exercises the same
+overlap under a 256 MiB no-swap cgroup. The first Linux attempt was killed at
+the cgroup limit while using a fixture generator that synced only at EOF.
+The benchmark now syncs and drops prepared pages in intervals on Linux and
+reports when fixture preparation finishes.
+
+The integrated local workspace run passed 247 tests with nine opt-in checks
+ignored. The capped helper and 1 GiB overlap release probes passed separately
+on macOS. Formatting and Clippy passed with warnings denied. Independent
+engine and runtime re-reviews found no remaining production blockers after
+the fixes. Physical terminals, tmux and remote transports were outside this
+validation run.

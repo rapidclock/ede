@@ -226,3 +226,30 @@ impl Status {
         }
     }
 }
+
+#[cfg(test)]
+/// Project a synthetic stream's immutable snapshot using the real preflight and engine.
+pub(crate) fn project_snapshot_for_test(
+    snapshot: &crate::document::Snapshot,
+    view: &crate::text::View,
+    language: &'static Language,
+) -> Vec<Styled> {
+    let mut source = Vec::new();
+    limits::transfer(
+        snapshot,
+        &crate::document::Cancellation::default(),
+        &mut source,
+    )
+    .unwrap();
+    let deadline = std::time::Instant::now() + wire::ANALYSIS;
+    let analysis = engine::Analysis::new(
+        String::from_utf8(source).unwrap(),
+        language,
+        &config::Rules::default(),
+        deadline,
+    )
+    .unwrap();
+    analysis
+        .project(&projection::GlyphRun::collect(view).unwrap(), deadline)
+        .unwrap()
+}

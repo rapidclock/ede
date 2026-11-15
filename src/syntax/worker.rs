@@ -499,6 +499,7 @@ mod tests {
             session
         };
         let mut process = make_child();
+        let pid = control.state.lock().unwrap().child.as_ref().unwrap().1.id();
         let start = Instant::now();
         let cancel = Cancellation::default();
         assert_eq!(
@@ -510,6 +511,13 @@ mod tests {
         drop(process);
         assert!(control.status(id).is_none());
         assert!(control.state.lock().unwrap().child.is_none());
+        assert_eq!(
+            nix::sys::wait::waitpid(
+                nix::unistd::Pid::from_raw(pid as i32),
+                Some(nix::sys::wait::WaitPidFlag::WNOHANG)
+            ),
+            Err(nix::errno::Errno::ECHILD),
+        );
 
         let mut process = make_child();
         let epoch = control.pause();

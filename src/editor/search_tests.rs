@@ -936,3 +936,70 @@ fn review_quit_during_postreplacement_maintenance_is_not_lost() {
         "Quit was deferred behind maintenance without a completion replay"
     );
 }
+
+/// H07: retained read-only text and editable EOF use one tab choice and fresh logical offsets.
+#[test]
+fn retained_revision_highlighting_rebases_and_override_survives_eof() {
+    use crate::syntax::{Category, Choice, ViewKey, project_snapshot_for_test};
+
+    let mut worker = super::tests::coordinator(OpenOptions::default());
+    worker
+        .action(Action::Insert("one\nfn item() {}\n".into()))
+        .unwrap();
+    worker.tab.capability = crate::search::Capability::ReadOnly;
+    let tab = worker.tab.screen.tab.unwrap();
+    let document = worker.tab.screen.document.unwrap();
+    let language = Choice::options()
+        .find_map(|choice| match choice {
+            Choice::Syntax(language) if language.id == "rust" => Some(language),
+            _ => None,
+        })
+        .unwrap();
+    worker
+        .action(Action::SetLanguage(tab, Choice::Syntax(language)))
+        .unwrap();
+    worker
+        .action(Action::Search(request(search::Operation::Next)))
+        .unwrap();
+    settle(&mut worker);
+    assert_eq!(worker.search.status.total(), 1);
+    let old = worker.snapshot().unwrap();
+    let view = worker.tab.screen.view.as_ref().unwrap();
+    let old_key = ViewKey::new(tab, document, view);
+    let spans = project_snapshot_for_test(&old, view, language);
+    assert!(
+        spans
+            .iter()
+            .any(|span| span.start == 4 && span.category == Category::Keyword)
+    );
+
+    // Simulate retained-base eviction by changing the authoritative storage
+    // revision without using the read-only tab's user edit path.
+    let response = worker
+        .call(Request::Replace {
+            document,
+            expected: old.revision(),
+            range: TextRange::new(0, 4).unwrap(),
+            text: String::new(),
+        })
+        .unwrap();
+    assert!(matches!(response, Response::Changed { .. }));
+    worker.refresh().unwrap();
+    worker.tab.screen.position = Position::default();
+    worker.layout(false).unwrap();
+    let next = worker.snapshot().unwrap();
+    let view = worker.tab.screen.view.as_ref().unwrap();
+    assert_ne!(ViewKey::new(tab, document, view), old_key);
+    let spans = project_snapshot_for_test(&next, view, language);
+    assert!(
+        spans
+            .iter()
+            .any(|span| span.start == 0 && span.category == Category::Keyword)
+    );
+
+    worker.tab.capability = crate::search::Capability::Editable;
+    assert_eq!(worker.tab.screen.tab, Some(tab));
+    assert_eq!(worker.tab.screen.syntax_language, Choice::Syntax(language));
+    worker.action(Action::Insert("// EOF\n".into())).unwrap();
+    assert_eq!(worker.tab.screen.syntax_language, Choice::Syntax(language));
+}

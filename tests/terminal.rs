@@ -2197,13 +2197,30 @@ fn large_highlighting_and_search_overlap() {
     let mut writer = File::create(&large).unwrap();
     let block = b"ordinary-search-data\n".repeat(1 << 15);
     let mut size = 0u64;
+    let mut synced = 0u64;
     while size < 1 << 30 {
         let bytes = (block.len() as u64).min((1 << 30) - size) as usize;
         writer.write_all(&block[..bytes]).unwrap();
         size += bytes as u64;
+        if size - synced >= 8 << 20 {
+            writer.sync_data().unwrap();
+            #[cfg(target_os = "linux")]
+            nix::fcntl::posix_fadvise(
+                &writer,
+                synced as i64,
+                (size - synced) as i64,
+                nix::fcntl::PosixFadviseAdvice::POSIX_FADV_DONTNEED,
+            )
+            .unwrap();
+            synced = size;
+        }
     }
     writer.sync_all().unwrap();
     drop(writer);
+    eprintln!(
+        "highlight_search fixtures_ready active_bytes={} inactive_bytes={size}",
+        std::fs::metadata(&syntax).unwrap().len()
+    );
 
     let started = Instant::now();
     let mut process = PtyChild::editor_with_args(Some("xterm-256color"), [&syntax, &large]);
@@ -2279,6 +2296,7 @@ fn large_highlighting_and_search_overlap() {
         max_input = max_input.max(event.elapsed());
     }
     process.send(b"\x1b");
+    process.expect_absent("Scope: All open");
     process.send(b"\x13");
     process.expect_with_timeout("Saved", Duration::from_secs(30));
     process.send(b"\x11");
@@ -2290,4 +2308,34 @@ fn large_highlighting_and_search_overlap() {
         max_input.as_secs_f64() * 1000.0
     );
     process.report_peak_rss();
+}
+
+/// H06: projected source style covers the entire grapheme and yields to selection and search.
+#[test]
+fn syntax_color_yields_to_selection_and_current_match() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("style.md");
+    std::fs::write(&path, "# Note 界e\u{301}\tend\n").unwrap();
+    let mut process = PtyChild::editor_with_path(Some("xterm-256color"), Some(&path));
+    process.expect("# Note 界e\u{301}");
+    syntax_color(&mut process, 1, 2, vt100::Color::Idx(13));
+    syntax_color(&mut process, 1, 7, vt100::Color::Idx(13));
+    process.send(b"\x01");
+    syntax_color(&mut process, 1, 2, vt100::Color::Idx(15));
+    assert_eq!(
+        process.parser.screen().cell(1, 7).unwrap().bgcolor(),
+        vt100::Color::Idx(4)
+    );
+    process.send(b"\x06Note\r");
+    process.expect("1 match");
+    syntax_color(&mut process, 1, 2, vt100::Color::Idx(0));
+    assert_eq!(
+        process.parser.screen().cell(1, 2).unwrap().bgcolor(),
+        vt100::Color::Idx(5)
+    );
+    process.send(b"\x1b");
+    process.expect_absent("Find:");
+    process.send(b"\x11");
+    assert!(process.wait().success());
+    process.assert_restored();
 }
