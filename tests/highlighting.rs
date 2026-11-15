@@ -279,3 +279,22 @@ fn quoted_markdown_fence_has_logical_frontmatter() {
     assert_eq!(reply.at(source, "> title"), Some(10));
     assert_eq!(reply.at(source, "Done"), Some(6));
 }
+
+/// Recovery still highlights unambiguous properties, values and punctuation around invalid text.
+#[test]
+fn incomplete_json_and_css_keep_distinct_styles() {
+    let json = r#"{"key":42,"broken": ]"#;
+    let reply = Reply::parse(run_worker(request(4, json, &[])));
+    for (token, category) in [("{", 10), ("\"key\"", 5), (":", 10), ("42", 2), (",", 10)] {
+        assert_eq!(
+            reply.at(json, token),
+            Some(category),
+            "{token:?}: {reply:?}"
+        );
+    }
+    let css = "p { display: grid; color: red; }\n.broken {";
+    let reply = Reply::parse(run_worker(request(12, css, &[])));
+    for (token, category) in [("display", 5), ("grid", 8), ("red", 8)] {
+        assert_eq!(reply.at(css, token), Some(category), "{token:?}: {reply:?}");
+    }
+}

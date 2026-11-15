@@ -504,9 +504,14 @@ the cgroup limit while using a fixture generator that synced only at EOF.
 The benchmark now syncs and drops prepared pages in intervals on Linux and
 reports when fixture preparation finishes.
 
-The integrated local workspace run passed 247 tests with nine opt-in checks
+The integrated local workspace run passed 248 tests with nine opt-in checks
 ignored. The capped helper and 1 GiB overlap release probes passed separately
 on macOS. Formatting and Clippy passed with warnings denied. Independent
 engine and runtime re-reviews found no remaining production blockers after
 the fixes. Physical terminals, tmux and remote transports were outside this
 validation run.
+
+Linux's unoptimized debug build timed out on the combined nested-language
+fixture. The development profile optimizes the Tree-sitter runtime, regular
+expression dependencies and fixed-arena allocator. The runtime deadlines
+and release profile are identical to the approved implementation.

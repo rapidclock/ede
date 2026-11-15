@@ -221,7 +221,17 @@ impl Analysis {
         check(deadline)?;
         let (grammar, source) = grammar(id);
         if !self.queries.contains_key(id) {
-            let built_in = Query::new(&grammar, source).map_err(|_| Fallback::Worker)?;
+            let extra = match id {
+                "json" => r#"["{" "}" "[" "]" ":" ","] @punctuation.delimiter"#,
+                "css" => "(declaration (plain_value) @constant)",
+                _ => "",
+            };
+            let built_in = if extra.is_empty() {
+                Query::new(&grammar, source)
+            } else {
+                Query::new(&grammar, &format!("{source}\n{extra}"))
+            }
+            .map_err(|_| Fallback::Worker)?;
             let custom = rules
                 .queries
                 .get(id)

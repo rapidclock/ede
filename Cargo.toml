@@ -45,6 +45,19 @@ missing_docs = "warn"
 name = "ede"
 path = "src/bin/ede.rs"
 
+# Keep nested grammar and query work within the same deadline in local debug builds.
+[profile.dev.package.tree-sitter]
+opt-level = 2
+
+[profile.dev.package.regex]
+opt-level = 2
+
+[profile.dev.package.regex-automata]
+opt-level = 2
+
+[profile.dev.package.rlsf]
+opt-level = 2
+
 [profile.release]
 opt-level = 3          # Maximum runtime speed (use "z" or "s" to prioritize binary size)
 lto = true             # Fat link-time optimization across all crates (use "thin" for faster builds)
