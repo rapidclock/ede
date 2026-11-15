@@ -160,6 +160,8 @@ keyword = "#68D5F7"
 comment = "bright-black"
 heading_2 = "bright-cyan"
 list_marker = "bright-yellow"
+ordered_list_marker = "bright-cyan"
+quote_marker = "bright-blue"
 
 [files.names]
 ".env" = "ini"
@@ -176,13 +178,26 @@ Theme bases are `dark` and `light`. Colors accept `#RRGGBB` or the ANSI names
 with an optional `bright-` prefix. Category names are `comment`, `string`,
 `number`, `keyword`, `type`, `property`, `markup`, `function`, `constant`,
 `operator`, `punctuation`, `variable`, `tag`, `attribute`, `code`,
-`heading_1` through `heading_6`, and `list_marker`.
+`heading_1` through `heading_6`, `list_marker`, `ordered_list_marker`,
+`quote_marker`, `code_delimiter`, `fence_language`, `emphasis`,
+`strong_emphasis`, `strikethrough`, `link`, `link_target`, `task_checked`,
+`task_unchecked`, `table_header`, and `separator`.
 
 Markdown headings have a different color for each level, including headings
-underlined with `=` or `-`. List marker colors cover bullets and ordered list
-numbers with their punctuation. In custom themes, an explicit `markup` color
-also applies to any heading level without its own override. An explicit
-`punctuation` color applies to list markers when `list_marker` is unspecified.
+underlined with `=` or `-`. Bullets, numbered markers, task boxes, and quote marks
+remain distinct in nested lists and quotes. Ordinary prose keeps its terminal
+color. Inline backticks and fence delimiters are distinct from code text.
+Fences with a recognized language use that language's syntax colors. Markdown
+also distinguishes emphasis, strong emphasis, strikethrough, link labels and
+targets, table headings and separators, and raw HTML. Reference links and
+images use link colors when the current Markdown document defines their label.
+
+Custom themes can set each category directly. An explicit `markup` override
+also supplies heading, emphasis, link, task box, and table heading colors that
+have no override of their own. Ordered lists inherit an explicitly configured
+`list_marker` when `ordered_list_marker` is absent. Explicit `punctuation`
+supplies unspecified list markers, quote markers, code delimiters, and
+separators. Explicit `code` supplies an unspecified `fence_language`.
 
 Language IDs are `markdown`, `toml`, `yaml`, `json`, `javascript`, `typescript`,
 `python`, `rust`, `ini`, `xml`, `html`, and `css`. Association targets can also

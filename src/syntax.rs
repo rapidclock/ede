@@ -134,6 +134,19 @@ pub(crate) enum Category {
     Heading5,
     Heading6,
     ListMarker,
+    OrderedListMarker,
+    QuoteMarker,
+    CodeDelimiter,
+    FenceLanguage,
+    Emphasis,
+    StrongEmphasis,
+    Strikethrough,
+    Link,
+    LinkTarget,
+    TaskChecked,
+    TaskUnchecked,
+    TableHeader,
+    Separator,
 }
 
 impl Category {
@@ -161,7 +174,34 @@ impl Category {
         (Self::Heading5, "heading_5"),
         (Self::Heading6, "heading_6"),
         (Self::ListMarker, "list_marker"),
+        (Self::OrderedListMarker, "ordered_list_marker"),
+        (Self::QuoteMarker, "quote_marker"),
+        (Self::CodeDelimiter, "code_delimiter"),
+        (Self::FenceLanguage, "fence_language"),
+        (Self::Emphasis, "emphasis"),
+        (Self::StrongEmphasis, "strong_emphasis"),
+        (Self::Strikethrough, "strikethrough"),
+        (Self::Link, "link"),
+        (Self::LinkTarget, "link_target"),
+        (Self::TaskChecked, "task_checked"),
+        (Self::TaskUnchecked, "task_unchecked"),
+        (Self::TableHeader, "table_header"),
+        (Self::Separator, "separator"),
     ];
+
+    /// Inherit explicitly overridden colors from earlier, broader theme categories.
+    fn theme_parent(self) -> Option<Self> {
+        use Category::*;
+        Some(match self {
+            Heading1 | Heading2 | Heading3 | Heading4 | Heading5 | Heading6 | Emphasis
+            | StrongEmphasis | Strikethrough | Link | LinkTarget | TaskChecked | TaskUnchecked
+            | TableHeader => Markup,
+            ListMarker | QuoteMarker | CodeDelimiter | Separator => Punctuation,
+            OrderedListMarker => ListMarker,
+            FenceLanguage => Code,
+            _ => return None,
+        })
+    }
 
     /// Read a canonical name from user configuration.
     fn named(name: &str) -> Option<Self> {

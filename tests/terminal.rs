@@ -54,9 +54,15 @@ fn markdown_source_renders_syntax_colors() {
     for (row, color) in [(8, 13), (9, 13), (11, 14), (12, 14)] {
         syntax_color(&mut process, row, 0, vt100::Color::Idx(color));
     }
-    for (row, marker_len) in [(14, 1), (15, 1), (16, 1), (18, 2), (20, 2)] {
+    for (row, marker_len, color) in [
+        (14, 1, 11),
+        (15, 1, 11),
+        (16, 1, 11),
+        (18, 2, 14),
+        (20, 2, 14),
+    ] {
         for column in 0..marker_len {
-            syntax_color(&mut process, row, column, vt100::Color::Idx(11));
+            syntax_color(&mut process, row, column, vt100::Color::Idx(color));
         }
         syntax_color(&mut process, row, marker_len + 1, vt100::Color::Default);
     }
@@ -70,6 +76,137 @@ fn markdown_source_renders_syntax_colors() {
     process.expect("# Heading");
     syntax_color(&mut process, 1, 2, vt100::Color::Default);
     syntax_color(&mut process, 14, 0, vt100::Color::Default);
+    process.send(b"\x11");
+    assert!(process.wait().success());
+    process.assert_restored();
+}
+
+/// A mixed Markdown page keeps structural marks, code, and inline meaning distinguishable.
+#[test]
+fn markdown_mixed_source_uses_distinct_styles() {
+    use vt100::Color::{Default, Idx};
+
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("guide.md");
+    let lines = [
+        "# Reference",
+        "1. Ordered step",
+        "   - Child bullet",
+        "     1) Grandchild number",
+        "2. Next step",
+        "",
+        "- Parent bullet",
+        "  1. Child number",
+        "     + Grandchild bullet",
+        "- [ ] Pending",
+        "- [x] Done",
+        "",
+        "> Plain quote with *light*, **strong**, ~~old~~, and `code`.",
+        "> Continuation with `` `literal` `` and \\* escape.",
+        "> > Nested quote.",
+        ">",
+        "> ```rust",
+        "> let answer = 42;",
+        "> ```",
+        "",
+        "~~~unknown",
+        "# literal > inside fence",
+        "~~~",
+        "",
+        "    - indented literal",
+        "",
+        "Name | Count",
+        ":--- | ---:",
+        "`x` | **two**",
+        "",
+        "[Visible](https://example.test \"title\") and ![Picture](p.png)",
+        "[Shortcut] and [Full][Shortcut] and [Shortcut][]",
+        "",
+        "[Shortcut]: https://example.test/reference \"Ref title\"",
+        "",
+        "See <https://example.test> <a@example.test> &amp; &#42; and <kbd>Enter</kbd>.",
+        "",
+        "Break\\",
+        "next line",
+        "",
+        "***",
+        "",
+        "<div class=\"example\">",
+        "<!-- HTML note -->",
+        "</div>",
+    ];
+    std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+    let mut process = PtyChild::editor_with_path(Some("xterm-256color"), Some(&path));
+    process.expect("# Reference");
+    process.resize(100, 48);
+    process.expect("HTML note");
+    for (sample, offset, color) in [
+        ("1. Ordered", 0, Idx(14)),
+        ("- Child bullet", 0, Idx(11)),
+        ("1) Grandchild", 1, Idx(14)),
+        ("2. Next", 0, Idx(14)),
+        ("- Parent bullet", 0, Idx(11)),
+        ("1. Child number", 1, Idx(14)),
+        ("+ Grandchild", 0, Idx(11)),
+        ("[ ] Pending", 1, Idx(11)),
+        ("[x] Done", 1, Idx(10)),
+        ("Child bullet", 0, Default),
+        ("> Plain quote", 0, Idx(12)),
+        ("Plain quote", 0, Default),
+        ("> Continuation", 0, Idx(12)),
+        ("> > Nested", 2, Idx(12)),
+        ("*light*", 1, Idx(13)),
+        ("**strong**", 2, Idx(11)),
+        ("~~old~~", 2, Idx(8)),
+        ("`code`", 0, Idx(12)),
+        ("`code`", 1, Idx(10)),
+        ("`` `literal` ``", 1, Idx(12)),
+        ("`` `literal` ``", 3, Idx(10)),
+        ("\\* escape", 0, Idx(10)),
+        ("```rust", 0, Idx(12)),
+        ("```rust", 3, Idx(11)),
+        ("let answer", 0, Idx(14)),
+        ("answer = 42", 9, Idx(13)),
+        ("~~~unknown", 0, Idx(12)),
+        ("# literal >", 0, Idx(10)),
+        ("- indented literal", 0, Idx(10)),
+        ("Name | Count", 0, Idx(13)),
+        ("Name | Count", 5, Idx(8)),
+        (":--- | ---:", 0, Idx(8)),
+        ("`x` | **two**", 4, Idx(8)),
+        ("**two**", 2, Idx(11)),
+        ("[Visible]", 0, Idx(8)),
+        ("[Visible]", 1, Idx(14)),
+        ("(https://", 1, Idx(12)),
+        ("![Picture]", 2, Idx(14)),
+        ("[Full][Shortcut]", 1, Idx(14)),
+        ("[Shortcut][]", 1, Idx(14)),
+        ("https://example.test/reference", 0, Idx(12)),
+        ("<https://", 1, Idx(12)),
+        ("<a@example.test>", 1, Idx(12)),
+        ("&amp;", 0, Idx(13)),
+        ("&#42;", 0, Idx(13)),
+        ("<kbd>", 1, Idx(14)),
+        ("Enter", 0, Default),
+        ("Break\\", 5, Idx(10)),
+        ("***", 0, Idx(8)),
+        ("<div class", 1, Idx(14)),
+        ("class=", 0, Idx(11)),
+        ("<!-- HTML note", 0, Idx(8)),
+    ] {
+        let (row, column) = lines
+            .iter()
+            .enumerate()
+            .find_map(|(row, line)| line.find(sample).map(|column| (row, column)))
+            .unwrap();
+        syntax_color(
+            &mut process,
+            row as u16 + 1,
+            (column + offset) as u16,
+            color,
+        );
+    }
+    syntax_color(&mut process, 19, 2, Idx(12)); // Closing fence in the quote.
     process.send(b"\x11");
     assert!(process.wait().success());
     process.assert_restored();
@@ -2090,7 +2227,7 @@ fn markdown_theme_can_override_headings_and_list_markers() {
     let config = directory.path().join("ede");
     let queries = config.join("queries/markdown");
     std::fs::create_dir_all(&queries).unwrap();
-    std::fs::write(&path, "# One\n## Two\n\n- Dash\n+ Plus\n").unwrap();
+    std::fs::write(&path, "# One\n## Two\n\n- Dash\n+ Plus\n\n1. Numbered\n").unwrap();
     let file = config.join("highlighting.toml");
     let base = concat!(
         "default_theme = 'Notes'\n[themes.Notes]\nbase = 'light'\n",
@@ -2115,10 +2252,12 @@ fn markdown_theme_can_override_headings_and_list_markers() {
     syntax_color(&mut process, 2, 3, vt100::Color::Rgb(0x22, 0x55, 0x88));
     syntax_color(&mut process, 4, 0, vt100::Color::Rgb(0x11, 0x66, 0x33));
     syntax_color(&mut process, 5, 0, vt100::Color::Rgb(0x22, 0x55, 0x88));
+    syntax_color(&mut process, 7, 0, vt100::Color::Rgb(0x11, 0x66, 0x33));
     std::fs::write(&file, base.replace("#225588", "#334499")).unwrap();
     syntax_action(&mut process, 29);
     syntax_color(&mut process, 4, 0, vt100::Color::Rgb(0x66, 0x44, 0x88));
     syntax_color(&mut process, 5, 0, vt100::Color::Rgb(0x33, 0x44, 0x99));
+    syntax_color(&mut process, 7, 0, vt100::Color::Rgb(0x66, 0x44, 0x88));
     process.send(b"\x11");
     assert!(process.wait().success());
     process.assert_restored();

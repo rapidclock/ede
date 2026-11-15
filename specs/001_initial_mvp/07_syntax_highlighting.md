@@ -57,27 +57,36 @@ the previous selection and detection intact.
 | CSS | `.css` | | Selectors, properties, values, at-rules and comments |
 
 Markdown uses CommonMark source constructs plus GitHub-style pipe tables, task
-markers and strikethrough. Highlight headings, lists, quotes, emphasis, links,
-inline code, and fence delimiters. Both built-in themes assign distinct colors
-to the six heading levels. Setext text and underlines use the heading level's
-color. Unordered and ordered list markers have their own color, and ordinary
-list text uses the terminal foreground. Recognize YAML frontmatter bounded by `---`
+markers and strikethrough. Both built-in themes distinguish the six heading
+levels, including Setext text and underlines. Show different colors for bullets,
+ordered numbers and their punctuation, task boxes, and quote prefixes, including
+when those constructs nest. Ordinary prose uses the terminal foreground. Use
+separate colors for emphasis, strong emphasis and strikethrough, inline code and
+its backticks, and link labels and destinations. Highlight image syntax, link
+references, autolinks, entities, visible escapes and hard breaks, raw HTML, table
+headings and pipes, and thematic breaks. Table alignment rows and frontmatter
+delimiters use the same structural separator color. Resolve reference links and
+images against definitions in the current Markdown layer using CommonMark
+spacing and Unicode case folding. Recognize YAML frontmatter bounded by `---`
 on the first logical line and a later standalone `---` line, accepting LF and
 CRLF. An unmatched opener follows ordinary Markdown rules. In backtick and
 tilde fences, take the first whitespace-delimited word of the info string and
 resolve it ASCII case-insensitively through the registry. An unknown, absent,
-or `text`/`plain` identifier gives the body a neutral code style. Use the
-Markdown grammar's block and inline context so markers inside code are treated
-as source text for that code. An unclosed fence extends to EOF under ordinary
-Markdown fence rules.
+or `text`/`plain` identifier gives the body a neutral code style. Style the fence
+delimiters and language label separately from the body. Indented blocks use
+neutral code styling. Use the Markdown grammar's block and inline context so
+markers inside code are treated as source text for that code. An unclosed
+fence extends to EOF under ordinary Markdown fence rules.
 
 In HTML, parse bodies of `<script>` and `<style>` as JavaScript or CSS when
 `type` is omitted, empty, or recognized. Trim HTML whitespace and compare type
 values ASCII case-insensitively. Accept `module`, `text/javascript`, and
 `application/javascript` for scripts and `text/css` for styles. Keep unknown
 types neutral, including JSON data scripts. Apply the same HTML rules inside
-an HTML fence. Keep injection ranges inside their parent, and map every nested
-capture back to original logical bytes, including indented fences. Place
+Markdown HTML fences and raw HTML blocks. Recognized HTML comment blocks keep
+their comment color through the closing marker or EOF. Keep injection ranges
+inside their parent and map every nested capture back to original logical
+bytes, including indented fences. Place
 frontmatter, fence alias, and HTML type rules with syntax definitions.
 Treat INI values as text through the line end. A comment marker inside a value
 stays part of the value. Incomplete or malformed source still receives any
@@ -145,10 +154,10 @@ keys, language IDs and how to obtain the bundled queries as starting points.
   user theme. Each `[themes.<name>]` entry sets `base` to `dark` or `light`
   and supplies any overrides in `[themes.<name>.colors]`. Accept ANSI color
   names and `#RRGGBB` foreground values for documented capture categories.
-  Unspecified categories inherit the base. An explicit `markup` override fills
-  unspecified `heading_1`–`heading_6` colors. An explicit `punctuation` override
-  fills an unspecified `list_marker` color. Reject duplicate or reserved theme
-  names and unknown categories. The F2 choice lasts for the session and the
+  Unspecified categories inherit the base. Explicit broader colors supply
+  unspecified Markdown categories as documented in the
+  [theme guide](../../README.md#syntax-highlighting). Reject duplicate or
+  reserved theme names and unknown categories. The F2 choice lasts for the session and the
   file supplies the persistent default. On reload, retain an explicit session
   choice that still exists. Otherwise use the file's default or Dark.
 - **Associations.** `[files.names]` maps exact, case-sensitive basenames to a
@@ -304,6 +313,12 @@ Tree-sitter queries can style the syntax nodes exposed by the chosen grammar.
 Feasibility must exercise user-authored queries on bundled grammars, including
 invalid rules and costly matches, under the same analysis limits.
 [Tree-sitter query syntax](https://tree-sitter.github.io/tree-sitter/using-parsers/queries/1-syntax.html)
+
+Markdown reference resolution uses the dependency-free Rust `unicase` 2.9.0
+crate for full Unicode case folding. The Markdown block and inline parsers
+remain the pinned Tree-sitter grammars.
+[CommonMark reference labels](https://spec.commonmark.org/0.31.2/#link-label)
+· [UniCase](https://docs.rs/crate/unicase/2.9.0)
 
 Syntect was the alternative. Sublime syntax definitions and resumable line state
 offer a smaller integration surface if the bindings cover all required forms.
@@ -570,3 +585,22 @@ failed before the palette change and passed in debug and release on macOS.
 Independent review and worker probes against `6d0125be` found no production
 issues and verified partial heading projections, nested Markdown and inline
 style precedence.
+
+The broader Markdown follow-up adds a mixed-document PTY fixture that covers
+both directions of list nesting, all three emphasis styles, double-backtick
+spans, code fences and language labels, quote prefixes, task boxes, table
+pipes and alignment, links, entities, hard breaks, and raw HTML. The fixture
+first failed on the numbered marker color. Installed-worker regressions also
+failed before the fixes for unresolved and adjacent reference labels, closed
+and unclosed HTML comments, and a wrapped HTML opening tag inside a list.
+The reference fixtures include case folding, wrapped label whitespace, and
+independent scopes in fenced Markdown. A standalone Rust probe verified
+`unicase`'s full case folding before it was added to ede. License text is in
+the [Stage 7 dependency notices](../../licenses/stage07).
+
+The local macOS workspace suite passed 255 tests with nine opt-in checks
+ignored, with an inherited soft open-file limit of 256. Separate workspace
+runs hit intermittent failures in the existing mouse tab-overflow and failed
+recovery checkpoint tests. Each passed in isolation and in the full rerun.
+Independent review reproduced the reference and HTML boundary issues, then
+checked the fixes with the installed worker and the Markdown PTYs.

@@ -34,20 +34,55 @@ impl Default for Palette {
 impl Palette {
     /// Built-in colors with equivalent contrast intent on dark and light terminals.
     fn built_in(light: bool) -> Self {
-        let values = if light {
-            [
-                8, 2, 5, 4, 6, 4, 5, 4, 5, 0, 8, 4, 5, 6, 2, 5, 6, 4, 2, 1, 8, 4,
-            ]
-        } else {
-            [
-                8, 10, 13, 14, 11, 12, 13, 12, 13, 15, 7, 12, 14, 11, 10, 13, 14, 12, 10, 11, 9, 11,
-            ]
-        };
-        Self(values.map(Foreground::Ansi))
+        use Category::*;
+        let colors: [(Category, u8, u8); Category::ALL.len()] = [
+            // Category, Dark palette, Light palette.
+            (Comment, 8, 8),
+            (String, 10, 2),
+            (Number, 13, 5),
+            (Keyword, 14, 4),
+            (Type, 11, 6),
+            (Property, 12, 4),
+            (Markup, 13, 5),
+            (Function, 12, 4),
+            (Constant, 13, 5),
+            (Operator, 15, 0),
+            (Punctuation, 7, 8),
+            (Variable, 12, 4),
+            (Tag, 14, 5),
+            (Attribute, 11, 6),
+            (Code, 10, 2),
+            (Heading1, 13, 5),
+            (Heading2, 14, 6),
+            (Heading3, 12, 4),
+            (Heading4, 10, 2),
+            (Heading5, 11, 1),
+            (Heading6, 9, 8),
+            (ListMarker, 11, 4),
+            (OrderedListMarker, 14, 6),
+            (QuoteMarker, 12, 4),
+            (CodeDelimiter, 12, 4),
+            (FenceLanguage, 11, 5),
+            (Emphasis, 13, 5),
+            (StrongEmphasis, 11, 1),
+            (Strikethrough, 8, 8),
+            (Link, 14, 4),
+            (LinkTarget, 12, 6),
+            (TaskChecked, 10, 2),
+            (TaskUnchecked, 11, 5),
+            (TableHeader, 13, 5),
+            (Separator, 8, 8),
+        ];
+        let mut palette = [Foreground::Ansi(0); Category::ALL.len()];
+        for (category, dark_color, light_color) in colors {
+            palette[category as usize] =
+                Foreground::Ansi(if light { light_color } else { dark_color });
+        }
+        Self(palette)
     }
 
     /// Resolve a category without allocating or reading configuration.
-    pub(crate) fn color(self, category: Category) -> Foreground {
+    pub(crate) fn color(&self, category: Category) -> Foreground {
         self.0[category as usize]
     }
 }
@@ -186,27 +221,22 @@ impl Config {
                 Some("light") => Palette::built_in(true),
                 _ => return Err(format!("{name}: base must be dark or light")),
             };
-            let colors = take_table(&mut theme, "colors")?;
-            for (key, value) in &colors {
-                let category = Category::named(key)
+            let mut overrides = [None; Category::ALL.len()];
+            for (key, value) in take_table(&mut theme, "colors")? {
+                let category = Category::named(&key)
                     .ok_or_else(|| format!("{name}: unknown category {key:?}"))?;
                 let color = value.as_str().and_then(color).ok_or_else(|| {
                     format!("{name}.{key}: expected an ANSI color name or #RRGGBB")
                 })?;
-                palette.0[category as usize] = color;
+                overrides[category as usize] = Some(color);
             }
-            // Preserve explicitly themed markup and punctuation for older custom themes.
-            if colors.contains_key("markup") {
-                for &(category, key) in
-                    &Category::ALL[Category::Heading1 as usize..=Category::Heading6 as usize]
+            for &(category, _) in Category::ALL {
+                if let Some(color) =
+                    std::iter::successors(Some(category), |entry| entry.theme_parent())
+                        .find_map(|entry| overrides[entry as usize])
                 {
-                    if !colors.contains_key(key) {
-                        palette.0[category as usize] = palette.color(Category::Markup);
-                    }
+                    palette.0[category as usize] = color;
                 }
-            }
-            if colors.contains_key("punctuation") && !colors.contains_key("list_marker") {
-                palette.0[Category::ListMarker as usize] = palette.color(Category::Punctuation);
             }
             empty(&theme, &name)?;
             themes.insert(name, palette);

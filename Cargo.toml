@@ -19,6 +19,7 @@ signal-hook = { version = "0.4.5", default-features = false }
 tempfile = "3.27.0"
 unicode-segmentation = "1.13.3"
 unicode-width = "0.2.3"
+unicase = "=2.9.0"
 toml = "1.1.2"
 tree-sitter = "=0.27.2"
 tree-sitter-css = "=0.25.0"

@@ -12,6 +12,8 @@ use super::{
     projection::{GlyphRun, MAX_RANGES, Styled},
 };
 
+mod markdown;
+
 /// Markdown has two grammars. Its custom query uses the block grammar.
 pub(super) const INLINE: &str = "markdown-inline";
 const MAX_DEPTH: u8 = 8;
@@ -31,6 +33,7 @@ struct Layer {
     tree: Tree,
     depth: u8,
     ranges: Vec<Range>,
+    markdown_links: Option<markdown::ResolvedLinks>,
 }
 
 struct Compiled {
@@ -121,7 +124,8 @@ impl Analysis {
                         check(deadline)?;
                         for capture in found.captures() {
                             let name = names[capture.index as usize];
-                            let category = if custom {
+                            let category = if custom || matches!(layer.grammar, "markdown" | INLINE)
+                            {
                                 Category::named(name)
                             } else {
                                 builtin_category(name)
@@ -134,6 +138,15 @@ impl Analysis {
                                 continue;
                             }
                             if category.is_none() {
+                                continue;
+                            }
+                            if !custom
+                                && let Some(links) = &layer.markdown_links
+                                && !links.styles(
+                                    capture.node,
+                                    matches!(category, Some(Category::Link | Category::Separator)),
+                                )
+                            {
                                 continue;
                             }
                             let range = capture.node.byte_range();
@@ -258,7 +271,7 @@ impl Analysis {
             ] {
                 self.neutral.extend(
                     intersect(delimiter, ranges)
-                        .map(|range| (range, depth, Some(Category::Punctuation))),
+                        .map(|range| (range, depth, Some(Category::Separator))),
                 );
             }
             let yaml: Vec<_> = intersect(byte_range(bytes, opening_end, closing_start), ranges)
@@ -283,6 +296,7 @@ impl Analysis {
         check(deadline)?;
 
         let mut injections = Vec::new();
+        let mut references = markdown::References::default();
         if matches!(id, "markdown" | "html") {
             let mut cursor = tree.walk();
             loop {
@@ -295,6 +309,24 @@ impl Analysis {
                                 Some(INLINE),
                                 without_children(node, |node| node.kind() == "block_continuation"),
                             ));
+                            true
+                        }
+                        "html_block" | "ERROR"
+                            if node.kind() == "html_block"
+                                || markdown::is_list_html(node, data, ranges) =>
+                        {
+                            if !markdown::is_unclosed_html_comment(node, data, ranges) {
+                                injections.push((
+                                    Some("html"),
+                                    without_children(node, |node| {
+                                        node.kind() == "block_continuation"
+                                    }),
+                                ));
+                            }
+                            true
+                        }
+                        "link_reference_definition" => {
+                            references.add(node, data, ranges);
                             true
                         }
                         "fenced_code_block" => {
@@ -347,6 +379,7 @@ impl Analysis {
             tree,
             depth,
             ranges: ranges.to_vec(),
+            markdown_links: None,
         });
         for (injection, child_ranges) in injections {
             let child_ranges: Vec<_> = child_ranges
@@ -358,6 +391,7 @@ impl Analysis {
             }
             match injection {
                 Some(id) => {
+                    let child_layer = self.layers.len();
                     if id != INLINE {
                         // Unclassified child text inherits terminal foreground instead
                         // of the surrounding parent's markup or code capture.
@@ -365,6 +399,15 @@ impl Analysis {
                             .extend(child_ranges.iter().map(|range| (*range, depth + 1, None)));
                     }
                     self.add(id, &child_ranges, depth + 1, rules, parser, deadline)?;
+                    if id == INLINE {
+                        let layer = &mut self.layers[child_layer];
+                        layer.markdown_links = Some(references.resolve_inline(
+                            &layer.tree,
+                            self.source.as_bytes(),
+                            &layer.ranges,
+                            deadline,
+                        )?);
+                    }
                 }
                 None => self.neutral.extend(
                     child_ranges
@@ -604,9 +647,6 @@ fn builtin_category(name: &str) -> Option<Category> {
     Some(match name {
         "text.literal" => Code,
         "string.special.key" => Property,
-        _ if name.starts_with("heading_") || name == "list_marker" => {
-            return Category::named(name);
-        }
         _ => match name.split('.').next()? {
             "comment" => Comment,
             "string" | "character" | "escape" => String,
@@ -632,11 +672,7 @@ fn grammar(id: &str) -> (Grammar, &'static str) {
     match id {
         "markdown" => (
             tree_sitter_md::LANGUAGE.into(),
-            concat!(
-                include_str!("queries/markdown.scm"),
-                "\n",
-                "(task_list_marker_checked) @text.reference\n(task_list_marker_unchecked) @text.reference\n(pipe_table_delimiter_row) @punctuation.special"
-            ),
+            include_str!("queries/markdown.scm"),
         ),
         INLINE => (
             tree_sitter_md::INLINE_LANGUAGE.into(),
