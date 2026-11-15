@@ -12,26 +12,30 @@ and [Stage 06 search](06_search_and_replace.md) as integration baselines.
 ## Outcome and decision status
 
 Users see syntax colors while reading and editing supported UTF-8 text. They
-can choose a language or Plain Text for a tab and change the syntax theme for
-the session. Highlighting works offline. Document text appears as soon as the
-existing editor can display it. Editing, selection, navigation, search, and
-saving remain usable during highlighting and after any highlighting failure.
+can choose a language or Plain Text for a tab and use built-in or custom syntax
+colors. They can customize file associations and the highlighting rules of
+bundled grammars through local files. Highlighting works offline. Document
+text appears as soon as the existing editor can display it. Editing, selection,
+navigation, search, and saving remain usable during highlighting and after any
+highlighting failure.
 
 Required scope includes all eleven languages and the embedded cases below.
 The 20 MiB, 64 KiB, and 250 ms thresholds are already agreed starting defaults.
-The detection rules, interaction, palettes, dialect boundaries, worker design,
-and additional resource caps below form the proposal. Confirm the engine,
-grammar sources, and Markdown/INI dialects with the user before adding
-dependencies. No supported language or required embedding is deferred.
+The detection rules, customization format, interaction, palettes, dialect
+boundaries, worker design, and additional resource caps below form the proposal.
+Confirm the engine, grammar sources, and Markdown/INI dialects with the user
+before adding dependencies. No supported language or required embedding is deferred.
 
 ## Detection and language coverage
 
-In Auto, match only the final extension of the tab's current stored filename,
-ASCII case-insensitively. Match native filename bytes so a non-UTF-8 stem works.
+In Auto, match the tab's current stored filename using the precedence in
+[User customization](#user-customization). Built-in detection matches the
+final extension ASCII case-insensitively. Match native filename bytes so a
+non-UTF-8 stem works.
 Use the name the editor opened or committed with Save As, including for files
-opened through a symlink. An unnamed scratch, restored scratch, unknown
-extension, or basename with no extension starts in Plain Text. Ordinary edits
-and snapshot refreshes do not run content sniffing or change the language.
+opened through a symlink. An unnamed scratch starts in Plain Text, and named
+tabs with no matching association use Plain Text. Ordinary edits and snapshot
+refreshes do not run content sniffing or change the language.
 Re-evaluate Auto after a successful Save As, using its committed destination
 even if newer edits keep the tab dirty. A cancelled or failed Save As leaves
 the previous selection and detection intact.
@@ -78,9 +82,10 @@ default style.
 
 ## Commands and rendering
 
-- Add named `Language…`, `Syntax Theme…`, and `Retry Highlighting` actions to
-  the existing F2 Actions menu and help as appropriate. Reach the menu and
-  picker rows by keyboard and mouse. Use the existing dialog focus and
+- Add named `Language…`, `Syntax Theme…`, `Reload Highlighting`, and
+  `Retry Highlighting` actions to the existing F2 Actions menu and help as
+  appropriate. Reach the menu and picker rows by keyboard and mouse. Use the
+  existing dialog focus and
   scrolling conventions. Up/Down moves, Enter or a row click applies, and
   Escape dismisses without changes and returns focus. Keep all options
   reachable at 40×8; at a size too small to show the dialog, preserve the
@@ -94,7 +99,8 @@ default style.
   Applying a language or theme does not move the caret/selection, mark the
   tab modified, change its undo history, or write a file.
 - Syntax Theme is session-wide. Offer built-in Dark and Light palettes using
-  ANSI colors for a portable baseline; start in Dark. Map semantic categories
+  ANSI colors for a portable baseline, and list valid user themes alongside
+  them. Start with the configured default or Dark. Map semantic categories
   such as comment, string, number, keyword, type, property and markup to
   foreground colors. Theme changes restyle current spans without parsing.
   Preserve terminal-default colors for ordinary text and leave editor chrome
@@ -121,6 +127,59 @@ editable. Appends, truncations, retained-base changes and EOF conversion must
 provide a fresh revision or document identity whenever the logical coordinates
 or text change. Verify that contract with synthetic revisions in this stage and
 validate real ingestion in Stage 08.
+
+## User customization
+
+Proposed location on macOS and Linux is the `ede` directory under an absolute
+`XDG_CONFIG_HOME`, or `~/.config/ede` when that variable is unset or invalid.
+Load optional `highlighting.toml` and query files there. Missing files use
+bundled defaults. Load on startup and when `Reload Highlighting` is invoked.
+The editor owns this interface and documents the effective location, theme
+keys, language IDs and how to obtain the bundled queries as starting points.
+
+- **Colors.** In `highlighting.toml`, `default_theme` selects a built-in or
+  user theme. Each `[themes.<name>]` entry sets `base` to `dark` or `light`
+  and supplies any overrides in `[themes.<name>.colors]`. Accept ANSI color
+  names and `#RRGGBB` foreground values for documented capture categories.
+  Unspecified categories inherit the base. Reject duplicate or reserved theme
+  names and unknown categories. The F2 choice lasts for the session and the
+  file supplies the persistent default. On reload, retain an explicit session
+  choice that still exists. Otherwise use the file's default or Dark.
+- **Associations.** `[files.names]` maps exact, case-sensitive basenames to a
+  bundled language ID or `plain`. `[files.extensions]` maps final extensions
+  without dots, matching ASCII case-insensitively. Auto uses exact basename,
+  custom extension, built-in extension, then Plain Text in that order. Manual
+  language choices retain priority. `[fences.aliases]` adds or overrides
+  Markdown fence aliases for bundled languages or `plain`; it takes priority
+  over bundled names and aliases. Reserve `text` and `plain` after ASCII
+  case folding.
+  Reject extensions or fence aliases that duplicate another user entry after
+  ASCII case folding.
+- **Highlighting rules.** For the proposed Tree-sitter engine, an optional
+  `queries/<language-id>/highlights.scm` supplies capture patterns for a
+  bundled grammar's syntax tree. On overlapping captures in the same syntax
+  tree, matching user patterns take precedence over built-in patterns and the
+  later matching user pattern wins. Bundled rules still style other text and
+  nested language bodies retain their own rules. Document the supported query
+  predicates and category names. A query changes the styling of parsed syntax.
+  Runtime loading of new parser grammars remains an open design decision.
+
+Load and validate configuration off the interactive path. Cap combined
+configuration and query source at 256 KiB. Compile candidate queries within
+the analysis worker's deadline and memory limits. Coalesce startup and reload
+requests into one running validation and one latest pending request. Publish
+only the latest requested revision after every file validates. On failure,
+report the failing file and reason and retain the last good revision, which
+starts at the bundled defaults.
+Removing overrides and reloading restores the corresponding defaults. A palette
+change alone repaints without parsing and leaves fallback state intact. Any
+query or fence alias change advances the analysis configuration generation,
+revokes current and in-flight syntax results, and allows a fresh attempt on
+the next eligible view. This covers aliases that previously styled a fence as
+neutral and queries used only in embedded text. Re-evaluate file associations
+on Auto tabs, including parked tabs, and invalidate analysis where the effective
+language changed. Keep document text, dirty state and history intact through
+reloads.
 
 ## Eligibility and fallback
 
@@ -159,6 +218,7 @@ assets ship with the executable.
 The coordinator publishes separate syntax status and optional, immutable
 viewport spans alongside the existing screen. Use a key containing tab ID,
 document ID, logical revision, effective language, and an attempt generation.
+Include the applicable query and embedding-rule revision in that identity.
 Projection also carries the exact viewport identity (geometry, scroll origin
 and generation). Accept a result only if its identities still match the
 current tab, document metadata and prepared view. Project using the visible
@@ -232,6 +292,12 @@ aborts on allocator failure, which motivates the proposed containment.
 · [Markdown grammar](https://github.com/tree-sitter-grammars/tree-sitter-markdown)
 · [Allocator behavior](https://github.com/tree-sitter/tree-sitter/blob/master/lib/src/alloc.c)
 
+The editor controls the theme and custom file loader under either approach.
+Tree-sitter queries can style the syntax nodes exposed by the chosen grammar.
+Feasibility must exercise user-authored queries on bundled grammars, including
+invalid rules and costly matches, under the same analysis limits.
+[Tree-sitter query syntax](https://tree-sitter.github.io/tree-sitter/using-parsers/queries/1-syntax.html)
+
 Syntect is the alternative. Sublime syntax definitions and resumable line state
 offer a smaller integration surface if the bindings cover all required forms.
 The pure-Rust regex option avoids Oniguruma; its worst-case interruptibility and
@@ -267,6 +333,7 @@ relaxing limits.
 | H06 | Terminal cell checks verify ANSI palettes, selection and search precedence, wide and combining graphemes, tabs, escaped/clipped glyphs, cursor and hit testing. Include narrow views of long lines, where visible byte runs can be far apart. PTY checks edit, search/replace, Undo and save exact bytes before, during and after fallback. |
 | H07 | A synthetic retained read-only stream with manual override remains searchable and highlightable, rejects old offsets after a retained-history change, and keeps the override across the editable EOF transition. Real stream testing follows in Stage 08. |
 | H08 | Run a small representative document, near-limit regular and pathological corpora, repeated edits and switches across 64 tabs, and a 1 GiB file that takes the size fallback. In a separate overlap run, verify active helper work on an eligible tab while all-open search scans an inactive 1 GiB tab. Record first visible text, ordinary input under load, preflight/parse/query time, cancellation, both process peaks and combined memory, and budget high waters. Check the 1 s first-text and 50 ms ordinary-input local goals and existing storage limits on the agreed baseline and run the resource case in the swap-disabled Linux 256 MiB harness. |
+| H09 | Without rebuilding, load a custom theme, a file association, a fence alias, and a rule that reclassifies a parsed token. Check theme inheritance and startup/reload choices, detection precedence and manual override, and built-in styling outside custom matches. Prove palette-only reload avoids parsing. Gate an old reload against a newer request and old syntax across a query change or a formerly unknown fence alias. Malformed or oversize input and query compilation timeout keep the last good configuration, with bundled defaults on first load and a visible diagnostic. Removing overrides restores defaults. |
 
 Use a failing focused check before each behavior change. Use explicit ordering
 gates for H05 and subprocess/PTY tests for real process and terminal behavior.
@@ -274,7 +341,7 @@ Run formatting, Clippy with warnings denied, the workspace suite, and relevant
 Stage 02–06 regressions. Record OS, toolchain, filesystem, CPU/RAM, corpus,
 cache state, build profile, limit enforcement, and reproducible commands for
 H08. Report native macOS/Linux and PTY evidence separately from physical
-terminals, tmux and remote transports. Map checks and measurements to H01–H08
+terminals, tmux and remote transports. Map checks and measurements to H01–H09
 in the record below.
 
 ## Validation record
@@ -297,6 +364,10 @@ These runs exercise the merged runtime with the updated Cargo settings.
 Independent design review followed [REVIEW.md](../../REVIEW.md) against
 `9714b09`. Review findings on snapshot admission, validation of worker spans,
 job-control suspension, and overlapping highlight/search measurements were
-addressed and re-reviewed. No actionable findings remain. All 28 local
-Markdown links resolve, H01–H08 are unique and sequential, and this record is
-the final section.
+addressed and re-reviewed. No actionable findings remained in the initial draft.
+
+The customization follow-up received a separate design review against
+`f968931`. The review verified the final reload ordering, case-insensitive
+association precedence, and rejection of stale embedded results. The revision
+passed whitespace and all 29 local Markdown link checks; H01–H09 are unique
+and sequential. H09 runtime validation remains pending.

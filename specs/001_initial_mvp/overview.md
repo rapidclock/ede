@@ -134,11 +134,13 @@ are proposed interaction details, subject to review.
 - Separate file detection, syntax definitions/queries, embedded-language rules,
   and theme styling so adding a language does not require rewriting the UI.
 - Allow a manual language override for ambiguous filenames and piped content.
+- Let users customize syntax colors, file associations, and highlighting rules
+  for bundled grammars through local configuration without rebuilding ede.
 - Degrade or disable highlighting when necessary to preserve responsiveness;
   explain the change visibly. Highlighting limits must not make a file uneditable.
 
-Exact grammars, dialects, theme defaults, and extension-loading mechanisms remain
-open. Adding a native grammar may initially require recompilation.
+Exact grammars, dialects, and theme defaults remain open. Loading entirely new
+grammars at runtime remains a separate design decision.
 
 Agreed initial highlighting heuristics (configurable and subject to benchmarks):
 
@@ -562,10 +564,12 @@ Evidence: [Stage 07 validation record](07_syntax_highlighting.md#validation-reco
 
 - Deliver offline syntax highlighting for all eleven FR-04 languages, including
   Markdown frontmatter and fences, and JavaScript and CSS embedded in HTML.
-  Users can override language per tab and select a built-in syntax theme.
-- Complete when fixtures highlight correctly, adding a language leaves the UI
-  code intact, and all three agreed heuristics produce a visible whole-document
-  plain-text fallback while editing and search stay available. Covers FR-04.
+  Users can override language per tab, choose a built-in or custom syntax theme,
+  and configure file associations and highlighting rules for bundled grammars.
+- Complete when fixtures highlight correctly, users can reload local customization
+  without rebuilding, adding a language leaves the UI code intact, and all three
+  agreed heuristics produce a visible whole-document plain-text fallback while
+  editing and search stay available. Covers FR-04.
 
 ### 08 — Pipes, pager behavior, and live following
 
