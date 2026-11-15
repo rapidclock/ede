@@ -604,3 +604,11 @@ runs hit intermittent failures in the existing mouse tab-overflow and failed
 recovery checkpoint tests. Each passed in isolation and in the full rerun.
 Independent review reproduced the reference and HTML boundary issues, then
 checked the fixes with the installed worker and the Markdown PTYs.
+
+The local release build passed the Markdown PTYs and worker fixtures. A
+separate release PTY verified Light-theme heading, list marker, quote and
+inline-code colors. Both Stage 7 opt-in release probes passed locally. The
+heap probe recorded 48,840,704 bytes peak RSS, and the 1 GiB overlap recorded
+182.2 ms to first text and a 23.7 ms maximum input sample. The [CI matrix](https://github.com/rapidclock/ede/actions/runs/43767314757)
+passed for `8064266` on macOS and Ubuntu, including all Linux release and
+constrained-memory checks.
