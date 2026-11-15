@@ -3,6 +3,45 @@
 use super::*;
 
 impl AppState {
+    /// Apply a choice to the tab the picker was opened for, or keep it pending at tiny sizes.
+    pub(super) fn language_command(
+        &mut self,
+        command: Command,
+        layout: &LayoutSnapshot,
+    ) -> Option<Intent> {
+        let Some(Modal::Language { tab, row, .. }) = &mut self.modal else {
+            return None;
+        };
+        if layout.list_rows() == 0 {
+            return None;
+        }
+        let end = Choice::options().count() - 1;
+        *row = match command {
+            Command::Move(Movement::Up, _) => row.saturating_sub(1),
+            Command::Move(Movement::Down, _) => (*row + 1).min(end),
+            Command::Move(Movement::Home | Movement::Start, _) => 0,
+            Command::Move(Movement::End | Movement::Finish, _) => end,
+            Command::Move(Movement::PageUp, _) => row.saturating_sub(layout.list_rows() as usize),
+            Command::Move(Movement::PageDown, _) => (*row + layout.list_rows() as usize).min(end),
+            Command::Newline | Command::Activate => {
+                let row = match self.focus {
+                    Some(Control::LanguageRow(clicked)) if command == Command::Activate => clicked,
+                    _ => *row,
+                };
+                let intent = Intent::Editor(Action::SetLanguage(*tab, Choice::options().nth(row)?));
+                self.modal = None;
+                self.focus = self.opener.take().or(Some(Control::Content));
+                self.capture = None;
+                self.dirty = true;
+                return Some(intent);
+            }
+            _ => return None,
+        };
+        self.focus = Some(Control::LanguageRow(*row));
+        self.dirty = true;
+        None
+    }
+
     pub(super) fn tab_change(&mut self, action: Action) -> Option<Intent> {
         self.capture = None;
         self.focus = Some(Control::Content);

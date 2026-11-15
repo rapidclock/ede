@@ -1,0 +1,30 @@
+[package]
+name = "ede-syntax-probe"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99.1"
+publish = false
+
+# Isolated from ede until the Stage 07 engine and grammar decision is recorded.
+[dependencies]
+tree-sitter = "=0.27.2"
+tree-sitter-css = "=0.25.0"
+tree-sitter-html = "=0.23.2"
+tree-sitter-ini = "=1.4.0"
+tree-sitter-javascript = "=0.25.0"
+tree-sitter-json = "=0.24.8"
+tree-sitter-md = "=0.5.4"
+tree-sitter-python = "=0.25.0"
+tree-sitter-rust = "=0.24.2"
+tree-sitter-toml-ng = "=0.7.0"
+tree-sitter-typescript = "=0.23.2"
+tree-sitter-xml = "=0.7.0"
+tree-sitter-yaml = "=0.7.2"
+
+[lints.rust]
+missing_docs = "warn"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

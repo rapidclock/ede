@@ -12,6 +12,7 @@ mod runtime;
 pub mod search;
 mod spool;
 pub mod status;
+mod syntax;
 mod terminal;
 mod text;
 mod ui;

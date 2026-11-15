@@ -1,6 +1,6 @@
 # 07 — Syntax highlighting
 
-Status — **Design draft. Engine selection and implementation authorization pending.**
+Status — **Implementation started. Language selection landed on the stage branch. Engine selection remains open.**
 
 Branch — `stage/syntax_highlighting`, based on `feat/initial_mvp` at `9714b09`.
 PR target — `feat/initial_mvp`.
@@ -21,7 +21,9 @@ highlighting failure.
 
 Required scope includes all eleven languages and the embedded cases below.
 The 20 MiB, 64 KiB, and 250 ms thresholds are already agreed starting defaults.
-The detection rules, customization format, interaction, palettes, dialect
+The user authorized implementation on 2026-11-14. Built-in filename detection
+and per-tab language selection are implemented. Custom configuration, themes,
+syntax analysis, and coloring remain pending. The remaining interaction, dialect
 boundaries, worker design, and additional resource caps below form the proposal.
 Confirm the engine, grammar sources, and Markdown/INI dialects with the user
 before adding dependencies. No supported language or required embedding is deferred.
@@ -346,9 +348,9 @@ in the record below.
 
 ## Validation record
 
-**Stage 07 acceptance validation pending.** Engine/grammar feasibility,
-native parser and terminal behavior, and performance evidence are pending.
-No language or embedding deferral has been approved.
+**Stage 07 acceptance validation in progress.** The built-in Language picker and
+Tab Details implement part of H03. Measurements below are from a standalone
+probe. No language or embedding deferral has been approved.
 
 Design baseline on 2026-11-14 — merged Stage 06 at `9714b09`, native macOS
 27.2 arm64 and Rust 1.99.1. The branch includes the explicit `ede` binary
@@ -371,3 +373,77 @@ The customization follow-up received a separate design review against
 association precedence, and rejection of stale embedded results. The revision
 passed whitespace and all 29 local Markdown link checks; H01–H09 are unique
 and sequential. H09 runtime validation remains pending.
+
+### First implementation checks on 2026-11-14
+
+Native macOS 27.2 arm64, MacBookPro18,2 with 32 GiB RAM and local APFS,
+Rust 1.99.1 and Apple Clang 21.0.0. H03 reducer checks cover native filename
+bytes, final extensions, unknown and unnamed tabs, and the full chooser at
+40×8 with a click, a hidden dialog, Escape and restored focus. The PTY check
+verifies the symlink's opened name, failed and committed Save As, an immediate
+Tab Details read after applying a manual choice, and independent choices on
+two tabs. Physical terminals and Linux were not exercised in this slice.
+
+Formatting and strict Clippy passed for both crates. The locked workspace
+suite passed 230 tests with seven opt-in checks ignored. Independent review
+against `745c9ff` caught stale Tab Details after an asynchronous choice and
+focus lost through F2 dispatch. Both paths were fixed and re-reviewed against
+the focused reducer and PTY checks.
+
+The separately locked [Rust probe](../../examples/syntax_probe/Cargo.toml)
+builds published generated grammars with a C compiler, using this inventory.
+The probe uses Tree-sitter `0.27.2` (MIT). The listed grammars declare MIT
+except INI, which declares Apache-2.0. Any distributed builds need applicable
+license and copyright notices. The notice inventory for upstream query assets
+and transitive dependencies is pending.
+
+| Grammar crate | Version | Grammar ABI |
+| --- | --- | --- |
+| `tree-sitter-md` | `0.5.4` | 15 block / 15 inline |
+| `tree-sitter-toml-ng` | `0.7.0` | 14 |
+| `tree-sitter-yaml` | `0.7.2` | 14 |
+| `tree-sitter-json` | `0.24.8` | 14 |
+| `tree-sitter-javascript` | `0.25.0` | 15 |
+| `tree-sitter-typescript` | `0.23.2` | 14 |
+| `tree-sitter-python` | `0.25.0` | 15 |
+| `tree-sitter-rust` | `0.24.2` | 15 |
+| `tree-sitter-ini` | `1.4.0` | 15 |
+| `tree-sitter-xml` | `0.7.0` | 14 |
+| `tree-sitter-html` | `0.23.2` | 14 |
+| `tree-sitter-css` | `0.25.0` | 15 |
+
+`cargo test --offline --locked --manifest-path examples/syntax_probe/Cargo.toml`
+passed five tests. The fixtures demonstrate representative upstream captures
+for all eleven languages, Markdown block/inline extensions, CRLF YAML
+frontmatter, and nested Markdown → HTML → JavaScript/CSS captures at original
+byte offsets. They also exercise custom capture priority, rejected invalid
+query source and regex syntax, and callbacks during root parsing,
+included-range parsing, and a query that yields no matches. These are partial
+H01, H02, H04 and H09 evidence. The published Markdown highlighting queries
+need added patterns for task markers, table cells and strikethrough. The INI
+grammar accepts indented comments and expects LF or CRLF after settings and
+comment lines, so the column-one and EOF rules need adapter coverage.
+
+`cargo build --release --offline --locked --manifest-path examples/syntax_probe/Cargo.toml`
+built from an empty probe target with a populated Cargo cache in about 15 s.
+The runnable probe, including fixture and measurement code, is about 6.0 MiB
+stripped. The Stage 06 baseline executable with the Stage 07 Cargo profile
+is about 2.6 MiB. The size delta of an integrated editor remains unmeasured.
+Each row ran in its own process with `/usr/bin/time -l` and the named argument
+to `examples/syntax_probe/target/release/ede-syntax-probe`. The timer covers
+root parse and query iteration. Corpus preparation and query compilation take
+place before that timer. These runs used warm binary/cache state.
+
+| Probe argument | Input bytes | Parse | Parse and query | Peak RSS |
+| --- | ---: | ---: | ---: | ---: |
+| `ordinary` (Rust functions) | 7,168 | 1.10 ms | 1.89 ms | 6.9 MiB |
+| `near-limit` (Rust comments, 512 lines of 40 KiB) | 20,971,520 | 98.31 ms | 98.47 ms | 27.0 MiB |
+| `dense` (JSON arrays) | 4,200,003 | 250.01 ms, cancelled | 250.01 ms | 151.8 MiB |
+
+The dense run demonstrates that a deadline alone does not enforce the helper
+memory budget. Inspection of the published C sources found direct libc
+allocations in the Markdown and Python scanners, which bypass Tree-sitter's
+allocator hook. A helper-wide allocation ceiling that covers native scanners,
+independent deadline enforcement, Linux feasibility, and integrated H08 tests
+under 256 MiB with swap disabled remain pending. Tree-sitter remains a candidate.
+Its dependencies are confined to the probe until the engine decision.

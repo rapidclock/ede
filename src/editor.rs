@@ -11,6 +11,7 @@ use crate::{
         TextRange,
     },
     spool::Spool,
+    syntax,
     text::{Checkpoints, Position, Text, View, ViewRequest},
 };
 use std::{
@@ -84,6 +85,7 @@ impl ViewControl {
             }
             Action::RecoveryPage { .. }
             | Action::DiscardRetained { .. }
+            | Action::SetLanguage(..)
             | Action::FieldPaste(..)
             | Action::CancelGuard => None,
             _ => current,
@@ -168,6 +170,7 @@ pub(crate) enum Action {
     CancelGuard,
     FinishQuit,
     RetryRefresh(TabId),
+    SetLanguage(TabId, syntax::Choice),
     RecoveryPage {
         generation: u64,
         cursor: Option<(u64, crate::recovery::Id)>,
@@ -261,6 +264,7 @@ pub(crate) enum SaveResult {
 /// Most recent document state plus prepared immutable viewport.
 #[derive(Clone)]
 pub(crate) struct Screen {
+    pub syntax_language: syntax::Choice,
     pub can_replace: bool,
     pub search: Arc<search::Status>,
     pub tab: Option<TabId>,
@@ -281,6 +285,7 @@ impl Default for Screen {
     /// Pending startup is visibly distinct from a ready empty buffer.
     fn default() -> Self {
         Self {
+            syntax_language: syntax::Choice::Auto,
             can_replace: true,
             search: Arc::default(),
             tab: None,
@@ -1249,6 +1254,7 @@ impl Coordinator {
                 | Action::CancelGuard
                 | Action::FinishQuit
                 | Action::RetryRefresh(_)
+                | Action::SetLanguage(..)
                 | Action::RecoveryPage { .. }
                 | Action::OpenRetained { .. }
                 | Action::DiscardRetained { .. }
@@ -1268,6 +1274,11 @@ impl Coordinator {
             }
             Action::RevokeSearch => {}
             Action::RetryRefresh(tab) => self.retry_refresh(tab)?,
+            Action::SetLanguage(tab, choice) => {
+                if let Some(state) = self.state_mut(tab) {
+                    state.screen.syntax_language = choice;
+                }
+            }
             Action::RecoveryPage {
                 generation,
                 cursor,

@@ -1,6 +1,6 @@
 # 001 — Initial MVP overview
 
-Status: **MVP scope and roadmap accepted — Stages 01–06 merged. Stage 07 design draft.**
+Status: **MVP scope and roadmap accepted — Stages 01–06 merged. Stage 07 implementation started.**
 
 Project: **ede**, a predominantly Rust terminal text editor for macOS and Linux.
 
@@ -558,7 +558,7 @@ Evidence: [Stage 06 validation record](06_search_and_replace.md#validation-recor
 ### 07 — Syntax highlighting
 
 Design: [07_syntax_highlighting.md](07_syntax_highlighting.md). Depends on: 02–06.
-Status: design draft; engine selection and implementation authorization pending.
+Status — Built-in language detection and selection implemented. Engine selection is open.
 Branch: `stage/syntax_highlighting`; PR target: `feat/initial_mvp`.
 Evidence: [Stage 07 validation record](07_syntax_highlighting.md#validation-record).
 

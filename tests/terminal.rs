@@ -26,6 +26,66 @@ use nix::{
 /// Bounded timeouts turn a broken terminal loop into a useful test failure, not a hanging CI job.
 const TIMEOUT: Duration = Duration::from_secs(5);
 
+/// H03: language detection follows the opened name and changes only on a committed Save As.
+#[test]
+fn tab_details_language_follows_opened_name_and_committed_save_as() {
+    let directory = tempfile::tempdir().unwrap();
+    let target = directory.path().join("actual.txt");
+    let opened = directory.path().join("source.RS");
+    let busy = directory.path().join("existing.py");
+    let saved = directory.path().join("copy.TS");
+    std::fs::write(&target, b"source text\n").unwrap();
+    std::fs::write(&busy, b"existing\n").unwrap();
+    std::os::unix::fs::symlink(&target, &opened).unwrap();
+    let mut process = PtyChild::editor_with_path(Some("xterm-256color"), Some(&opened));
+    process.expect_status("Ready");
+
+    let show_language = |expected, process: &mut PtyChild| {
+        let open_details = [b"\x1bOQ".as_slice(), &b"\x1b[B".repeat(17), b"\r"].concat();
+        process.send(&open_details);
+        process.expect(expected);
+        process.send(b"\x1b");
+        process.expect_absent(expected);
+    };
+    show_language("Language: Rust (Auto)", &mut process);
+
+    process.send(b"\x1bOS");
+    process.expect("Save As (new path)");
+    process.send(busy.as_os_str().as_encoded_bytes());
+    process.send(b"\r");
+    process.expect("work retained");
+    process.send(b"\x1b");
+    process.expect_absent("work retained");
+    show_language("Language: Rust (Auto)", &mut process);
+
+    process.send(b"\x1bOS");
+    process.expect("Save As (new path)");
+    process.send(saved.as_os_str().as_encoded_bytes());
+    process.send(b"\r");
+    process.expect_status("Saved");
+    show_language("Language: TypeScript (Auto)", &mut process);
+
+    let open_language = [b"\x1bOQ".as_slice(), &b"\x1b[B".repeat(27), b"\r"].concat();
+    process.send(&open_language);
+    process.expect("Auto (TypeScript)");
+    process.send(&[b"\x1b[B".repeat(5).as_slice(), b"\r"].concat());
+    show_language("Language: JSON (Manual)", &mut process);
+    process.send(b"\x0e");
+    process.expect("Untitled 1");
+    show_language("Language: Plain Text (Auto)", &mut process);
+    process.send(b"\x17");
+    process.expect("Unsaved changes");
+    process.send(b"\t\t\r");
+    process.expect_absent("Untitled 1");
+    show_language("Language: JSON (Manual)", &mut process);
+
+    assert_eq!(std::fs::read(&saved).unwrap(), b"source text\n");
+    assert_eq!(std::fs::read(&busy).unwrap(), b"existing\n");
+    process.send(b"\x11");
+    assert!(process.wait().success());
+    process.assert_restored();
+}
+
 /// Stage 06 must expose a real non-modal search surface through portable input.
 #[test]
 fn literal_find_panel_uses_unsaved_text() {
