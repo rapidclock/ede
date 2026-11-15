@@ -1,9 +1,11 @@
 # ede
 
 A Rust terminal text editor for macOS and Linux, built in reviewed stages.
-Current version: **0.0.1-dev.6**. Stage 6 adds literal search and atomic replacement.
-See the [MVP overview](specs/001_initial_mvp/overview.md) and the
-[Stage 6 validation record](specs/001_initial_mvp/06_search_and_replace.md#validation-record).
+Current version **0.0.1-dev.7**. Stage 6 shipped literal search and atomic
+replacement. Stage 7 syntax highlighting is in design. See the
+[MVP overview](specs/001_initial_mvp/overview.md),
+[Stage 6 validation record](specs/001_initial_mvp/06_search_and_replace.md#validation-record),
+and [Stage 7 validation record](specs/001_initial_mvp/07_syntax_highlighting.md#validation-record).
 
 ## Build and run
 

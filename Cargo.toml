@@ -1,6 +1,6 @@
 [package]
 name = "ede"
-version = "0.0.1-dev.6"
+version = "0.0.1-dev.7"
 edition = "2024"
 rust-version = "1.99.1"
 description = "A terminal text editor for macOS and Linux"
@@ -26,3 +26,12 @@ vt100 = "0.18.1"
 [lints.rust]
 missing_docs = "warn"
 
+[[bin]]
+name = "ede"
+path = "src/bin/ede.rs"
+
+[profile.release]
+opt-level = 3          # Maximum runtime speed (use "z" or "s" to prioritize binary size)
+lto = true             # Fat link-time optimization across all crates (use "thin" for faster builds)
+codegen-units = 1      # Optimize the entire crate as one unit (slower compile, smaller/faster binary)
+strip = true           # Strip both debug info and symbol tables (alias for "symbols")

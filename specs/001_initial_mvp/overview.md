@@ -1,6 +1,6 @@
 # 001 — Initial MVP overview
 
-Status: **MVP scope and roadmap accepted — Stages 01–05 merged; Stage 06 implemented and validated, PR open.**
+Status: **MVP scope and roadmap accepted — Stages 01–06 merged. Stage 07 design draft.**
 
 Project: **ede**, a predominantly Rust terminal text editor for macOS and Linux.
 
@@ -315,12 +315,9 @@ commands. Background work should use document revisions so stale results cannot
 overwrite current state. Changes should be expressed as undoable transactions.
 
 Stage 01 selects Ratatui with Crossterm; its implementation is merged and dependency
-versions are recorded in the stage design. Tree-sitter remains the leading
-highlighting candidate, with alternatives such as Syntect still open. Highlighting
-dependencies are research recommendations, not approved selections. Compare
-runtime/build weight, performance, maintenance, language coverage, compatibility,
-and licenses with the user before choosing. Record any agreed highlighting scope
-deferrals explicitly.
+versions are recorded in the stage design. The [Stage 07 design](07_syntax_highlighting.md)
+proposes Tree-sitter with bundled grammars and compares it with Syntect. Engine
+and dependency selection remains open for user approval after feasibility checks.
 
 Prefer reuse of ripgrep's Rust libraries where they fit editor search. Evaluate
 `grep-searcher`, `grep-matcher`, and `grep-regex` before writing a custom engine.
@@ -541,8 +538,7 @@ of unsaved named-file edits remains outside this stage.
 ### 06 — Search and replacement
 
 Design: [06_search_and_replace.md](06_search_and_replace.md). Depends on: 02–05.
-Status: implemented and independently reviewed; native and Linux/macOS CI passed.
-[PR #6](https://github.com/rapidclock/ede/pull/6) is open into `feat/initial_mvp`.
+Status: complete; [PR #6](https://github.com/rapidclock/ede/pull/6) merged into `feat/initial_mvp` at `9714b09`.
 Implementation was authorized by the user on 2026-11-14.
 The design was independently reviewed and findings fixed before implementation.
 Branch: `stage/search_and_replace`; PR target: `feat/initial_mvp`.
@@ -559,14 +555,17 @@ Evidence: [Stage 06 validation record](06_search_and_replace.md#validation-recor
 
 ### 07 — Syntax highlighting
 
-Planned file: `07_syntax_highlighting.md`. Depends on: 02–04.
+Design: [07_syntax_highlighting.md](07_syntax_highlighting.md). Depends on: 02–06.
+Status: design draft; engine selection and implementation authorization pending.
+Branch: `stage/syntax_highlighting`; PR target: `feat/initial_mvp`.
+Evidence: [Stage 07 validation record](07_syntax_highlighting.md#validation-record).
 
-- Select an established highlighting library with the user. Deliver language
-  detection/override, themes, and the agreed language set, including Markdown
-  frontmatter/fences and embedded syntax. Record any user-approved deferrals.
-- Complete when representative fixtures highlight correctly, new language support
-  does not require UI changes, and all three agreed heuristics trigger an explained
-  whole-document plain-text fallback without disabling edits/search. Covers FR-04.
+- Deliver offline syntax highlighting for all eleven FR-04 languages, including
+  Markdown frontmatter and fences, and JavaScript and CSS embedded in HTML.
+  Users can override language per tab and select a built-in syntax theme.
+- Complete when fixtures highlight correctly, adding a language leaves the UI
+  code intact, and all three agreed heuristics produce a visible whole-document
+  plain-text fallback while editing and search stay available. Covers FR-04.
 
 ### 08 — Pipes, pager behavior, and live following
 
@@ -578,7 +577,7 @@ Planned file: `08_pipes_and_follow.md`. Depends on: 02–07.
 - Complete when active input remains read-only, EOF makes piped content editable,
   and partial lines/characters are handled correctly. Verify input/UI separation,
   replacement restrictions, quitting with an active producer, and redirected-output
-  behavior. Covers FR-07 and stream integration with FR-08.
+  behavior. Covers FR-07 and stream integration with FR-04 and FR-08.
 
 ### 09 — Configuration and keybinding UI
 
