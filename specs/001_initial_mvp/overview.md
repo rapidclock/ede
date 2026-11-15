@@ -1,6 +1,6 @@
 # 001 — Initial MVP overview
 
-Status: **MVP scope and roadmap accepted — Stages 01–05 merged; Stage 06 implementation and validation in progress.**
+Status: **MVP scope and roadmap accepted — Stages 01–05 merged; Stage 06 implemented and validated, PR open.**
 
 Project: **ede**, a predominantly Rust terminal text editor for macOS and Linux.
 
@@ -541,12 +541,13 @@ of unsaved named-file edits remains outside this stage.
 ### 06 — Search and replacement
 
 Design: [06_search_and_replace.md](06_search_and_replace.md). Depends on: 02–05.
-Status: implemented and independently reviewed; native checks pass, Linux CI pending.
+Status: implemented and independently reviewed; native and Linux/macOS CI passed.
+[PR #6](https://github.com/rapidclock/ede/pull/6) is open into `feat/initial_mvp`.
 Implementation was authorized by the user on 2026-11-14.
 The design was independently reviewed and findings fixed before implementation.
 Branch: `stage/search_and_replace`; PR target: `feat/initial_mvp`.
 Evidence: [Stage 06 validation record](06_search_and_replace.md#validation-record)
-(native implementation, review, mutation and performance evidence recorded; Linux CI pending).
+(native and Linux/macOS CI, review, mutation and performance evidence recorded).
 
 - Deliver literal search, case sensitivity, next/previous, replace-next/all, and
   current/all-open-document scopes, including unsaved and scratch contents.

@@ -365,7 +365,7 @@ unrecorded deferral to Stage 10.
 
 ## Validation record
 
-**Implementation validation: native checks complete; Linux CI pending.** The user
+**Implementation validation: complete; native macOS and Linux/macOS CI passed.** The user
 authorized completion after design review. Earlier checkpoints are retained below;
 the integrated evidence and final measurements supersede their pending notes.
 
@@ -487,7 +487,7 @@ is Escape dispatch to displayed settled cancellation, including the terminal
 Escape disambiguation interval. The sampled RSS is not the peak; the table uses
 the kernel lifetime peak. First text and input meet the local 1 s / 50 ms goals.
 Dense indexing becomes editable later than its first preview, as in prior stages.
-Linux constrained-memory execution is pending CI.
+Linux constrained-memory results are recorded below.
 
 
 ### Integrated implementation evidence
@@ -558,3 +558,34 @@ and all 18 local Markdown link targets passed. The CI workflow adds all three
 systemd harness. Native benchmark fixtures are warm; no physical terminal,
 remote transport or cold-cache result is implied by PTY evidence. Those environment
 limitations carry forward from the earlier terminal stages.
+
+
+### Completed Linux/macOS CI
+
+[PR #6](https://github.com/rapidclock/ede/pull/6) targets `feat/initial_mvp`.
+[CI run 43668601751](https://github.com/rapidclock/ede/actions/runs/43668601751)
+passed both macOS and Ubuntu jobs for implementation commit
+`23c4a9bb52df4c406bd8add550485022c65a6ce0`. Linux passed 230 enabled tests
+(the native macOS run has 227; three checks are Linux-specific), formatting,
+Clippy and all existing recovery/refresh/storage/editing resource regressions.
+The final follow-up changes only these specification/overview validation records.
+
+Linux environment: Ubuntu 26.04.1, runner image `20261111.196.1`, x86_64,
+Rust 1.99.1, two vCPUs on AMD EPYC 7763, ext4 on `/dev/sda1`.
+Each search benchmark ran through `systemd-run` with `MemoryMax=256M` and
+`MemorySwapMax=0`; its allocated 1 GiB fixture was four times the memory limit.
+Fixtures were generated warm; cache residency was subsequently constrained by
+that limit. Full scans and atomic application remain asynchronous and cancellable.
+
+| Corpus | First text ms | Ready ms | Scan ms | Replace ms | Input p50 / p95 / max ms | Cancel ms | Kernel peak KiB |
+| --- | ---: | ---: | ---: | ---: | --- | ---: | ---: |
+| Ordinary, 1 GiB | 24.015 | 10345.269 | 5139.293 | 16219.691 | 8.453 / 13.262 / 23.132 | 48.966 | 73352 |
+| Dense, 1 GiB | 24.070 | 10325.578 | 5135.799 | 16473.698 | 8.373 / 24.983 / 25.100 | 47.611 | 73236 |
+| Long line, 1 GiB | 23.985 | 10315.175 | 5153.414 | 16651.274 | 8.361 / 22.971 / 23.375 | 47.571 | 73408 |
+
+All three passed exact counts, observed cancellation, saved length/byte checks,
+Undo, successful exit and terminal restoration. Preview/input meet the agreed
+local goals even at the tighter memory limit. Editable Ready, full scan and
+replacement take longer under this resource constraint; the UI remains usable.
+No remaining independent-review findings are open. Physical terminal and remote
+transport limitations remain as stated above; no such results are claimed.
