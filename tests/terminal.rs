@@ -2190,8 +2190,18 @@ fn sixty_four_highlighted_tabs_keep_foreground_budget() {
     }
     process.send(b"fresh \x13");
     process.expect("fresh # Heading 63");
+    process.expect_status("Saved");
+    assert_eq!(
+        std::fs::read_to_string(&paths[63]).unwrap(),
+        "fresh # Heading 63\n"
+    );
     process.send(b"\x11");
-    assert!(process.wait().success());
+    let status = process.wait();
+    assert!(
+        status.success(),
+        "{status}: {}",
+        String::from_utf8_lossy(&process.output)
+    );
     process.assert_restored();
 }
 

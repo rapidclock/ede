@@ -545,8 +545,9 @@ inherited hard limit. Embedded sessions keep their caller's limits.
 
 On macOS, plain `cargo test` from a soft limit of 256 passed 248 tests with
 nine opt-in checks ignored, including 64 tabs with search and cancellation,
-and the 64-tab PTY with highlighting, editing, saving and quitting. CI
-starts the regular workspace test step with a soft limit of 256 on both
-hosted platforms. Independent review against `c807466` confirmed the soft
-limit adjustment preserves the inherited hard limit and passed both focused
-64-tab tests under the same macOS limit.
+and the 64-tab PTY with highlighting, editing, saving and quitting. The PTY
+checks the committed file before quitting and also passed in release mode
+with timing enabled. CI starts the regular workspace test step with a soft
+limit of 256 on both hosted platforms. Independent review against `c807466`
+confirmed the soft limit adjustment preserves the inherited hard limit and
+passed both focused 64-tab tests under the same macOS limit.
