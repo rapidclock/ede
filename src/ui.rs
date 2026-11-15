@@ -17,6 +17,7 @@ use unicode_width::UnicodeWidthStr;
 /// Stable visible control; text byte positions live in the prepared document view.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Control {
+    Search(u8),
     Content,
     Menu,
     Help,
@@ -61,6 +62,8 @@ impl Control {
     /// Resolve buttons/menu items to the shared command handler.
     pub fn command(self) -> Option<Command> {
         match self {
+            Self::Search(0 | 1) => None,
+            Self::Search(_) => Some(Command::Activate),
             Self::Content
             | Self::PathField
             | Self::Tab(_)
@@ -83,6 +86,7 @@ impl Control {
     /// Compact display labels fit the minimum 40×8 geometry.
     fn label(self) -> &'static str {
         match self {
+            Self::Search(_) => "",
             Self::Content
             | Self::PathField
             | Self::Tab(_)
@@ -138,6 +142,7 @@ pub(crate) struct Signature {
     picker_revision: u64,
     picker_request: u64,
     switching: Option<u64>,
+    search: Option<(bool, usize)>,
 }
 /// Immutable frame geometry; hidden surfaces have no hit targets.
 #[derive(Clone, Debug)]
@@ -150,6 +155,13 @@ pub(crate) struct LayoutSnapshot {
     list_rows: u16,
 }
 impl LayoutSnapshot {
+    /// Actual text viewport leaves room for the non-modal search controls.
+    pub(crate) fn content_height(&self) -> u16 {
+        self.targets
+            .iter()
+            .find(|t| t.control == Control::Content)
+            .map_or(self.area.height.saturating_sub(2), |t| t.area.height)
+    }
     /// Base geometry retained for shell/scheduler tests.
     pub fn new(area: Rect, help: bool, generation: u64) -> Self {
         let mut result = Self {
@@ -187,6 +199,7 @@ impl LayoutSnapshot {
     /// Stable key for changes that invalidate pointer capture or hit geometry.
     pub fn signature(app: &AppState) -> Signature {
         let (modal, detail) = match &app.modal {
+            Some(Modal::ReplaceAll(_)) => (11, 0),
             None => (0, 0),
             Some(Modal::Menu(index)) => (1, *index as u64),
             Some(Modal::Path(..)) => (2, 0),
@@ -215,6 +228,10 @@ impl LayoutSnapshot {
             picker_revision,
             picker_request,
             switching: app.switching,
+            search: app
+                .search
+                .open
+                .then_some((app.search.replace, app.search.row)),
         }
     }
     /// Modal targets replace all underlying controls, including at tiny sizes.
@@ -227,6 +244,28 @@ impl LayoutSnapshot {
         if app.modal.is_none() {
             if !app.help {
                 result.add_tab_strip(app);
+                if app.search.open {
+                    if let Some(content) = result
+                        .targets
+                        .iter_mut()
+                        .find(|t| t.control == Control::Content)
+                    {
+                        content.area.height = content.area.height.saturating_sub(3);
+                    }
+                    for (row, index) in app
+                        .search
+                        .controls()
+                        .into_iter()
+                        .skip(app.search.row)
+                        .take(2)
+                        .enumerate()
+                    {
+                        result.add(
+                            Control::Search(index),
+                            Rect::new(area.x, area.bottom() - 4 + row as u16, area.width, 1),
+                        );
+                    }
+                }
             }
             return result;
         }
@@ -235,6 +274,10 @@ impl LayoutSnapshot {
         result.overlay = Some(overlay);
         let y = overlay.bottom() - 2;
         match &app.modal {
+            Some(Modal::ReplaceAll(_)) => {
+                result.add(Control::Search(15), Rect::new(overlay.x + 2, y, 16, 1));
+                result.add(Control::Search(16), Rect::new(overlay.x + 20, y, 10, 1));
+            }
             Some(Modal::Menu(index)) => {
                 let count = overlay.height.saturating_sub(2) as usize;
                 let start = index.saturating_sub(count.saturating_sub(1));
@@ -548,7 +591,7 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &AppState, layout: &LayoutSnaps
     } else if let Some(preview) = &app.screen.preview {
         let visible = preview
             .lines()
-            .take(area.height.saturating_sub(2) as usize)
+            .take(layout.content_height() as usize)
             .map(|line| safe(&line.chars().take(area.width as usize).collect::<String>()))
             .collect::<Vec<_>>()
             .join("\n");
@@ -561,7 +604,7 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &AppState, layout: &LayoutSnaps
         for (y, row) in view
             .rows
             .iter()
-            .take(area.height.saturating_sub(2) as usize)
+            .take(layout.content_height() as usize)
             .enumerate()
         {
             for glyph in &row.spans {
@@ -602,6 +645,67 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &AppState, layout: &LayoutSnaps
                 );
             }
         }
+        // Paint search decorations from exact logical ranges over the prepared
+        // cell map. Grapheme-bisecting matches color the intersecting cells.
+        let status = &app.screen.search;
+        let ordinary = status.decorated.is_some_and(|(tab, revision, _, _, _)| {
+            Some(tab) == app.screen.tab && revision == view.revision
+        });
+        let current = status
+            .current
+            .as_ref()
+            .filter(|found| Some(found.tab) == app.screen.tab && found.revision == view.revision);
+        for (range, selected) in status
+            .decorations
+            .iter()
+            .filter(|_| ordinary)
+            .map(|r| (r, false))
+            .chain(current.map(|found| (&found.range, true)))
+        {
+            for (y, row) in view
+                .rows
+                .iter()
+                .take(layout.content_height() as usize)
+                .enumerate()
+            {
+                for span in &row.spans {
+                    if range.start >= span.bytes.end || range.end <= span.bytes.start {
+                        continue;
+                    }
+                    let (lo, hi) = if let Some((bytes, cells)) = span.unit {
+                        let (bytes, cells) = (u64::from(bytes), u64::from(cells));
+                        (
+                            span.column
+                                + range.start.saturating_sub(span.bytes.start) / bytes * cells,
+                            span.column
+                                + range
+                                    .end
+                                    .min(span.bytes.end)
+                                    .saturating_sub(span.bytes.start)
+                                    .div_ceil(bytes)
+                                    * cells,
+                        )
+                    } else {
+                        (span.column, span.column + span.width)
+                    };
+                    for column in lo.max(view.left)..hi.min(view.left + u64::from(area.width)) {
+                        let style = Style::default()
+                            .bg(if selected {
+                                Color::Magenta
+                            } else {
+                                Color::Yellow
+                            })
+                            .fg(Color::Black);
+                        if let Some(cell) = frame
+                            .buffer_mut()
+                            .cell_mut((area.x + (column - view.left) as u16, area.y + 1 + y as u16))
+                        {
+                            cell.set_style(style);
+                        }
+                    }
+                }
+            }
+        }
         if !app.help
             && app.modal.is_none()
             && !app.screen.loading
@@ -610,7 +714,7 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &AppState, layout: &LayoutSnaps
             && app.focus == Some(Control::Content)
             && let Some((x, y)) = view.cursor
             && x < area.width
-            && y < area.height - 2
+            && y < layout.content_height()
         {
             frame.set_cursor_position((area.x + x, area.y + 1 + y));
         }
@@ -629,20 +733,50 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &AppState, layout: &LayoutSnaps
             return "Waiting for tab state or save | Escape cancels".into();
         }
         format!(
-            "{}{} | {}{}",
+            "{}{} | {}{}{}",
             severity,
             app.status.text(),
             coordinates,
-            if app.pending { " | working" } else { "" }
+            if app.pending { " | working" } else { "" },
+            if !app.search.open && !app.screen.search.message.is_empty() {
+                format!(" | {}", app.screen.search.message)
+            } else {
+                String::new()
+            }
         )
     });
     frame.render_widget(
         Paragraph::new(footer),
         Rect::new(area.x, area.bottom() - 1, area.width, 1),
     );
+    if app.search.open && app.modal.is_none() && !app.help {
+        let status = &app.screen.search;
+        let mut text = if status.busy {
+            format!(
+                "{} | {}/{} bytes; {} matches",
+                status.message,
+                status.progress.scanned,
+                status.progress.total,
+                status.progress.matches
+            )
+        } else {
+            status.message.clone()
+        };
+        if let Some(error) = &app.field_error {
+            text = error.clone();
+        }
+        if status.partial_highlighting {
+            text.push_str(" | Partial highlighting");
+        }
+        frame.render_widget(
+            Paragraph::new(text),
+            Rect::new(area.x, area.bottom() - 2, area.width, 1),
+        );
+    }
     if let Some(overlay) = layout.overlay {
         frame.render_widget(Clear, overlay);
         let title = match &app.modal {
+            Some(Modal::ReplaceAll(_)) => " Replace all — confirm scope ",
             Some(Modal::Menu(_)) => " Actions (wheel/arrows) ",
             Some(Modal::Open(_)) => " Open file ",
             Some(Modal::Tabs(_)) => " Tabs — Enter to switch ",
@@ -665,6 +799,18 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &AppState, layout: &LayoutSnaps
             overlay.height - 3,
         );
         let text = match &app.modal {
+            Some(Modal::ReplaceAll(request)) => format!(
+                "{}\nFind: {}\nReplace: {}\nMatch case: {} | Whole word: {}\nOne undo step per changed document; no disk save.",
+                if request.all {
+                    "All open documents"
+                } else {
+                    "Current document"
+                },
+                crate::app::search::display(&request.query.literal),
+                crate::app::search::display(&request.replacement),
+                request.query.match_case,
+                request.query.whole_word
+            ),
             Some(Modal::Menu(_) | Modal::Path(..) | Modal::Open(_) | Modal::Tabs(_)) => {
                 String::new()
             }
@@ -794,6 +940,7 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &AppState, layout: &LayoutSnaps
                             app.modal,
                             Some(
                                 Modal::Details(_)
+                                    | Modal::ReplaceAll(_)
                                     | Modal::SaveError(_)
                                     | Modal::PersistenceError(_)
                             )
@@ -865,6 +1012,48 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &AppState, layout: &LayoutSnaps
                 | Control::TabList
                 | Control::RecoveryList
         ) {
+            continue;
+        }
+        if let Control::Search(index) = target.control {
+            let label = if index <= 1 {
+                let (prefix, field) = if index == 0 {
+                    ("Find: ", &app.search.query.literal)
+                } else {
+                    ("Replace: ", &app.search.replacement)
+                };
+                format!(
+                    "{prefix}{}",
+                    tail_cells(
+                        &crate::app::search::display(field),
+                        target.area.width.saturating_sub(prefix.len() as u16 + 2)
+                    )
+                )
+            } else {
+                app.search.label(index)
+            };
+            let focused = app.focus == Some(target.control);
+            let style = if focused {
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            frame.render_widget(
+                Paragraph::new(tail_cells(
+                    &format!("{}{label}", if focused { ">" } else { " " }),
+                    target.area.width,
+                ))
+                .style(style),
+                target.area,
+            );
+            if focused && index <= 1 {
+                frame.set_cursor_position((
+                    target.area.x
+                        + (label.width() as u16 + 1).min(target.area.width.saturating_sub(1)),
+                    target.area.y,
+                ));
+            }
             continue;
         }
         let focused = app.focus == Some(target.control)

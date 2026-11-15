@@ -610,7 +610,7 @@ impl Coordinator {
     }
 
     #[cfg(test)]
-    fn install_refresh(
+    pub(super) fn install_refresh(
         &mut self,
         tab: TabId,
         document: DocumentId,

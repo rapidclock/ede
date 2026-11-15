@@ -218,7 +218,7 @@ impl Source {
 }
 
 /// A generation of private working files. Dropping the last reference removes only its directory.
-pub(super) struct Store {
+pub(super) struct StoreData {
     _permit: Permit,
     pub source: Source,
     pub tree: Tree,
@@ -226,7 +226,51 @@ pub(super) struct Store {
     pub original_longest: u64,
     pub cloned: bool,
 }
+/// Last-reference disposal transfers the complete generation to its bounded worker.
+pub(super) struct Store {
+    data: Option<StoreData>,
+    cleanup: Arc<super::cleanup::Cleanup>,
+}
+impl std::ops::Deref for Store {
+    type Target = StoreData;
+    fn deref(&self) -> &StoreData {
+        self.data.as_ref().expect("live generation")
+    }
+}
+impl std::ops::DerefMut for Store {
+    fn deref_mut(&mut self) -> &mut StoreData {
+        self.data.as_mut().expect("live generation")
+    }
+}
+impl Drop for Store {
+    fn drop(&mut self) {
+        if let Some(data) = self.data.take() {
+            self.cleanup.retire(data);
+        }
+    }
+}
 impl Store {
+    /// Borrow disjoint tree/source fields through the retirement wrapper.
+    pub(super) fn initial(
+        &mut self,
+        piece: super::tree::Entry,
+    ) -> Result<super::tree::Root, Error> {
+        let data = self.data.as_mut().expect("live generation");
+        data.tree.initial(piece, &data.source)
+    }
+    /// Apply one tree replacement without borrowing the wrapper twice.
+    pub(super) fn replace_root(
+        &mut self,
+        root: super::tree::Root,
+        start: u64,
+        end: u64,
+        piece: Option<super::tree::Entry>,
+        cancel: &Cancellation,
+    ) -> Result<super::tree::Root, Error> {
+        let data = self.data.as_mut().expect("live generation");
+        data.tree
+            .replace(root, start, end, piece, &data.source, cancel)
+    }
     /// Fork captured immutable prefixes into a private generation; no live-store lock spans I/O.
     pub(super) fn fork(
         reader: &Reader,
@@ -302,12 +346,15 @@ impl Store {
         );
         Ok((
             Self {
-                _permit: resources.buffers.acquire(32 << 10)?,
-                source,
-                tree,
-                directory,
-                original_longest: 0,
-                cloned: is_clone,
+                cleanup: resources.cleanup.clone(),
+                data: Some(StoreData {
+                    _permit: resources.buffers.acquire(32 << 10)?,
+                    source,
+                    tree,
+                    directory,
+                    original_longest: 0,
+                    cloned: is_clone,
+                }),
             },
             is_clone,
         ))

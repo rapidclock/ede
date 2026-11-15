@@ -6,11 +6,13 @@
 
 mod bitmap;
 mod cache;
+mod cleanup;
 mod compact;
 mod history;
 mod index;
 mod model;
 mod platform;
+mod prepared_edit;
 mod refresh;
 mod resources;
 mod save;
@@ -22,6 +24,7 @@ mod tree;
 mod types;
 
 pub use model::Document;
+pub use prepared_edit::{EditReport, EditTask, PreparedEdit};
 pub(crate) use refresh::observe;
 pub use refresh::{FileObservation, PreparedRefresh, RefreshProgress, RefreshReport, RefreshTask};
 pub(crate) use resources::Permit;

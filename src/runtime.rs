@@ -223,7 +223,12 @@ fn event_loop_impl(
                 let Ok(event) = bridge.events.try_recv() else {
                     break;
                 };
-                if let Some(intent) = app.event(event)
+                let had_surface = app.modal.is_some() || app.help;
+                let intent = app.event(event);
+                if !had_surface && (app.modal.is_some() || app.help) {
+                    bridge.revoke_search_navigation();
+                }
+                if let Some(intent) = intent
                     && effect(intent, host, &mut app, Some(bridge), picker)?
                 {
                     return Ok(Exit { code: 0 });
@@ -267,7 +272,7 @@ fn event_loop_impl(
         // A timer can submit a pasted path and close its dialog. Reconcile that
         // change before drawing or reading another key, just like input effects.
         reconcile_layout(area, &mut app, &mut layout);
-        let geometry = (area.width, area.height.saturating_sub(2), layout.generation);
+        let geometry = (area.width, layout.content_height(), layout.generation);
         if requested_geometry != Some(geometry) {
             if let Some(bridge) = editor.as_deref_mut() {
                 if bridge.submit(Action::Size(geometry.0, geometry.1, geometry.2)) {
@@ -329,7 +334,15 @@ fn event_loop_impl(
         if let Input::Resize(width, height) = input {
             area = Rect::new(0, 0, width, height);
         }
-        if let Some(intent) = app.input(input, &layout) {
+        let had_surface = app.modal.is_some() || app.help;
+        let intent = app.input(input, &layout);
+        if !had_surface
+            && (app.modal.is_some() || app.help)
+            && let Some(bridge) = editor.as_deref()
+        {
+            bridge.revoke_search_navigation();
+        }
+        if let Some(intent) = intent {
             let suspended = matches!(intent, Intent::Suspend);
             if effect(intent, host, &mut app, editor.as_deref_mut(), picker)? {
                 return Ok(Exit { code: 0 });

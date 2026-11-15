@@ -188,6 +188,7 @@ fn copy_state(
     state: State,
     cancel: &Cancellation,
 ) -> Result<State, Error> {
+    let fresh = &mut **fresh;
     Ok(State {
         root: old
             .tree

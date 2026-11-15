@@ -77,6 +77,24 @@ jobs:
             "$EDE_REFRESH_PROBE" --ignored --exact \
             document::refresh::tests::large_refresh_storage_measurements --nocapture
 
+      - name: Validate search and replacement with constrained memory (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          for binary in "$GITHUB_WORKSPACE"/target/release/deps/terminal-*; do
+            if [ ! -f "$binary" ] || [ ! -x "$binary" ]; then
+              continue
+            fi
+            for corpus in ordinary dense long; do
+              sudo systemd-run --wait --pipe --collect \
+                --property=MemoryMax=256M --property=MemorySwapMax=0 \
+                --setenv="TMPDIR=$RUNNER_TEMP" \
+                --setenv="EDE_BENCH_MIB=1024" --setenv="EDE_BENCH_CORPUS=$corpus" \
+                --setenv="EDE_BENCH_PEAK_RSS=1" \
+                --property="WorkingDirectory=$GITHUB_WORKSPACE" --uid="$(id -u)" \
+                "$binary" --ignored --exact large_search_and_replace_benchmark --nocapture
+            done
+          done
+
       - name: Validate large-file storage with constrained memory (Linux)
         if: runner.os == 'Linux'
         run: |

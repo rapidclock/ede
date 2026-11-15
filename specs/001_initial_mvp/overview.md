@@ -1,6 +1,6 @@
 # 001 — Initial MVP overview
 
-Status: **MVP scope and roadmap accepted — Stages 01–04 merged; Stage 05 implemented and validated, with its PR open.**
+Status: **MVP scope and roadmap accepted — Stages 01–05 merged; Stage 06 implementation and validation in progress.**
 
 Project: **ede**, a predominantly Rust terminal text editor for macOS and Linux.
 
@@ -393,7 +393,7 @@ storage. Avoid assuming that an open file descriptor or memory map freezes data.
 | Saving | Atomic replacement policy, metadata/links, cancellation, disk exhaustion, and external-change conflicts |
 | Scratch persistence | Resolved in Stage 05: machine-local state, independent live owners, recovery of retired owners, fresh restored history, and scratch-only recovery; power-loss guarantees remain outside scope |
 | Live content | Direct file-follow semantics, log rotation, retention quotas, and producer-error handling |
-| Search | ripgrep library integration, whole-word semantics, Unicode case behavior, multi-document replacement and cancellation |
+| Search | Stage 06 uses bounded ripgrep literal matching, Unicode simple case folding, optional whole-word matching, and per-document atomic replacement; design and implementation authorized |
 | Performance | Benchmark corpus and CPU/storage details for the agreed 1 GiB / 8 GiB RAM baseline; measurement methods, memory budgets, and validation of agreed latency/highlighting defaults |
 | Dependencies | Libraries, grammar versions, compiler/toolchain baseline, and configuration locations |
 
@@ -512,7 +512,7 @@ Evidence: [Stage 04 validation record](04_tabs_and_file_picker.md#validation-rec
 ### 05 — Persistent scratch documents, recovery, and automatic file refresh
 
 Design: [05_scratch_recovery.md](05_scratch_recovery.md). Depends on: 02–04.
-Status: implemented and validated; [PR #5](https://github.com/rapidclock/ede/pull/5) open into `feat/initial_mvp`.
+Status: complete; [PR #5](https://github.com/rapidclock/ede/pull/5) merged into `feat/initial_mvp`.
 Branch: `stage/scratch_recovery`; PR target: `feat/initial_mvp`.
 Evidence: [Stage 05 validation record](05_scratch_recovery.md#validation-record)
 (native and Linux CI results recorded).
@@ -540,7 +540,13 @@ of unsaved named-file edits remains outside this stage.
 
 ### 06 — Search and replacement
 
-Planned file: `06_search_and_replace.md`. Depends on: 02–05.
+Design: [06_search_and_replace.md](06_search_and_replace.md). Depends on: 02–05.
+Status: implemented and independently reviewed; native checks pass, Linux CI pending.
+Implementation was authorized by the user on 2026-11-14.
+The design was independently reviewed and findings fixed before implementation.
+Branch: `stage/search_and_replace`; PR target: `feat/initial_mvp`.
+Evidence: [Stage 06 validation record](06_search_and_replace.md#validation-record)
+(native implementation, review, mutation and performance evidence recorded; Linux CI pending).
 
 - Deliver literal search, case sensitivity, next/previous, replace-next/all, and
   current/all-open-document scopes, including unsaved and scratch contents.

@@ -27,6 +27,9 @@ use std::{
 mod recovery;
 mod refresh;
 use refresh::{Monitor, Watch};
+pub(crate) mod search;
+#[cfg(test)]
+mod search_tests;
 mod session;
 pub(crate) use recovery::RecoveryPage;
 #[cfg(test)]
@@ -50,6 +53,9 @@ struct ViewControl {
     targets: Mutex<Vec<(TabId, Arc<InputEpoch>)>>,
     current: Mutex<Option<TabId>>,
     receiving: Mutex<Option<TabId>>,
+    search: Mutex<Cancellation>,
+    search_navigation: AtomicU64,
+    search_replacing: AtomicBool,
 }
 impl ViewControl {
     fn admit(&self, action: &Action) -> Vec<Arc<InputEpoch>> {
@@ -143,6 +149,11 @@ pub(crate) enum After {
 /// Ordered intent submitted by the terminal shell.
 #[derive(Clone, Debug)]
 pub(crate) enum Action {
+    Search(search::SearchRequest),
+    CancelSearch,
+    InvalidateSearch,
+    InvalidateReplacement,
+    RevokeSearch,
     Command(Command),
     Insert(String),
     Paste(Arc<Spool>),
@@ -203,6 +214,9 @@ impl Action {
     /// Resident payload accounting; disk-backed paste bytes are excluded.
     fn bytes(&self) -> usize {
         (match self {
+            Self::Search(request) => {
+                request.query.literal.capacity() + request.replacement.capacity()
+            }
             Self::Insert(text) => text.capacity(),
             Self::Open(path) | Self::Save(Some(path)) | Self::SaveGuard(_, Some(path)) => {
                 path.capacity()
@@ -247,6 +261,8 @@ pub(crate) enum SaveResult {
 /// Most recent document state plus prepared immutable viewport.
 #[derive(Clone)]
 pub(crate) struct Screen {
+    pub can_replace: bool,
+    pub search: Arc<search::Status>,
     pub tab: Option<TabId>,
     pub tabs: Arc<[TabSummary]>,
     pub reserved_paths: Arc<[Arc<Path>]>,
@@ -265,6 +281,8 @@ impl Default for Screen {
     /// Pending startup is visibly distinct from a ready empty buffer.
     fn default() -> Self {
         Self {
+            can_replace: true,
+            search: Arc::default(),
             tab: None,
             tabs: Arc::default(),
             reserved_paths: Arc::default(),
@@ -288,6 +306,7 @@ struct QueueBudget {
     entries: AtomicUsize,
     paste: AtomicBool,
     cancellation: AtomicU64,
+    searches: AtomicUsize,
 }
 /// A committed transaction whose caret lookup must survive transient read failure/cancellation.
 struct CommittedEdit {
@@ -301,6 +320,7 @@ struct Envelope {
     sequence: u64,
     charge: usize,
     paste: bool,
+    search: bool,
     paste_cancel: Option<Cancellation>,
     cancellation: u64,
     layout_epoch: u64,
@@ -316,6 +336,9 @@ impl Drop for Envelope {
         }
         self.used.bytes.fetch_sub(self.charge, Ordering::AcqRel);
         self.used.entries.fetch_sub(1, Ordering::AcqRel);
+        if self.search {
+            self.used.searches.fetch_sub(1, Ordering::AcqRel);
+        }
         if self.paste {
             if let Ok(mut slot) = self.paste_slot.lock() {
                 *slot = None;
@@ -394,7 +417,7 @@ impl Editor {
         })
     }
     /// Admit an ordered operation or visibly reject it without changing the document.
-    pub fn submit(&mut self, action: Action) -> bool {
+    pub fn submit(&mut self, mut action: Action) -> bool {
         let charge = action.bytes();
         if self
             .used
@@ -421,6 +444,18 @@ impl Editor {
             Action::ForTab(_, inner) => inner,
             action => action,
         };
+        if (matches!(inner, Action::CancelSearch | Action::InvalidateSearch)
+            || matches!(inner, Action::InvalidateReplacement)
+                && self.view_cancel.search_replacing.load(Ordering::Acquire))
+            && let Ok(cancel) = self.view_cancel.search.lock()
+        {
+            cancel.cancel();
+        }
+        if search::revokes_navigation(inner) {
+            self.view_cancel
+                .search_navigation
+                .fetch_add(1, Ordering::AcqRel);
+        }
         let paste = matches!(
             inner,
             Action::Paste(_) | Action::FieldPaste(..) | Action::Command(Command::Paste)
@@ -441,6 +476,20 @@ impl Editor {
             *slot = paste_cancel.clone();
         }
         let sequence = self.sequence + 1;
+        let search = matches!(inner, Action::Search(_));
+        if search
+            && self
+                .used
+                .searches
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                    (count < 16).then_some(count + 1)
+                })
+                .is_err()
+        {
+            self.used.entries.fetch_sub(1, Ordering::AcqRel);
+            self.used.bytes.fetch_sub(charge, Ordering::AcqRel);
+            return false;
+        }
         // Entry admission guarantees channel capacity. Advance epochs before
         // enqueueing so even a job that has not created its read token sees it.
         let layout_epoch = if matches!(
@@ -462,11 +511,19 @@ impl Editor {
             self.view_cancel.navigation.load(Ordering::Acquire)
         };
         let epochs = self.view_cancel.admit(&action);
+        let dispatched = match &mut action {
+            Action::ForTab(_, inner) => &mut **inner,
+            action => action,
+        };
+        if let Action::Search(request) = dispatched {
+            request.navigation = Some(self.view_cancel.search_navigation.load(Ordering::Acquire));
+        }
         let envelope = Envelope {
             action,
             sequence,
             charge,
             paste,
+            search,
             paste_cancel,
             cancellation: self.used.cancellation.load(Ordering::Acquire),
             layout_epoch,
@@ -494,8 +551,17 @@ impl Editor {
     pub fn sequence(&self) -> u64 {
         self.sequence
     }
+    /// Modal ownership can change without a document action or queue admission.
+    pub fn revoke_search_navigation(&self) {
+        self.view_cancel
+            .search_navigation
+            .fetch_add(1, Ordering::AcqRel);
+    }
     /// Cancel the current long operation without requiring admission to its queue.
     pub fn cancel(&self) {
+        if let Ok(cancel) = self.view_cancel.search.lock() {
+            cancel.cancel();
+        }
         self.used.cancellation.fetch_add(1, Ordering::AcqRel);
         self.cancel_paste();
         if let Ok(cancel) = self.activity.lock() {
@@ -543,6 +609,7 @@ impl Drop for Editor {
 }
 /// Coordinator owns view/history metadata and serializes operations against acknowledged epochs.
 struct Coordinator {
+    search: search::State,
     service: StorageService,
     inbox: Receiver<Envelope>,
     events: SyncSender<Event>,
@@ -592,6 +659,7 @@ impl Coordinator {
         view_cancel: Arc<ViewControl>,
     ) -> Self {
         Self {
+            search: search::State::default(),
             service,
             inbox,
             events,
@@ -720,6 +788,7 @@ impl Coordinator {
             }
         }
         let shutdown = self.service.shutdown();
+        self.search.shutdown();
         if let Some(monitor) = self.monitor.take() {
             monitor.shutdown();
         }
@@ -756,6 +825,8 @@ impl Coordinator {
     }
     /// Coalesce screen updates; two bounded layouts at most are retained across the bridge.
     fn publish(&mut self) {
+        self.tab.screen.can_replace = self.tab.capability == crate::search::Capability::Editable;
+        self.tab.screen.search = Arc::new(self.search.status.clone());
         self.summarize();
         if let Ok(mut slot) = self.output.lock() {
             *slot = Some(self.tab.screen.clone());
@@ -905,7 +976,11 @@ impl Coordinator {
     fn poll_background(&mut self) -> bool {
         let result = (|| {
             let changed = self.settle_completions()? | self.receive()?;
-            Ok(changed | self.poll_opens()? | self.poll_retention()? | self.poll_refreshes()?)
+            Ok(changed
+                | self.poll_opens()?
+                | self.poll_retention()?
+                | self.poll_refreshes()?
+                | self.poll_search()?)
         })();
         match result {
             Ok(true) => self.publish(),
@@ -926,6 +1001,9 @@ impl Coordinator {
         paste: Option<Arc<Spool>>,
         range: std::ops::Range<u64>,
     ) -> Result<(), Error> {
+        if self.tab.capability == crate::search::Capability::ReadOnly {
+            return Err(Error::ReadOnly);
+        }
         if let Some(tab) = self.tab.screen.tab {
             self.yield_refresh_for_edit(tab)?;
         }
@@ -936,6 +1014,7 @@ impl Coordinator {
             .is_some_and(|info| info.compaction_pending)
             && let Some(tab) = self.tab.screen.tab
         {
+            self.search.cancel(false);
             self.yield_checkpoint(tab)?;
         }
         let info = self.tab.info.as_ref().ok_or(Error::Busy)?;
@@ -1130,6 +1209,15 @@ impl Coordinator {
     }
     /// Handle one ordered user intention, leaving state intact on a failed edit.
     fn action(&mut self, action: Action) -> Result<(), Error> {
+        if self.tab.capability == crate::search::Capability::ReadOnly && search::mutates(&action) {
+            return Err(Error::ReadOnly);
+        }
+        if self.search.defer_lifecycle(&action, self.active_sequence) {
+            return Ok(());
+        }
+        if search::clears_anchor(&action) {
+            self.search.status.current = None;
+        }
         if matches!(
             action,
             Action::Insert(_) | Action::Paste(_) | Action::Command(_)
@@ -1169,6 +1257,16 @@ impl Coordinator {
             self.reconcile_edit()?;
         }
         match action {
+            Action::Search(request) => self.start_search(request)?,
+            Action::CancelSearch | Action::InvalidateSearch => self
+                .search
+                .cancel(matches!(action, Action::InvalidateSearch)),
+            Action::InvalidateReplacement => {
+                if self.search.status.replacing {
+                    self.search.cancel(false);
+                }
+            }
+            Action::RevokeSearch => {}
             Action::RetryRefresh(tab) => self.retry_refresh(tab)?,
             Action::RecoveryPage {
                 generation,
@@ -1441,7 +1539,7 @@ mod tests {
     use super::*;
     use std::time::Instant;
     /// Worker-side fixture uses the real service without a terminal or shared user files.
-    fn coordinator(options: OpenOptions) -> Coordinator {
+    pub(super) fn coordinator(options: OpenOptions) -> Coordinator {
         let (_, inbox) = mpsc::sync_channel(256);
         let (events, _) = mpsc::sync_channel(16);
         let mut worker = Coordinator::new(
@@ -1458,7 +1556,7 @@ mod tests {
         worker
     }
     /// Read small test contents with the same bounded snapshot interface as production.
-    fn contents(worker: &mut Coordinator) -> String {
+    pub(super) fn contents(worker: &mut Coordinator) -> String {
         let snapshot = worker.snapshot().unwrap();
         let mut result = String::new();
         let mut offset = 0;

@@ -113,6 +113,15 @@ pub enum Request {
     Compact(DocumentId),
     /// Capture immutable clean named state for background refresh preparation.
     PrepareRefresh(DocumentId),
+    /// Capture an editable branch for off-owner batch preparation.
+    PrepareEdit(DocumentId),
+    /// Publish a complete private batch against its original revision.
+    FinishEdit {
+        /// Stable live document identity.
+        document: DocumentId,
+        /// Complete candidate whose preparation performed no live mutation.
+        prepared: Box<super::PreparedEdit>,
+    },
     /// Atomically install prepared content if its captured revision/baseline remain eligible.
     Refresh {
         /// Original runtime document identity.
@@ -131,7 +140,8 @@ impl Request {
             | Self::Snapshot(id)
             | Self::BackgroundSnapshot(id)
             | Self::Compact(id)
-            | Self::PrepareRefresh(id) => Some(*id),
+            | Self::PrepareRefresh(id)
+            | Self::PrepareEdit(id) => Some(*id),
             Self::Read { snapshot, .. }
             | Self::LocateLine { snapshot, .. }
             | Self::Save { snapshot, .. } => Some(snapshot.document()),
@@ -140,7 +150,7 @@ impl Request {
             | Self::Apply { document, .. }
             | Self::Undo { document, .. }
             | Self::Redo { document, .. } => Some(*document),
-            Self::Refresh { document, .. } => Some(*document),
+            Self::Refresh { document, .. } | Self::FinishEdit { document, .. } => Some(*document),
         }
     }
     /// Conservative owned payload charge. Staged file contents do not reside in memory.
@@ -197,6 +207,10 @@ pub enum Response {
     RefreshTask(Box<super::RefreshTask>),
     /// Atomic refresh outcome with explicit history pruning/reset information.
     Refreshed(super::RefreshReport),
+    /// Immutable batch preparation input.
+    EditTask(Box<super::EditTask>),
+    /// Exact metadata acknowledged with the batch root swap.
+    Edited(super::EditReport),
 }
 /// Small owner-consistent metadata for interactive state and bounded undo view history.
 #[derive(Clone, Debug)]
@@ -327,6 +341,21 @@ struct OwnedDocument {
 struct PreparedOpen {
     envelope: Envelope,
     result: Result<OwnedDocument, Error>,
+    return_to: SyncSender<PreparedOpen>,
+}
+/// Rejected prepared storage is fully reclaimed before its terminal completion.
+struct CancelledOpen(PreparedOpen);
+impl super::cleanup::Garbage for CancelledOpen {
+    fn observe(&self) {}
+    fn dispose(self: Box<Self>) {
+        let mut prepared = self.0;
+        drop(std::mem::replace(
+            &mut prepared.result,
+            Err(Error::Cancelled),
+        ));
+        let sender = prepared.return_to.clone();
+        let _ = sender.send(prepared);
+    }
 }
 /// Bounded asynchronous storage bridge. Drop cancels and detaches; shutdown().wait()
 /// provides orderly joining outside the terminal event loop.
@@ -344,6 +373,7 @@ pub struct StorageService {
 /// Pending orderly shutdown. Waiting may block on OS I/O and must occur off the UI thread.
 pub struct Shutdown {
     workers: Vec<JoinHandle<()>>,
+    cleanup: Option<Arc<super::cleanup::Cleanup>>,
 }
 impl Shutdown {
     /// Resolve in-flight publishing saves and release owner-scoped working storage.
@@ -353,6 +383,9 @@ impl Shutdown {
             // Join every owner even if an earlier one panicked. Returning early would
             // detach later workers while they still own in-flight operations/resources.
             panicked |= worker.join().is_err();
+        }
+        if let Some(cleanup) = self.cleanup {
+            cleanup.wait();
         }
         if panicked {
             Err(Error::Io(std::io::Error::other("storage worker panicked")))
@@ -377,6 +410,7 @@ impl StorageService {
         stopping: Arc<AtomicBool>,
     ) -> Result<Self, Error> {
         let resources = Resources::new(&options.limits)?;
+        resources.cleanup.enable();
         let entries = Arc::new(AtomicUsize::new(0));
         let (outbox, inbox) = mpsc::sync_channel(options.limits.queue_entries);
         let capacity = options.limits.queue_entries;
@@ -554,6 +588,7 @@ impl StorageService {
         self.cancel_all();
         Shutdown {
             workers: std::mem::take(&mut self.workers),
+            cleanup: Some(self.resources.cleanup.clone()),
         }
     }
     /// Signal every live owner without waiting for queue slots or filesystem calls.
@@ -670,7 +705,17 @@ fn prepare_opens(
                 _permit: permit,
             })
         })();
-        if prepared.send(PreparedOpen { envelope, result }).is_err() {
+        if result.is_err() {
+            resources.cleanup.wait();
+        }
+        if prepared
+            .send(PreparedOpen {
+                envelope,
+                result,
+                return_to: prepared.clone(),
+            })
+            .is_err()
+        {
             break;
         }
     }
@@ -787,15 +832,25 @@ fn worker(
             }
         }
         // Process at most one transfer before giving mutations and saves a turn.
-        if let Ok(PreparedOpen { envelope, result }) = prepared.try_recv() {
+        if let Ok(preparation) = prepared.try_recv() {
+            // One final classification owns both handback and completion. A
+            // second independent check must not bypass disposal of Ready storage.
+            let cancelled = preparation.envelope.cancel.is_cancelled();
+            if cancelled && preparation.result.is_ok() {
+                resources.cleanup.retire(CancelledOpen(preparation));
+                continue;
+            }
+            let PreparedOpen {
+                envelope, result, ..
+            } = preparation;
             if let Some(mut queued) = opening.remove(&envelope.document) {
                 ready.append(&mut queued);
             }
-            let result = envelope
-                .cancel
-                .check()
-                .and(result)
-                .map(|owned| install(envelope.document, owned, &mut documents));
+            let result = if cancelled {
+                Err(Error::Cancelled)
+            } else {
+                result.map(|owned| install(envelope.document, owned, &mut documents))
+            };
             let revision = match &result {
                 Ok(Response::Ready { revision, .. }) => Some(*revision),
                 _ => None,
@@ -1115,6 +1170,12 @@ fn execute(
                 Request::PrepareRefresh(_) => {
                     Ok(Response::RefreshTask(Box::new(document.prepare_refresh()?)))
                 }
+                Request::PrepareEdit(_) => {
+                    Ok(Response::EditTask(Box::new(document.prepare_edit()?)))
+                }
+                Request::FinishEdit { prepared, .. } => Ok(Response::Edited(
+                    document.finish_edit(*prepared, &envelope.cancel)?,
+                )),
                 Request::Refresh { prepared, .. } => Ok(Response::Refreshed(
                     document.finish_refresh_validated(*prepared, &envelope.cancel)?,
                 )),
@@ -1148,6 +1209,7 @@ mod tests {
         let waiter = thread::spawn(move || {
             let outcome = Shutdown {
                 workers: vec![failing, later],
+                cleanup: None,
             }
             .wait();
             result_sender

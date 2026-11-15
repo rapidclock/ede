@@ -52,6 +52,7 @@ impl Drop for Permit {
 }
 /// Shared cache/buffer budgets across every document belonging to a service.
 pub(super) struct Resources {
+    pub cleanup: Arc<super::cleanup::Cleanup>,
     pub text: Arc<Mutex<Cache>>,
     pub nodes: Arc<Mutex<Cache>>,
     pub buffers: Arc<Budget>,
@@ -60,10 +61,18 @@ impl Resources {
     /// Validate all limits before exposing a resource pool.
     pub fn new(limits: &StorageLimits) -> Result<Arc<Self>, Error> {
         limits.validate()?;
+        let buffers = Budget::new(limits.buffer_bytes);
+        let capacity = limits.buffer_bytes / (32 << 10);
+        let bytes = capacity
+            .checked_mul(std::mem::size_of::<super::source::StoreData>() + 64)
+            .and_then(|bytes| bytes.checked_add(4096))
+            .ok_or(Error::ResourceLimit("cleanup queue size"))?;
+        let cleanup = super::cleanup::Cleanup::new(capacity, buffers.acquire(bytes)?)?;
         Ok(Arc::new(Self {
             text: Arc::new(Mutex::new(Cache::new(limits.text_cache_bytes))),
             nodes: Arc::new(Mutex::new(Cache::new(limits.node_cache_bytes))),
-            buffers: Budget::new(limits.buffer_bytes),
+            buffers,
+            cleanup,
         }))
     }
 }

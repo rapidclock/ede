@@ -26,6 +26,46 @@ use nix::{
 /// Bounded timeouts turn a broken terminal loop into a useful test failure, not a hanging CI job.
 const TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Stage 06 must expose a real non-modal search surface through portable input.
+#[test]
+fn literal_find_panel_uses_unsaved_text() {
+    let mut terminal = PtyChild::editor();
+    terminal.expect("Ready");
+    terminal.send(b"one two one");
+    terminal.expect("one two one");
+    terminal.send(b"\x06");
+    terminal.expect("Find:");
+    terminal.send(b"one\r");
+    terminal.expect("2 matches");
+    terminal.send(b"\x1b");
+    terminal.expect_absent("Find:");
+    terminal.send(b"\x11");
+    terminal.wait();
+}
+
+/// Portable Replace dispatch, confirmation, one atomic batch and ordinary Undo.
+#[test]
+fn literal_replace_all_confirmation_and_undo() {
+    let mut terminal = PtyChild::editor();
+    terminal.expect("Ready");
+    terminal.send(b"one two one");
+    terminal.expect("one two one");
+    terminal.send(b"\x08");
+    terminal.expect("Replace:");
+    terminal.send(b"one\t1\t\t\t\t\t\t\t\r");
+    terminal.expect("Replace all — confirm scope");
+    terminal.send(b"\t\r");
+    terminal.expect("2 occurrences processed");
+    terminal.send(b"\x1b");
+    terminal.expect_absent("Replace all…");
+    terminal.expect("1 two 1");
+    terminal.send(b"\x1a");
+    terminal.expect("one two one");
+    terminal.send(b"\x11");
+    assert!(terminal.wait().success());
+    terminal.assert_restored();
+}
+
 /// Test terminal, retained slave attributes, process, and a bounded diagnostic transcript.
 struct PtyChild {
     _state_root: Option<tempfile::TempDir>,
@@ -551,6 +591,37 @@ fn scratch_quit_and_relaunch_retains_text_without_save_prompts() {
     second.expect_body("retained scratch 界e\u{301}", TIMEOUT);
     second.send(b"\x1a");
     second.expect_body("retained scratch 界e\u{301}", TIMEOUT);
+    second.send(b"\x11");
+    assert!(second.wait().success());
+    second.assert_restored();
+}
+
+/// Replacement revisions participate in normal-exit scratch retention.
+#[test]
+fn replaced_scratch_is_restored_after_normal_quit() {
+    let state = tempfile::tempdir().unwrap();
+    let profile = state.path().join("state");
+    let mut first = PtyChild::editor_with_state(
+        Some("xterm-256color"),
+        std::iter::empty::<&str>(),
+        Some(&profile),
+    );
+    first.expect("Ready");
+    first.send(b"one two one\x08one\t1\t\t\t\t\t\t\t\r");
+    first.expect("Replace all — confirm scope");
+    first.send(b"\t\r");
+    first.expect("2 occurrences processed");
+    first.send(b"\x1b");
+    first.expect_absent("Replace all…");
+    first.send(b"\x11");
+    assert!(first.wait().success());
+    first.assert_restored();
+    let mut second = PtyChild::editor_with_state(
+        Some("xterm-256color"),
+        std::iter::empty::<&str>(),
+        Some(&profile),
+    );
+    second.expect_body("1 two 1", TIMEOUT);
     second.send(b"\x11");
     assert!(second.wait().success());
     second.assert_restored();
@@ -1318,6 +1389,146 @@ fn large_file_interactive_benchmark() {
     assert!(process.wait().success());
     process.assert_restored();
     process.report_peak_rss();
+}
+
+/// Search/replace over a real larger-than-cache fixture while measuring live input.
+#[test]
+#[ignore = "search resource benchmark: EDE_BENCH_MIB=1024 EDE_BENCH_CORPUS=ordinary|dense|long"]
+fn large_search_and_replace_benchmark() {
+    use std::os::unix::fs::FileExt;
+    let mib: u64 = std::env::var("EDE_BENCH_MIB")
+        .unwrap_or_else(|_| "1024".into())
+        .parse()
+        .unwrap();
+    let corpus = std::env::var("EDE_BENCH_CORPUS").unwrap_or_else(|_| "ordinary".into());
+    assert!(mib > 0);
+    let pattern: &[u8] = match corpus.as_str() {
+        "ordinary" => b"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef012\n",
+        "dense" => b"x\n",
+        "long" => b"x",
+        _ => panic!("unknown corpus"),
+    };
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("search-benchmark");
+    let mut chunk = vec![0; 1 << 20];
+    for (index, byte) in chunk.iter_mut().enumerate() {
+        *byte = pattern[index % pattern.len()];
+    }
+    chunk[..10].copy_from_slice(b"SEEK_TOKEN");
+    let mut file = File::create(&path).unwrap();
+    for index in 0..mib {
+        file.write_all(&chunk).unwrap();
+        if (index + 1).is_multiple_of(8) {
+            file.sync_data().unwrap();
+        }
+    }
+    file.sync_all().unwrap();
+    drop(file);
+    eprintln!(
+        "search fixture_ready corpus={corpus} bytes={} warm",
+        mib << 20
+    );
+    let started = Instant::now();
+    let mut process = PtyChild::editor_with_path(Some("xterm-256color"), Some(&path));
+    process.expect_body("SEEK_TOKEN", Duration::from_secs(120));
+    let first_text = started.elapsed();
+    process.expect_with_timeout("Ready", Duration::from_secs(120));
+    let ready = started.elapsed();
+    let pid = process.editor_pid();
+    let rss = || {
+        let output = Command::new("ps")
+            .args(["-o", "rss=", "-p", &pid.as_raw().to_string()])
+            .output()
+            .unwrap();
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .trim()
+            .parse::<u64>()
+            .unwrap()
+    };
+    let mut peak_rss = rss();
+    process.send(b"\x06SEEK_TOKEN\r");
+    let scan_started = Instant::now();
+    process.expect_with_timeout("exact match differs", Duration::from_secs(120));
+    assert!(
+        process
+            .parser
+            .screen()
+            .contents()
+            .contains(&format!("{mib} matches"))
+    );
+    let scan = scan_started.elapsed();
+    process.send(b"\x06\x7f\x7f\x7f\x7f\x7f\x7f\x7f\x7f\x7f\x7f");
+    process.send(if corpus == "ordinary" { b"0\r" } else { b"x\r" });
+    process.send(b"\x1b[17~"); // F6 returns to the live document.
+    let mut latency = Vec::new();
+    for count in 1..=40 {
+        let event = Instant::now();
+        process.send(b"Z");
+        process.expect_body(&"Z".repeat(count), TIMEOUT);
+        latency.push(event.elapsed().as_secs_f64() * 1000.0);
+        peak_rss = peak_rss.max(rss());
+    }
+    let cancel_started = Instant::now();
+    process.send(b"\x1b");
+    let cancel_deadline = Instant::now() + Duration::from_secs(30);
+    let cancellation_observed = loop {
+        process.drain();
+        let screen = process.parser.screen().contents();
+        if screen.contains("Cancelled") {
+            break true;
+        }
+        if !screen.contains("Find:") {
+            break false;
+        }
+        assert!(
+            Instant::now() < cancel_deadline,
+            "cancel did not settle: {screen}"
+        );
+        thread::sleep(Duration::from_millis(1));
+    };
+    let cancellation = cancel_started.elapsed();
+    process.send(b"\x08\x7fSEEK_TOKEN\tFOUND_DONE\t\t\t\t\t\t\t\r");
+    process.expect("Replace all — confirm scope");
+    let replace_started = Instant::now();
+    process.send(b"\t\r");
+    process.expect_with_timeout(
+        &format!("{mib} occurrences processed"),
+        Duration::from_secs(180),
+    );
+    let replacement = replace_started.elapsed();
+    peak_rss = peak_rss.max(rss());
+    process.send(b"\x1b");
+    process.expect_absent("Replace all…");
+    process.send(b"\x13");
+    process.expect_with_timeout("Saved", Duration::from_secs(120));
+    let file = File::open(&path).unwrap();
+    assert_eq!(file.metadata().unwrap().len(), (mib << 20) + 40);
+    let mut bytes = [0; 10];
+    for block in [0, mib / 2, mib - 1] {
+        file.read_exact_at(&mut bytes, (block << 20) + 40).unwrap();
+        assert_eq!(&bytes, b"FOUND_DONE");
+    }
+    process.send(b"\x1a");
+    process.expect_body("SEEK_TOKEN", TIMEOUT);
+    process.send(b"\x11");
+    process.expect("Unsaved changes");
+    process.send(b"\t\t\r");
+    assert!(process.wait().success());
+    process.assert_restored();
+    process.report_peak_rss();
+    latency.sort_by(f64::total_cmp);
+    eprintln!(
+        "search_ui corpus={corpus} MiB={mib} first_text_ms={:.3} ready_ms={:.3} full_scan_ms={:.3} replace_ms={:.3} cancellation_observed={cancellation_observed} cancellation_ms={:.3} input_p50_ms={:.3} input_p95_ms={:.3} input_max_ms={:.3} sampled_peak_RSS_KiB={peak_rss}",
+        first_text.as_secs_f64() * 1000.0,
+        ready.as_secs_f64() * 1000.0,
+        scan.as_secs_f64() * 1000.0,
+        replacement.as_secs_f64() * 1000.0,
+        cancellation.as_secs_f64() * 1000.0,
+        latency[20],
+        latency[38],
+        latency[39]
+    );
 }
 
 /// Pasted path data and immediately following typing/Enter stay in order off the UI thread.
