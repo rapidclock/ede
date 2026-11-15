@@ -45,6 +45,26 @@ jobs:
         if: runner.os == 'Linux'
         run: cargo test --release --locked --test terminal --no-run
 
+      - name: Validate syntax worker release and heap ceiling (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          cargo test --release --locked --test highlighting
+          cargo test --release --locked --test highlighting oversized_projection_reaches_fixed_heap_ceiling -- --ignored --exact --nocapture
+
+      - name: Validate highlighting alongside search with constrained memory (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          for binary in "$GITHUB_WORKSPACE"/target/release/deps/terminal-*; do
+            if [ ! -f "$binary" ] || [ ! -x "$binary" ]; then
+              continue
+            fi
+            sudo systemd-run --wait --pipe --collect \
+              --property=MemoryMax=256M --property=MemorySwapMax=0 \
+              --setenv="TMPDIR=$RUNNER_TEMP" --setenv="EDE_BENCH_PEAK_RSS=1" \
+              --property="WorkingDirectory=$GITHUB_WORKSPACE" --uid="$(id -u)" \
+              "$binary" --ignored --exact large_highlighting_and_search_overlap --nocapture
+          done
+
       - name: Build refresh resource probe (Linux)
         if: runner.os == 'Linux'
         run: |

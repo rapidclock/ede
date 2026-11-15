@@ -32,6 +32,8 @@ pub(crate) mod search;
 #[cfg(test)]
 mod search_tests;
 mod session;
+#[path = "editor/syntax.rs"]
+mod syntax_state;
 pub(crate) use recovery::RecoveryPage;
 #[cfg(test)]
 pub(crate) use recovery::RecoveryRow;
@@ -48,6 +50,7 @@ struct InputEpoch {
 /// Shared tab admission state is small and never holds a lock during filesystem I/O.
 #[derive(Default)]
 struct ViewControl {
+    syntax: Arc<syntax::ProcessControl>,
     active: Mutex<Cancellation>,
     layout: Arc<AtomicU64>,
     navigation: Arc<AtomicU64>,
@@ -86,6 +89,9 @@ impl ViewControl {
             Action::RecoveryPage { .. }
             | Action::DiscardRetained { .. }
             | Action::SetLanguage(..)
+            | Action::RetryHighlighting(..)
+            | Action::SyntaxTheme(..)
+            | Action::ReloadHighlighting
             | Action::FieldPaste(..)
             | Action::CancelGuard => None,
             _ => current,
@@ -171,6 +177,9 @@ pub(crate) enum Action {
     FinishQuit,
     RetryRefresh(TabId),
     SetLanguage(TabId, syntax::Choice),
+    RetryHighlighting(TabId),
+    SyntaxTheme(Arc<str>),
+    ReloadHighlighting,
     RecoveryPage {
         generation: u64,
         cursor: Option<(u64, crate::recovery::Id)>,
@@ -265,6 +274,13 @@ pub(crate) enum SaveResult {
 #[derive(Clone)]
 pub(crate) struct Screen {
     pub syntax_language: syntax::Choice,
+    pub syntax_config: Arc<syntax::Config>,
+    pub syntax_status: syntax::Status,
+    pub syntax_projection: Option<Arc<syntax::Projection>>,
+    pub syntax_palette: syntax::Palette,
+    pub syntax_theme: Arc<str>,
+    pub syntax_notice: Option<Arc<str>>,
+    pub syntax_epoch: u64,
     pub can_replace: bool,
     pub search: Arc<search::Status>,
     pub tab: Option<TabId>,
@@ -286,6 +302,13 @@ impl Default for Screen {
     fn default() -> Self {
         Self {
             syntax_language: syntax::Choice::Auto,
+            syntax_config: Arc::default(),
+            syntax_status: syntax::Status::Plain,
+            syntax_projection: None,
+            syntax_palette: syntax::Palette::default(),
+            syntax_theme: Arc::from("Dark"),
+            syntax_notice: None,
+            syntax_epoch: 0,
             can_replace: true,
             search: Arc::default(),
             tab: None,
@@ -366,18 +389,36 @@ pub(crate) struct Editor {
     worker: Option<JoinHandle<()>>,
 }
 impl Editor {
+    /// Isolate parser lifecycle from terminal job control and restoration.
+    pub(crate) fn pause_highlighting(&self) -> u64 {
+        self.view_cancel.syntax.pause()
+    }
+
+    /// Restart only after the terminal has restored its interactive modes.
+    pub(crate) fn resume_highlighting(&self) {
+        self.view_cancel.syntax.resume();
+    }
+
+    /// Keep a cleanup owner outside the coordinator and event loop.
+    pub(crate) fn highlighting_process(&self) -> Arc<syntax::ProcessControl> {
+        self.view_cancel.syntax.clone()
+    }
     /// Start storage and coordinator workers with an optional initial path.
     pub fn new(
         launch_directory: PathBuf,
         paths: Vec<PathBuf>,
         recovery: crate::recovery::Store,
+        syntax_program: Option<PathBuf>,
     ) -> std::io::Result<Self> {
         let (sender, receiver) = mpsc::sync_channel(256);
         let (event_sender, events) = mpsc::sync_channel(16);
         let screen = Arc::new(Mutex::new(None));
         let stop = Arc::new(AtomicBool::new(false));
         let activity = Arc::new(Mutex::new(Cancellation::default()));
-        let view_cancel = Arc::new(ViewControl::default());
+        let view_cancel = Arc::new(ViewControl {
+            syntax: Arc::new(syntax::ProcessControl::new(syntax_program)),
+            ..ViewControl::default()
+        });
         let view_cancellation = view_cancel.clone();
         let output = screen.clone();
         let stopping = stop.clone();
@@ -614,6 +655,7 @@ impl Drop for Editor {
 }
 /// Coordinator owns view/history metadata and serializes operations against acknowledged epochs.
 struct Coordinator {
+    syntax: syntax_state::State,
     search: search::State,
     service: StorageService,
     inbox: Receiver<Envelope>,
@@ -664,6 +706,7 @@ impl Coordinator {
         view_cancel: Arc<ViewControl>,
     ) -> Self {
         Self {
+            syntax: syntax_state::State::default(),
             search: search::State::default(),
             service,
             inbox,
@@ -706,6 +749,7 @@ impl Coordinator {
     /// Process lifecycle commands and asynchronous results in admission order.
     fn run(mut self, launch_directory: PathBuf, paths: Vec<PathBuf>) {
         self.start(launch_directory, paths);
+        self.syntax.reload();
         self.publish();
         let mut pending = None;
         while !self.stop.load(Ordering::Acquire) {
@@ -793,6 +837,7 @@ impl Coordinator {
             }
         }
         let shutdown = self.service.shutdown();
+        self.syntax.shutdown(&self.view_cancel.syntax);
         self.search.shutdown();
         if let Some(monitor) = self.monitor.take() {
             monitor.shutdown();
@@ -830,6 +875,7 @@ impl Coordinator {
     }
     /// Coalesce screen updates; two bounded layouts at most are retained across the bridge.
     fn publish(&mut self) {
+        self.syntax.screen(&mut self.tab.screen);
         self.tab.screen.can_replace = self.tab.capability == crate::search::Capability::Editable;
         self.tab.screen.search = Arc::new(self.search.status.clone());
         self.summarize();
@@ -980,12 +1026,16 @@ impl Coordinator {
     /// Publish background changes and surface failures without blocking terminal input.
     fn poll_background(&mut self) -> bool {
         let result = (|| {
-            let changed = self.settle_completions()? | self.receive()?;
-            Ok(changed
+            let changed = self.settle_completions()?
+                | self.receive()?
                 | self.poll_opens()?
                 | self.poll_retention()?
                 | self.poll_refreshes()?
-                | self.poll_search()?)
+                | self.poll_search()?;
+            let mut syntax = std::mem::take(&mut self.syntax);
+            let syntax_changed = syntax.poll(self);
+            self.syntax = syntax;
+            Ok(changed | syntax_changed)
         })();
         match result {
             Ok(true) => self.publish(),
@@ -1255,6 +1305,9 @@ impl Coordinator {
                 | Action::FinishQuit
                 | Action::RetryRefresh(_)
                 | Action::SetLanguage(..)
+                | Action::RetryHighlighting(..)
+                | Action::SyntaxTheme(..)
+                | Action::ReloadHighlighting
                 | Action::RecoveryPage { .. }
                 | Action::OpenRetained { .. }
                 | Action::DiscardRetained { .. }
@@ -1275,10 +1328,20 @@ impl Coordinator {
             Action::RevokeSearch => {}
             Action::RetryRefresh(tab) => self.retry_refresh(tab)?,
             Action::SetLanguage(tab, choice) => {
+                let config = self.syntax.config();
                 if let Some(state) = self.state_mut(tab) {
                     state.screen.syntax_language = choice;
+                    state.resolve_syntax(&config);
                 }
             }
+            Action::RetryHighlighting(tab) => {
+                if let Some(state) = self.state_mut(tab) {
+                    state.syntax_attempt = state.syntax_attempt.wrapping_add(1);
+                    state.syntax_failure = None;
+                }
+            }
+            Action::SyntaxTheme(name) => self.syntax.theme(name),
+            Action::ReloadHighlighting => self.syntax.reload(),
             Action::RecoveryPage {
                 generation,
                 cursor,

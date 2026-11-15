@@ -1,8 +1,8 @@
 # ede
 
 A Rust terminal text editor for macOS and Linux, built in reviewed stages.
-Current version **0.0.1-dev.7**. Stage 6 shipped literal search and atomic
-replacement. Stage 7 syntax highlighting is in design. See the
+Current version **0.0.1-dev.7**. This version includes literal search, atomic
+replacement, and customizable syntax highlighting. See the
 [MVP overview](specs/001_initial_mvp/overview.md),
 [Stage 6 validation record](specs/001_initial_mvp/06_search_and_replace.md#validation-record),
 and [Stage 7 validation record](specs/001_initial_mvp/07_syntax_highlighting.md#validation-record).
@@ -23,7 +23,7 @@ cargo run --locked -- -- -filename.txt
 Run in a terminal with a usable `TERM`, at least 40 columns by 8 rows. Smaller
 windows preserve work and show a resize prompt; return to a supported size to
 answer unsaved-change prompts. `--help` and `--version` work without a terminal.
-Pipes and syntax highlighting belong to later stages.
+Reading document text from pipes belongs to Stage 8.
 
 Opening validates a private UTF-8 snapshot in the background. Its initial preview
 is read-only; Escape cancels preparation. Once ready, files remain editable
@@ -134,6 +134,67 @@ adds one undo step within the 256 MiB history budget. If the previous text excee
 that budget, refresh resets history and reports it. Missing or invalid sources
 leave the last good text intact and retry with backoff. Actions → Retry refresh
 and Tab details provide an immediate retry.
+
+## Syntax highlighting
+
+Open a supported file to color its editable source. **F2 → Language…** selects
+Auto, Plain Text, or a language for the current tab. **F2 → Syntax Theme…**
+chooses a session-wide palette. Tab Details shows the language and highlighting
+state. If a file exceeds the size, line, time, or worker memory limit, the whole
+revision uses plain text. Use **Retry Highlighting** to retry an analysis failure.
+The terminal's `NO_COLOR` setting suppresses colors.
+
+Local overrides live in `$XDG_CONFIG_HOME/ede` when `XDG_CONFIG_HOME` is an
+absolute path, or `~/.config/ede` otherwise. Add `highlighting.toml`, then choose
+**F2 → Reload Highlighting**. Reload applies the complete configuration once it
+validates. Errors appear in Tab Details and the last good configuration stays active.
+
+```toml
+default_theme = "Ocean"
+
+[themes.Ocean]
+base = "dark"
+
+[themes.Ocean.colors]
+keyword = "#68D5F7"
+comment = "bright-black"
+
+[files.names]
+".env" = "ini"
+
+[files.extensions]
+notes = "markdown"
+
+[fences.aliases]
+rs-example = "rust"
+```
+
+Theme bases are `dark` and `light`. Colors accept `#RRGGBB` or the ANSI names
+`black`, `red`, `green`, `yellow`, `blue`, `magenta`, `cyan`, and `white`, each
+with an optional `bright-` prefix. Category names are `comment`, `string`,
+`number`, `keyword`, `type`, `property`, `markup`, `function`, `constant`,
+`operator`, `punctuation`, `variable`, `tag`, `attribute`, and `code`.
+
+Language IDs are `markdown`, `toml`, `yaml`, `json`, `javascript`, `typescript`,
+`python`, `rust`, `ini`, `xml`, `html`, and `css`. Association targets can also
+be `plain`. Exact basenames take precedence over custom extensions and bundled
+extensions. Extensions and fence aliases fold ASCII case. The fence aliases
+`text` and `plain` always use neutral code styling.
+
+Place custom Tree-sitter captures in `queries/<language-id>/highlights.scm`.
+Use `queries/markdown/inline-highlights.scm` for Markdown inline syntax. For
+example, `((primitive_type) @keyword (#eq? @keyword "u32"))` in the Rust query
+recolors `u32` using the theme's keyword color. Supported predicates include
+`#eq?`, `#not-eq?`, `#match?`, `#not-match?`, their `any-` variants, `#any-of?`,
+and `#not-any-of?`. Use the category names above in custom captures. Later
+matching custom patterns win. Built-in rules cover the rest of the syntax.
+
+Use the [bundled query registry](src/syntax/engine.rs),
+[ede query sources](src/syntax/queries), and the pinned grammar versions in the
+[Stage 7 validation record](specs/001_initial_mvp/07_syntax_highlighting.md#validation-record)
+as starting points. Builds require a C compiler for the bundled generated
+grammars. The executable highlights offline.
+See the [Stage 7 dependency notices](licenses/stage07) for upstream licenses.
 
 ## Cmd delivery
 

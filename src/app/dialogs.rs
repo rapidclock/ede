@@ -4,18 +4,19 @@ use super::*;
 
 impl AppState {
     /// Apply a choice to the tab the picker was opened for, or keep it pending at tiny sizes.
-    pub(super) fn language_command(
+    pub(super) fn syntax_picker_command(
         &mut self,
         command: Command,
         layout: &LayoutSnapshot,
     ) -> Option<Intent> {
-        let Some(Modal::Language { tab, row, .. }) = &mut self.modal else {
-            return None;
-        };
         if layout.list_rows() == 0 {
             return None;
         }
-        let end = Choice::options().count() - 1;
+        let (row, end) = match &mut self.modal {
+            Some(Modal::Language { row, .. }) => (row, Choice::options().count() - 1),
+            Some(Modal::SyntaxTheme { config, row }) => (row, config.themes().count() - 1),
+            _ => return None,
+        };
         *row = match command {
             Command::Move(Movement::Up, _) => row.saturating_sub(1),
             Command::Move(Movement::Down, _) => (*row + 1).min(end),
@@ -28,12 +29,20 @@ impl AppState {
                     Some(Control::LanguageRow(clicked)) if command == Command::Activate => clicked,
                     _ => *row,
                 };
-                let intent = Intent::Editor(Action::SetLanguage(*tab, Choice::options().nth(row)?));
+                let action = match &self.modal {
+                    Some(Modal::Language { tab, .. }) => {
+                        Action::SetLanguage(*tab, Choice::options().nth(row)?)
+                    }
+                    Some(Modal::SyntaxTheme { config, .. }) => {
+                        Action::SyntaxTheme(Arc::from(config.themes().nth(row)?))
+                    }
+                    _ => return None,
+                };
                 self.modal = None;
                 self.focus = self.opener.take().or(Some(Control::Content));
                 self.capture = None;
                 self.dirty = true;
-                return Some(intent);
+                return Some(Intent::Editor(action));
             }
             _ => return None,
         };

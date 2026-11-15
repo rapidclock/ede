@@ -26,6 +26,9 @@ pub(crate) struct TabSummary {
 /// The active or a parked document's editor state. Only the active tab has a layout.
 #[derive(Default)]
 pub(super) struct TabState {
+    pub(super) syntax_attempt: u64,
+    pub(super) syntax_failure: Option<syntax_state::Failure>,
+    pub(super) syntax_effective: Option<&'static syntax::Language>,
     pub(super) capability: crate::search::Capability,
     pub(super) input: Arc<InputEpoch>,
     pub screen: Screen,
@@ -49,7 +52,7 @@ pub(super) struct Tab {
     label: Arc<str>,
     path_hint: Option<Arc<str>>,
     startup: bool,
-    state: Option<TabState>,
+    pub(super) state: Option<TabState>,
     path_charge: Option<document::Permit>,
     _metadata: document::Permit,
 }
@@ -418,6 +421,9 @@ impl Coordinator {
             retention.active = Some(scratch.id);
         }
         old.screen.view = None;
+        old.screen.syntax_projection = None;
+        old.screen.syntax_config = Arc::default();
+        old.screen.syntax_notice = None;
         old.screen.tabs = Arc::default();
         old.screen.reserved_paths = Arc::default();
         old.screen.pointer_press = None;
@@ -703,6 +709,8 @@ impl Coordinator {
                 && job.request == completion.request
         }) {
             self.completed_save = Some(completion);
+        } else {
+            self.syntax.receive(completion);
         }
     }
 
@@ -1074,14 +1082,29 @@ impl Coordinator {
 
     fn refresh_tab(&mut self, id: TabId, document: DocumentId) -> Result<(), Error> {
         let info = self.read_info(document)?;
+        let config = self.syntax.config();
         if let Some(state) = self.state_mut(id) {
             state.apply_info(info);
+            state.resolve_syntax(&config);
         }
         Ok(())
     }
 }
 
 impl TabState {
+    /// Retire a latched failure whenever the effective language changes.
+    pub(super) fn resolve_syntax(&mut self, config: &syntax::Config) {
+        let language = self
+            .screen
+            .syntax_language
+            .effective(self.screen.path.as_deref(), config);
+        if self.syntax_effective != language {
+            self.syntax_effective = language;
+            self.syntax_attempt = self.syntax_attempt.wrapping_add(1);
+            self.syntax_failure = None;
+        }
+    }
+
     pub(super) fn apply_info(&mut self, info: DocumentInfo) {
         self.screen.path = info.path.clone();
         self.screen.modified =

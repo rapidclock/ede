@@ -135,6 +135,7 @@ pub(crate) fn run(
     launch_directory: PathBuf,
     paths: Vec<PathBuf>,
     recovery: crate::recovery::Store,
+    syntax_program: Option<PathBuf>,
 ) -> io::Result<Exit> {
     let (width, height) = crossterm::terminal::size()?;
     // The event loop owns resize/layout changes. A fixed viewport prevents Ratatui
@@ -145,7 +146,6 @@ pub(crate) fn run(
             viewport: Viewport::Fixed(Rect::new(0, 0, width, height)),
         },
     )?;
-    let mut editor = Editor::new(launch_directory.clone(), paths, recovery)?;
     let picker = crate::picker::Picker::new()?;
     let mut host = TerminalHost {
         terminal,
@@ -154,13 +154,18 @@ pub(crate) fn run(
         started: Instant::now(),
         ingress: Ingress::new()?,
     };
+    let mut editor = Editor::new(launch_directory.clone(), paths, recovery, syntax_program)?;
+    let highlighting = editor.highlighting_process();
     let mut app = AppState::new();
     app.set_launch_directory(launch_directory);
-    let result = event_loop_impl(&mut host, inbox, Some(&mut editor), Some(&picker), app);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        event_loop_impl(&mut host, inbox, Some(&mut editor), Some(&picker), app)
+    }));
     host.ingress.stop();
     let worker = editor.shutdown();
     let picker_worker = picker.shutdown();
     let restoration = host.session.restore();
+    highlighting.pause();
     host.ingress.join();
     drop(host);
     if let Some(worker) = worker {
@@ -169,8 +174,13 @@ pub(crate) fn run(
     if let Some(worker) = picker_worker {
         let _ = worker.join();
     }
-    restoration?;
-    result
+    match result {
+        Ok(result) => {
+            restoration?;
+            result
+        }
+        Err(payload) => std::panic::resume_unwind(payload),
+    }
 }
 
 /// Own UI state, checking signals between individual events even during an input flood.
@@ -245,7 +255,7 @@ fn event_loop_impl(
             return Ok(Exit { code: 128 + signal });
         }
         if host.suspend_requested() {
-            suspend(host, &mut app)?;
+            suspend(host, &mut app, editor.as_deref())?;
             area = host.area()?;
             rendered_generation = None;
         }
@@ -386,7 +396,7 @@ fn effect(
             }
         }
         Intent::QuitConfirmed => return Ok(true),
-        Intent::Suspend => suspend(host, app)?,
+        Intent::Suspend => suspend(host, app, editor.as_deref())?,
         Intent::MouseCapture(enabled) => host.mouse(enabled)?,
         Intent::Picker(request) => {
             if let Some(picker) = picker {
@@ -486,8 +496,21 @@ fn draw(
 }
 
 /// Report unavailable job control without leaving active modes partially restored.
-fn suspend(host: &mut impl Host, app: &mut AppState) -> io::Result<()> {
-    if host.suspend()? {
+fn suspend(host: &mut impl Host, app: &mut AppState, editor: Option<&Editor>) -> io::Result<()> {
+    if let Some(editor) = editor {
+        app.syntax_epoch = editor.pause_highlighting();
+        app.screen.syntax_projection = None;
+        if app.screen.syntax_status == crate::syntax::Status::Ready {
+            app.screen.syntax_status = crate::syntax::Status::Preparing;
+        }
+    }
+    let result = host.suspend();
+    if let Some(editor) = editor
+        && result.is_ok()
+    {
+        editor.resume_highlighting();
+    }
+    if result? {
         host.clear()?;
         app.input(
             Input::FocusLost,

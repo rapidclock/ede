@@ -44,6 +44,16 @@ pub(crate) struct Permit {
     budget: Arc<Budget>,
     bytes: usize,
 }
+impl Permit {
+    /// Release temporary workspace while retaining the published result's charge.
+    pub(crate) fn shrink(&mut self, bytes: usize) {
+        assert!(bytes <= self.bytes);
+        self.budget
+            .used
+            .fetch_sub(self.bytes - bytes, Ordering::AcqRel);
+        self.bytes = bytes;
+    }
+}
 impl Drop for Permit {
     /// Release exactly the successfully admitted allocation charge.
     fn drop(&mut self) {

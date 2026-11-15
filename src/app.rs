@@ -43,6 +43,10 @@ pub(crate) enum Modal {
         selected: Choice,
         row: usize,
     },
+    SyntaxTheme {
+        config: Arc<crate::syntax::Config>,
+        row: usize,
+    },
     Path(PathKind, String),
     Open(Box<picker::Dialog>),
     Tabs(Option<TabId>),
@@ -93,6 +97,7 @@ pub(crate) struct AppState {
     pub status: StatusMessage,
     pub dirty: bool,
     pub screen: Screen,
+    pub(crate) syntax_epoch: u64,
     pub mouse_capture: bool,
     pub pending: bool,
     opener: Option<Control>,
@@ -152,6 +157,9 @@ pub(crate) const MENU: &[(Command, &str)] = &[
     (Command::ReplaceAll, "Replace all"),
     (Command::CancelSearch, "Cancel search"),
     (Command::Language, "Language…"),
+    (Command::SyntaxTheme, "Syntax Theme…"),
+    (Command::ReloadHighlighting, "Reload Highlighting"),
+    (Command::RetryHighlighting, "Retry Highlighting"),
 ];
 impl AppState {
     /// Begin with text focus and a visible asynchronous preparation state.
@@ -165,6 +173,7 @@ impl AppState {
             status: StatusMessage::new(Severity::Info, "Preparing document"),
             dirty: true,
             screen: Screen::default(),
+            syntax_epoch: 0,
             mouse_capture: true,
             pending: false,
             opener: None,
@@ -233,13 +242,23 @@ impl AppState {
             }
         }
         let choice = self.screen.syntax_language;
-        let language = choice.name(self.screen.path.as_deref());
+        let language = choice.name(self.screen.path.as_deref(), &self.screen.syntax_config);
         let mode = if choice == Choice::Auto {
             "Auto"
         } else {
             "Manual"
         };
         label.push_str(&format!("\nLanguage: {language} ({mode})"));
+        label.push_str(&format!(
+            "\nHighlighting: {}",
+            self.screen.syntax_status.message()
+        ));
+        if let Some(error) = &self.screen.syntax_notice {
+            label.push_str(&format!(
+                "\nHighlighting configuration: {}",
+                crate::text::safe(error)
+            ));
+        }
         label
     }
 
@@ -282,7 +301,13 @@ impl AppState {
         }
     }
     /// Install the latest prepared viewport; an Arc shares drawing and pointer geometry.
-    pub fn update(&mut self, screen: Screen, pending: bool) {
+    pub fn update(&mut self, mut screen: Screen, pending: bool) {
+        if self.syntax_epoch != screen.syntax_epoch {
+            screen.syntax_projection = None;
+            if screen.syntax_status == crate::syntax::Status::Ready {
+                screen.syntax_status = crate::syntax::Status::Preparing;
+            }
+        }
         if self
             .switching
             .is_some_and(|sequence| screen.acknowledged >= sequence)
@@ -762,8 +787,11 @@ impl AppState {
         if matches!(self.modal, Some(Modal::Tabs(_))) {
             return self.tabs_command(command, layout);
         }
-        if matches!(self.modal, Some(Modal::Language { .. })) {
-            return self.language_command(command, layout);
+        if matches!(
+            self.modal,
+            Some(Modal::Language { .. } | Modal::SyntaxTheme { .. })
+        ) {
+            return self.syntax_picker_command(command, layout);
         }
         if matches!(
             self.modal,
@@ -1034,7 +1062,7 @@ impl AppState {
                 self.guard_return = from_menu;
                 self.guard_focus = self.focus;
             }
-            self.focus = if command == Command::Language {
+            self.focus = if matches!(command, Command::Language | Command::SyntaxTheme) {
                 self.opener.take().or(Some(Control::Content))
             } else {
                 Some(Control::Content)
@@ -1133,6 +1161,24 @@ impl AppState {
                 None
             }
             Command::Language => None,
+            Command::SyntaxTheme => {
+                let config = self.screen.syntax_config.clone();
+                let row = config
+                    .themes()
+                    .position(|name| name == self.screen.syntax_theme.as_ref())
+                    .unwrap_or(0);
+                self.opener = self.focus;
+                self.help = false;
+                self.modal = Some(Modal::SyntaxTheme { config, row });
+                self.focus = Some(Control::LanguageRow(row));
+                self.capture = None;
+                self.dirty = true;
+                None
+            }
+            Command::ReloadHighlighting => Some(Intent::Editor(Action::ReloadHighlighting)),
+            Command::RetryHighlighting => {
+                Some(Intent::Editor(Action::RetryHighlighting(self.screen.tab?)))
+            }
             Command::Recovery => self.open_recovery(),
             Command::RetryRefresh => {
                 self.modal = None;
@@ -1250,8 +1296,11 @@ impl AppState {
             if self.dialog_wheel(up, layout) {
                 return None;
             }
-            if matches!(self.modal, Some(Modal::Language { .. })) {
-                return self.language_command(
+            if matches!(
+                self.modal,
+                Some(Modal::Language { .. } | Modal::SyntaxTheme { .. })
+            ) {
+                return self.syntax_picker_command(
                     Command::Move(if up { Movement::Up } else { Movement::Down }, false),
                     layout,
                 );
@@ -1627,7 +1676,7 @@ mod tests {
             );
             if kind == MouseEventKind::Up(MouseButton::Left) {
                 assert!(
-                    matches!(intent, Some(Intent::Editor(Action::SetLanguage(TabId(1), choice))) if choice.name(None) == "CSS")
+                    matches!(intent, Some(Intent::Editor(Action::SetLanguage(TabId(1), choice))) if choice.name(None, &app.screen.syntax_config) == "CSS")
                 );
             } else {
                 assert!(intent.is_none());

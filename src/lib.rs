@@ -1,6 +1,8 @@
 //! Interactive paged text editor. Application state is independent of terminal ownership.
 
 mod app;
+#[doc(hidden)]
+pub use syntax::serve as syntax_worker;
 mod command;
 pub mod document;
 mod editor;
@@ -71,7 +73,7 @@ impl From<io::Error> for Failure {
 /// Start an unnamed editor document after validating stdin, stdout, and TERM.
 pub fn run() -> Result<Exit, Failure> {
     let (_sender, inbox) = status::mailbox();
-    run_session(inbox, Vec::new())
+    run_session(inbox, Vec::new(), None)
 }
 
 /// Start an unnamed editing session with a bounded background mailbox supplied by its caller.
@@ -81,7 +83,7 @@ pub fn run() -> Result<Exit, Failure> {
 /// diagnostics while it is active; the binary suppresses the default panic hook so
 /// panic diagnostics are printed after restoration as well.
 pub fn run_with_status(inbox: StatusInbox) -> Result<Exit, Failure> {
-    run_session(inbox, Vec::new())
+    run_session(inbox, Vec::new(), None)
 }
 /// Start a single-document editing session with an optional OS-native file path.
 pub fn run_with_path(path: Option<PathBuf>) -> Result<Exit, Failure> {
@@ -90,10 +92,21 @@ pub fn run_with_path(path: Option<PathBuf>) -> Result<Exit, Failure> {
 /// Start a session with OS-native paths in argument order.
 pub fn run_with_paths(paths: Vec<PathBuf>) -> Result<Exit, Failure> {
     let (_sender, inbox) = status::mailbox();
-    run_session(inbox, paths)
+    run_session(inbox, paths, None)
+}
+
+/// Start the ede CLI with an executable that implements the private syntax protocol.
+#[doc(hidden)]
+pub fn run_cli(paths: Vec<PathBuf>, executable: Option<PathBuf>) -> Result<Exit, Failure> {
+    let (_sender, inbox) = status::mailbox();
+    run_session(inbox, paths, executable)
 }
 /// Shared lifecycle boundary for embedded callers and command-line document startup.
-fn run_session(inbox: StatusInbox, paths: Vec<PathBuf>) -> Result<Exit, Failure> {
+fn run_session(
+    inbox: StatusInbox,
+    paths: Vec<PathBuf>,
+    executable: Option<PathBuf>,
+) -> Result<Exit, Failure> {
     if paths.len() > TAB_LIMIT {
         return Err(Failure {
             message: format!("Expected at most {TAB_LIMIT} startup paths"),
@@ -108,7 +121,15 @@ fn run_session(inbox: StatusInbox, paths: Vec<PathBuf>) -> Result<Exit, Failure>
     let mut session = TerminalSession::new(UnixTerminal);
     guarded(&mut session, |session| {
         session.acquire()?;
-        runtime::run(session, &signals, inbox, launch_directory, paths, recovery)
+        runtime::run(
+            session,
+            &signals,
+            inbox,
+            launch_directory,
+            paths,
+            recovery,
+            executable,
+        )
     })
 }
 

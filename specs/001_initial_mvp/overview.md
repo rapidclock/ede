@@ -1,6 +1,6 @@
 # 001 — Initial MVP overview
 
-Status: **MVP scope and roadmap accepted — Stages 01–06 merged. Stage 07 implementation started.**
+Status: **MVP scope and roadmap accepted — Stages 01–06 merged. Stage 07 implementation under validation.**
 
 Project: **ede**, a predominantly Rust terminal text editor for macOS and Linux.
 
@@ -139,7 +139,7 @@ are proposed interaction details, subject to review.
 - Degrade or disable highlighting when necessary to preserve responsiveness;
   explain the change visibly. Highlighting limits must not make a file uneditable.
 
-Exact grammars, dialects, and theme defaults remain open. Loading entirely new
+Stage 07 records the agreed engine, bundled grammars, dialects, and theme defaults. Loading entirely new
 grammars at runtime remains a separate design decision.
 
 Agreed initial highlighting heuristics (configurable and subject to benchmarks):
@@ -318,8 +318,8 @@ overwrite current state. Changes should be expressed as undoable transactions.
 
 Stage 01 selects Ratatui with Crossterm; its implementation is merged and dependency
 versions are recorded in the stage design. The [Stage 07 design](07_syntax_highlighting.md)
-proposes Tree-sitter with bundled grammars and compares it with Syntect. Engine
-and dependency selection remains open for user approval after feasibility checks.
+selects Tree-sitter with bundled grammars and records the Syntect comparison and
+feasibility evidence.
 
 Prefer reuse of ripgrep's Rust libraries where they fit editor search. Evaluate
 `grep-searcher`, `grep-matcher`, and `grep-regex` before writing a custom engine.
@@ -558,7 +558,7 @@ Evidence: [Stage 06 validation record](06_search_and_replace.md#validation-recor
 ### 07 — Syntax highlighting
 
 Design: [07_syntax_highlighting.md](07_syntax_highlighting.md). Depends on: 02–06.
-Status — Built-in language detection and selection implemented. Engine selection is open.
+Status — Implemented with Tree-sitter. Acceptance validation in progress.
 Branch: `stage/syntax_highlighting`; PR target: `feat/initial_mvp`.
 Evidence: [Stage 07 validation record](07_syntax_highlighting.md#validation-record).
 

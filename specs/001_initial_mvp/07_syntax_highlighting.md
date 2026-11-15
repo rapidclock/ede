@@ -1,6 +1,6 @@
 # 07 — Syntax highlighting
 
-Status — **Implementation started. Language selection landed on the stage branch. Engine selection remains open.**
+Status — **Implemented on the stage branch. Acceptance validation in progress.**
 
 Branch — `stage/syntax_highlighting`, based on `feat/initial_mvp` at `9714b09`.
 PR target — `feat/initial_mvp`.
@@ -21,12 +21,11 @@ highlighting failure.
 
 Required scope includes all eleven languages and the embedded cases below.
 The 20 MiB, 64 KiB, and 250 ms thresholds are already agreed starting defaults.
-The user authorized implementation on 2026-11-14. Built-in filename detection
-and per-tab language selection are implemented. Custom configuration, themes,
-syntax analysis, and coloring remain pending. The remaining interaction, dialect
-boundaries, worker design, and additional resource caps below form the proposal.
-Confirm the engine, grammar sources, and Markdown/INI dialects with the user
-before adding dependencies. No supported language or required embedding is deferred.
+The user authorized implementation and chose Tree-sitter with the pinned
+grammars below. The approved Markdown dialect is CommonMark with GFM tables,
+task lists and strikethrough. The approved INI dialect uses column-one comments
+and treats text after the equals sign as the setting value. No language or
+embedding deferral has been approved.
 
 ## Detection and language coverage
 
@@ -157,9 +156,10 @@ keys, language IDs and how to obtain the bundled queries as starting points.
   case folding.
   Reject extensions or fence aliases that duplicate another user entry after
   ASCII case folding.
-- **Highlighting rules.** For the proposed Tree-sitter engine, an optional
+- **Highlighting rules.** An optional
   `queries/<language-id>/highlights.scm` supplies capture patterns for a
-  bundled grammar's syntax tree. On overlapping captures in the same syntax
+  bundled grammar's syntax tree. The separate Markdown inline grammar uses
+  `queries/markdown/inline-highlights.scm`. On overlapping captures in the same syntax
   tree, matching user patterns take precedence over built-in patterns and the
   later matching user pattern wins. Bundled rules still style other text and
   nested language bodies retain their own rules. Document the supported query
@@ -236,7 +236,7 @@ waiting on analysis. Changes to text, effective language, or lifecycle revoke
 former analysis; changes to the view revoke only its projection. Reconcile
 inactive refresh through the ordinary tab state and start fresh when activated.
 
-The proposed Tree-sitter path uses one background analysis helper, isolated
+Tree-sitter uses one background analysis helper, isolated
 from terminal I/O and storage ownership. Reuse the current executable in a
 private worker mode with a bounded protocol over dedicated pipes. The helper
 never acquires the terminal or reads the editor's document stdin and receives
@@ -255,7 +255,7 @@ responsiveness checks pass. Keep reads, parsing, IPC, validation and cleanup
 off the terminal and storage owner loops. Foreground commands never wait for
 optional analysis to finish.
 
-Proposed budgets are 64 KiB per input window, 1 MiB total incremental editor-side
+Budgets allow up to 64 KiB per input window, 1 MiB total incremental editor-side
 buffer/IPC/result allocation charged to the existing 32 MiB shared buffer
 pool, and 64 MiB of helper dynamic allocation including input, query state,
 trees, nested parses, and staging. Cap emitted projections at 16,384 normalized
@@ -283,7 +283,7 @@ fallback latches.
 
 ## Engine decision and feasibility
 
-Tree-sitter is the leading proposal. It supports included ranges for embedded
+Tree-sitter is the approved engine. It supports included ranges for embedded
 languages and programmable capture queries, and its Rust bindings expose
 parse/query progress callbacks. The Markdown candidate provides block and
 inline grammars and relevant extensions. Native code and per-language
@@ -300,7 +300,7 @@ Feasibility must exercise user-authored queries on bundled grammars, including
 invalid rules and costly matches, under the same analysis limits.
 [Tree-sitter query syntax](https://tree-sitter.github.io/tree-sitter/using-parsers/queries/1-syntax.html)
 
-Syntect is the alternative. Sublime syntax definitions and resumable line state
+Syntect was the alternative. Sublime syntax definitions and resumable line state
 offer a smaller integration surface if the bindings cover all required forms.
 The pure-Rust regex option avoids Oniguruma; its worst-case interruptibility and
 the exact bundled syntax and injection coverage still need proof. Measure it
