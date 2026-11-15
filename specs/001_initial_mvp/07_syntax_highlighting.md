@@ -550,4 +550,8 @@ checks the committed file before quitting and also passed in release mode
 with timing enabled. CI starts the regular workspace test step with a soft
 limit of 256 on both hosted platforms. Independent review against `c807466`
 confirmed the soft limit adjustment preserves the inherited hard limit and
-passed both focused 64-tab tests under the same macOS limit.
+passed both focused 64-tab tests under the same macOS limit. The two focused
+tests also passed locally with a hard limit of 512. The full workspace
+suite passed in release mode. The [follow-up CI matrix](https://github.com/rapidclock/ede/actions/runs/43755157165)
+passed for `9802a1c`, including the low-limit workspace tests on both hosts
+and all Linux constrained-memory checks.
