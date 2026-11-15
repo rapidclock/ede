@@ -630,33 +630,46 @@ impl PtyChild {
         args: impl IntoIterator<Item = impl AsRef<std::ffi::OsStr>>,
         state: Option<&std::path::Path>,
     ) -> Self {
-        Self::editor_with_config(term, args, state, None)
+        Self::editor_with_options(term, args, state, None, None)
     }
 
-    /// Isolate optional highlighting configuration from the invoking user's files.
-    fn editor_with_config(
+    /// Start the editor with isolated state, highlighting configuration and optional soft limit.
+    fn editor_with_options(
         term: Option<&str>,
         args: impl IntoIterator<Item = impl AsRef<std::ffi::OsStr>>,
         state: Option<&std::path::Path>,
         config: Option<&std::path::Path>,
+        descriptor_limit: Option<u16>,
     ) -> Self {
         // The interactive parent supplies job control and stays alive after ede exits,
         // allowing exact post-exit termios capture before Darwin revokes the slave PTY.
         let mut command = Command::new("/bin/sh");
-        let script = "# The nested shell expands its own PID and positional parameters.\n# shellcheck disable=SC2016\nif [ \"$1\" = unset ]; then unset TERM; else TERM=$2; export TERM; fi; shift 2; /bin/sh -c 'printf \"EDE_PID:%s\\n\" \"$$\"; program=$1; shift; exec \"$program\" \"$@\"' ede-child \"$@\"; result=$?; printf '\\nEDE_EXIT:%s\\n' \"$result\"; read -r _completion; exit \"$result\"";
+        let script = r#"
+if [ "$1" = unset ]; then unset TERM; else TERM=$2; export TERM; fi
+if [ -n "$3" ]; then ulimit -Sn "$3" || exit 1; fi
+shift 3
+# The nested shell expands its own PID and positional parameters.
+# shellcheck disable=SC2016
+/bin/sh -c 'printf "EDE_PID:%s\n" "$$"; program=$1; shift; exec "$program" "$@"' ede-child "$@"
+result=$?
+printf '\nEDE_EXIT:%s\n' "$result"
+read -r _completion
+exit "$result"
+"#;
         let script = if std::env::var_os("EDE_BENCH_PEAK_RSS").is_some() {
             script.replacen(
-                "; /bin/sh -c",
+                "\n/bin/sh -c",
                 if cfg!(target_os = "macos") {
-                    "; /usr/bin/time -l /bin/sh -c"
+                    "\n/usr/bin/time -l /bin/sh -c"
                 } else {
-                    "; /usr/bin/time -v /bin/sh -c"
+                    "\n/usr/bin/time -v /bin/sh -c"
                 },
                 1,
             )
         } else {
             script.into()
         };
+        let descriptor_limit = descriptor_limit.map(|limit| limit.to_string());
         command.args([
             "-i",
             "-c",
@@ -664,6 +677,7 @@ impl PtyChild {
             "ede-term-test",
             if term.is_none() { "unset" } else { "set" },
             term.unwrap_or(""),
+            descriptor_limit.as_deref().unwrap_or(""),
             env!("CARGO_BIN_EXE_ede"),
         ]);
         command.args(args);
@@ -2083,11 +2097,12 @@ fn highlighting_configuration_reload_keeps_last_good_revision() {
     };
     std::fs::write(&file, theme("#AA1234")).unwrap();
     std::fs::write(&rules, "(primitive_type) @number").unwrap();
-    let mut process = PtyChild::editor_with_config(
+    let mut process = PtyChild::editor_with_options(
         Some("xterm-256color"),
         [&source],
         None,
         Some(directory.path()),
+        None,
     );
     process.expect("fn example()");
     syntax_color(&mut process, 1, 0, vt100::Color::Rgb(0xaa, 0x12, 0x34));
@@ -2159,7 +2174,8 @@ fn sixty_four_highlighted_tabs_keep_foreground_budget() {
             path
         })
         .collect();
-    let mut process = PtyChild::editor_with_args(Some("xterm-256color"), &paths);
+    let mut process =
+        PtyChild::editor_with_options(Some("xterm-256color"), &paths, None, None, Some(256));
     for index in 0..64 {
         process.expect(&format!("Heading {index:02}"));
         let until = Instant::now() + TIMEOUT;

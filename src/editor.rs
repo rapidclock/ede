@@ -1614,6 +1614,7 @@ mod tests {
     use std::time::Instant;
     /// Worker-side fixture uses the real service without a terminal or shared user files.
     pub(super) fn coordinator(options: OpenOptions) -> Coordinator {
+        crate::provide_descriptor_headroom();
         let (_, inbox) = mpsc::sync_channel(256);
         let (events, _) = mpsc::sync_channel(16);
         let mut worker = Coordinator::new(

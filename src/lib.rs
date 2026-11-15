@@ -98,9 +98,27 @@ pub fn run_with_paths(paths: Vec<PathBuf>) -> Result<Exit, Failure> {
 /// Start the ede CLI with an executable that implements the private syntax protocol.
 #[doc(hidden)]
 pub fn run_cli(paths: Vec<PathBuf>, executable: Option<PathBuf>) -> Result<Exit, Failure> {
+    provide_descriptor_headroom();
     let (_sender, inbox) = status::mailbox();
     run_session(inbox, paths, executable)
 }
+
+/// Raise the process's soft limit, when permitted, before opening document stores.
+/// A full session needs four files per tab plus descriptors for snapshots, I/O and workers.
+fn provide_descriptor_headroom() {
+    use nix::sys::resource::{Resource::RLIMIT_NOFILE, getrlimit, setrlimit};
+
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| {
+        if let Ok((soft, hard)) = getrlimit(RLIMIT_NOFILE) {
+            let target = hard.min(1024);
+            if soft < target {
+                let _ = setrlimit(RLIMIT_NOFILE, target, hard);
+            }
+        }
+    });
+}
+
 /// Shared lifecycle boundary for embedded callers and command-line document startup.
 fn run_session(
     inbox: StatusInbox,

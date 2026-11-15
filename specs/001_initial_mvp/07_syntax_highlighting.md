@@ -533,3 +533,20 @@ of eight input samples took 16.8 ms. Sampled RSS was 7,888 KiB for the editor
 and 28,540 KiB for its worker. systemd reported a 256 MiB cgroup peak with
 zero swap. The same run passed the existing Linux constrained storage,
 editing, recovery, refresh, and search and replacement regressions.
+
+The earlier local run inherited a high open-file limit. At a soft limit of
+256, the 64-tab search test reproduced `EMFILE` while opening tabs on both
+Stage 06 (`9714b09`) and Stage 07 (`c807466`). The 64-tab syntax PTY also
+reproduced the error while opening its 62nd file before the fix. Each tab
+keeps four private storage files open, and the editor needs additional
+descriptors for snapshots and background I/O. The CLI and editor unit-test
+fixture now attempt to raise their process soft limit to 1,024, capped by the
+inherited hard limit. Embedded sessions keep their caller's limits.
+
+On macOS, plain `cargo test` from a soft limit of 256 passed 248 tests with
+nine opt-in checks ignored, including 64 tabs with search and cancellation,
+and the 64-tab PTY with highlighting, editing, saving and quitting. CI
+starts the regular workspace test step with a soft limit of 256 on both
+hosted platforms. Independent review against `c807466` confirmed the soft
+limit adjustment preserves the inherited hard limit and passed both focused
+64-tab tests under the same macOS limit.
