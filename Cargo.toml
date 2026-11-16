@@ -46,6 +46,10 @@ missing_docs = "warn"
 name = "ede"
 path = "src/bin/ede.rs"
 
+[[bench]]
+name = "storage_bench"
+harness = false
+
 # Keep nested grammar and query work within the same deadline in local debug builds.
 [profile.dev.package.tree-sitter]
 opt-level = 2

@@ -286,7 +286,7 @@ storage rather than depending on OS swap.
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
-cargo run --release --locked --example storage_bench -- ordinary 1024 copy
+cargo bench --locked --bench storage_bench -- ordinary 1024 copy
 EDE_BENCH_MIB=1024 EDE_BENCH_CORPUS=ordinary cargo test --release --locked \
   --test terminal large_file_interactive_benchmark -- --ignored --exact --nocapture
 EDE_PASTE_MIB=64 cargo test --release --locked --test terminal \
