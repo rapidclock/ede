@@ -410,11 +410,11 @@ against `745c9ff` caught stale Tab Details after an asynchronous choice and
 focus lost through F2 dispatch. Both paths were fixed and re-reviewed against
 the focused reducer and PTY checks.
 
-The separately locked [Rust probe](../../examples/syntax_probe/Cargo.toml)
-builds published generated grammars with a C compiler, using this inventory.
+The standalone Rust feasibility probe built published generated grammars
+with a C compiler using this inventory.
 The probe uses Tree-sitter `0.27.2` (MIT). The listed grammars declare MIT
-except INI, which declares Apache-2.0. The release uses the assets at the pinned
-crate revisions and includes the [Stage 7 dependency notices](../../licenses/stage07).
+except INI, which declares Apache-2.0. The editor uses assets from these pinned
+crate revisions.
 
 | Grammar crate | Version | Grammar ABI |
 | --- | --- | --- |
@@ -431,9 +431,9 @@ crate revisions and includes the [Stage 7 dependency notices](../../licenses/sta
 | `tree-sitter-html` | `0.23.2` | 14 |
 | `tree-sitter-css` | `0.25.0` | 15 |
 
-`cargo test --offline --locked --manifest-path examples/syntax_probe/Cargo.toml`
-passed five tests. The fixtures demonstrate representative upstream captures
-for all eleven languages, Markdown block/inline extensions, CRLF YAML
+The standalone probe's locked Cargo test run passed five tests. The fixtures
+demonstrated representative upstream captures for all eleven languages,
+Markdown block/inline extensions, CRLF YAML
 frontmatter, and nested Markdown → HTML → JavaScript/CSS captures at original
 byte offsets. They also exercise custom capture priority, rejected invalid
 query source and regex syntax, and callbacks during root parsing,
@@ -443,13 +443,13 @@ need added patterns for task markers, table cells and strikethrough. The INI
 grammar accepts indented comments and expects LF or CRLF after settings and
 comment lines, so the column-one and EOF rules need adapter coverage.
 
-`cargo build --release --offline --locked --manifest-path examples/syntax_probe/Cargo.toml`
-built from an empty probe target with a populated Cargo cache in about 15 s.
+The locked release build took about 15 s with an empty probe target and a
+populated Cargo cache.
 The runnable probe, including fixture and measurement code, is about 6.0 MiB
 stripped. The Stage 06 baseline executable with the Stage 07 Cargo profile
 is about 2.6 MiB. The size delta of an integrated editor remains unmeasured.
 Each row ran in its own process with `/usr/bin/time -l` and the named argument
-to `examples/syntax_probe/target/release/ede-syntax-probe`. The timer covers
+to the standalone probe executable. The timer covers
 root parse and query iteration. Corpus preparation and query compilation take
 place before that timer. These runs used warm binary/cache state.
 
@@ -595,8 +595,8 @@ failed before the fixes for unresolved and adjacent reference labels, closed
 and unclosed HTML comments, and a wrapped HTML opening tag inside a list.
 The reference fixtures include case folding, wrapped label whitespace, and
 independent scopes in fenced Markdown. A standalone Rust probe verified
-`unicase`'s full case folding before it was added to ede. License text is in
-the [Stage 7 dependency notices](../../licenses/stage07).
+`unicase`'s full case folding before it was added to ede. The crate declares MIT
+or Apache-2.0.
 
 The local macOS workspace suite passed 255 tests with nine opt-in checks
 ignored, with an inherited soft open-file limit of 256. Separate workspace

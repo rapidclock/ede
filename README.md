@@ -218,7 +218,6 @@ Use the [bundled query registry](src/syntax/engine.rs),
 [Stage 7 validation record](specs/001_initial_mvp/07_syntax_highlighting.md#validation-record)
 as starting points. Builds require a C compiler for the bundled generated
 grammars. The executable highlights offline.
-See the [Stage 7 dependency notices](licenses/stage07) for upstream licenses.
 
 ## Cmd delivery
 
