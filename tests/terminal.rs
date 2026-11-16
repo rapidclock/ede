@@ -2081,7 +2081,9 @@ fn isolated_tmux_editing_and_suspend_smoke() {
     process.send(b"\t\r");
     process.expect("EDE_TEST_PROMPT>");
     restored(&pane, &original);
-    process.send(b"fg\n");
+    // tmux can redraw the old prompt during teardown. Wait for a fresh prompt
+    // after the resumed editor exits, with split quoting to exclude command echo.
+    process.send(b"fg; editor_status=$?; PS1='EDE_TEST_''EXIT> '\n");
     process.expect("Cmd aliases require");
     process.send(b"\x1b");
     let deadline = Instant::now() + TIMEOUT;
@@ -2096,9 +2098,9 @@ fn isolated_tmux_editing_and_suspend_smoke() {
         thread::sleep(Duration::from_millis(5));
     }
     process.send(b"\x11");
-    process.expect("EDE_TEST_PROMPT>");
+    process.expect("EDE_TEST_EXIT>");
     restored(&pane, &original);
-    process.send(b"exit\n");
+    process.send(b"exit \"$editor_status\"\n");
     assert!(process.wait().success());
 }
 
