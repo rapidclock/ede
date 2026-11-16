@@ -26,6 +26,252 @@ use nix::{
 /// Bounded timeouts turn a broken terminal loop into a useful test failure, not a hanging CI job.
 const TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Markdown reaches the real terminal as colored, editable source and honors Plain Text.
+#[test]
+fn markdown_source_renders_syntax_colors() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("notes.md");
+    std::fs::write(
+        &path,
+        concat!(
+            "# Heading\n## Second\n### Third\n#### Fourth\n##### Fifth\n###### Sixth\n\n",
+            "Setext One\n==========\n\nSetext Two\n----------\n\n",
+            "- Dash\n+ Plus\n* Star\n\n1. Dot\n\n1) Paren\n\nOrdinary prose\n",
+        ),
+    )
+    .unwrap();
+    let mut process = PtyChild::editor_with_path(Some("xterm-256color"), Some(&path));
+    process.expect("# Heading");
+    for (index, color) in [13, 14, 12, 10, 11, 9].into_iter().enumerate() {
+        syntax_color(&mut process, index as u16 + 1, 0, vt100::Color::Idx(color));
+        syntax_color(
+            &mut process,
+            index as u16 + 1,
+            index as u16 + 2,
+            vt100::Color::Idx(color),
+        );
+    }
+    for (row, color) in [(8, 13), (9, 13), (11, 14), (12, 14)] {
+        syntax_color(&mut process, row, 0, vt100::Color::Idx(color));
+    }
+    for (row, marker_len, color) in [
+        (14, 1, 11),
+        (15, 1, 11),
+        (16, 1, 11),
+        (18, 2, 14),
+        (20, 2, 14),
+    ] {
+        for column in 0..marker_len {
+            syntax_color(&mut process, row, column, vt100::Color::Idx(color));
+        }
+        syntax_color(&mut process, row, marker_len + 1, vt100::Color::Default);
+    }
+    process.expect("Ordinary prose");
+    syntax_color(&mut process, 22, 0, vt100::Color::Default);
+    let open_language = [b"\x1bOQ".as_slice(), &b"\x1b[B".repeat(27), b"\r"].concat();
+    process.send(&open_language);
+    process.expect("Auto (Markdown)");
+    process.send(b"\x1b[B\r");
+    process.expect_absent("Auto (Markdown)");
+    process.expect("# Heading");
+    syntax_color(&mut process, 1, 2, vt100::Color::Default);
+    syntax_color(&mut process, 14, 0, vt100::Color::Default);
+    process.send(b"\x11");
+    assert!(process.wait().success());
+    process.assert_restored();
+}
+
+/// A mixed Markdown page keeps structural marks, code, and inline meaning distinguishable.
+#[test]
+fn markdown_mixed_source_uses_distinct_styles() {
+    use vt100::Color::{Default, Idx};
+
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("guide.md");
+    let lines = [
+        "# Reference",
+        "1. Ordered step",
+        "   - Child bullet",
+        "     1) Grandchild number",
+        "2. Next step",
+        "",
+        "- Parent bullet",
+        "  1. Child number",
+        "     + Grandchild bullet",
+        "- [ ] Pending",
+        "- [x] Done",
+        "",
+        "> Plain quote with *light*, **strong**, ~~old~~, and `code`.",
+        "> Continuation with `` `literal` `` and \\* escape.",
+        "> > Nested quote.",
+        ">",
+        "> ```rust",
+        "> let answer = 42;",
+        "> ```",
+        "",
+        "~~~unknown",
+        "# literal > inside fence",
+        "~~~",
+        "",
+        "    - indented literal",
+        "",
+        "Name | Count",
+        ":--- | ---:",
+        "`x` | **two**",
+        "",
+        "[Visible](https://example.test \"title\") and ![Picture](p.png)",
+        "[Shortcut] and [Full][Shortcut] and [Shortcut][]",
+        "",
+        "[Shortcut]: https://example.test/reference \"Ref title\"",
+        "",
+        "See <https://example.test> <a@example.test> &amp; &#42; and <kbd>Enter</kbd>.",
+        "",
+        "Break\\",
+        "next line",
+        "",
+        "***",
+        "",
+        "<div class=\"example\">",
+        "<!-- HTML note -->",
+        "</div>",
+    ];
+    std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+    let mut process = PtyChild::editor_with_path(Some("xterm-256color"), Some(&path));
+    process.expect("# Reference");
+    process.resize(100, 48);
+    process.expect("HTML note");
+    for (sample, offset, color) in [
+        ("1. Ordered", 0, Idx(14)),
+        ("- Child bullet", 0, Idx(11)),
+        ("1) Grandchild", 1, Idx(14)),
+        ("2. Next", 0, Idx(14)),
+        ("- Parent bullet", 0, Idx(11)),
+        ("1. Child number", 1, Idx(14)),
+        ("+ Grandchild", 0, Idx(11)),
+        ("[ ] Pending", 1, Idx(11)),
+        ("[x] Done", 1, Idx(10)),
+        ("Child bullet", 0, Default),
+        ("> Plain quote", 0, Idx(12)),
+        ("Plain quote", 0, Default),
+        ("> Continuation", 0, Idx(12)),
+        ("> > Nested", 2, Idx(12)),
+        ("*light*", 1, Idx(13)),
+        ("**strong**", 2, Idx(11)),
+        ("~~old~~", 2, Idx(8)),
+        ("`code`", 0, Idx(12)),
+        ("`code`", 1, Idx(10)),
+        ("`` `literal` ``", 1, Idx(12)),
+        ("`` `literal` ``", 3, Idx(10)),
+        ("\\* escape", 0, Idx(10)),
+        ("```rust", 0, Idx(12)),
+        ("```rust", 3, Idx(11)),
+        ("let answer", 0, Idx(14)),
+        ("answer = 42", 9, Idx(13)),
+        ("~~~unknown", 0, Idx(12)),
+        ("# literal >", 0, Idx(10)),
+        ("- indented literal", 0, Idx(10)),
+        ("Name | Count", 0, Idx(13)),
+        ("Name | Count", 5, Idx(8)),
+        (":--- | ---:", 0, Idx(8)),
+        ("`x` | **two**", 4, Idx(8)),
+        ("**two**", 2, Idx(11)),
+        ("[Visible]", 0, Idx(8)),
+        ("[Visible]", 1, Idx(14)),
+        ("(https://", 1, Idx(12)),
+        ("![Picture]", 2, Idx(14)),
+        ("[Full][Shortcut]", 1, Idx(14)),
+        ("[Shortcut][]", 1, Idx(14)),
+        ("https://example.test/reference", 0, Idx(12)),
+        ("<https://", 1, Idx(12)),
+        ("<a@example.test>", 1, Idx(12)),
+        ("&amp;", 0, Idx(13)),
+        ("&#42;", 0, Idx(13)),
+        ("<kbd>", 1, Idx(14)),
+        ("Enter", 0, Default),
+        ("Break\\", 5, Idx(10)),
+        ("***", 0, Idx(8)),
+        ("<div class", 1, Idx(14)),
+        ("class=", 0, Idx(11)),
+        ("<!-- HTML note", 0, Idx(8)),
+    ] {
+        let (row, column) = lines
+            .iter()
+            .enumerate()
+            .find_map(|(row, line)| line.find(sample).map(|column| (row, column)))
+            .unwrap();
+        syntax_color(
+            &mut process,
+            row as u16 + 1,
+            (column + offset) as u16,
+            color,
+        );
+    }
+    syntax_color(&mut process, 19, 2, Idx(12)); // Closing fence in the quote.
+    process.send(b"\x11");
+    assert!(process.wait().success());
+    process.assert_restored();
+}
+
+/// H03: language detection follows the opened name and changes only on a committed Save As.
+#[test]
+fn tab_details_language_follows_opened_name_and_committed_save_as() {
+    let directory = tempfile::tempdir().unwrap();
+    let target = directory.path().join("actual.txt");
+    let opened = directory.path().join("source.RS");
+    let busy = directory.path().join("existing.py");
+    let saved = directory.path().join("copy.TS");
+    std::fs::write(&target, b"source text\n").unwrap();
+    std::fs::write(&busy, b"existing\n").unwrap();
+    std::os::unix::fs::symlink(&target, &opened).unwrap();
+    let mut process = PtyChild::editor_with_path(Some("xterm-256color"), Some(&opened));
+    process.expect_status("Ready");
+
+    let show_language = |expected, process: &mut PtyChild| {
+        let open_details = [b"\x1bOQ".as_slice(), &b"\x1b[B".repeat(17), b"\r"].concat();
+        process.send(&open_details);
+        process.expect(expected);
+        process.send(b"\x1b");
+        process.expect_absent(expected);
+    };
+    show_language("Language: Rust (Auto)", &mut process);
+
+    process.send(b"\x1bOS");
+    process.expect("Save As (new path)");
+    process.send(busy.as_os_str().as_encoded_bytes());
+    process.send(b"\r");
+    process.expect("work retained");
+    process.send(b"\x1b");
+    process.expect_absent("work retained");
+    show_language("Language: Rust (Auto)", &mut process);
+
+    process.send(b"\x1bOS");
+    process.expect("Save As (new path)");
+    process.send(saved.as_os_str().as_encoded_bytes());
+    process.send(b"\r");
+    process.expect_status("Saved");
+    show_language("Language: TypeScript (Auto)", &mut process);
+
+    let open_language = [b"\x1bOQ".as_slice(), &b"\x1b[B".repeat(27), b"\r"].concat();
+    process.send(&open_language);
+    process.expect("Auto (TypeScript)");
+    process.send(&[b"\x1b[B".repeat(5).as_slice(), b"\r"].concat());
+    show_language("Language: JSON (Manual)", &mut process);
+    process.send(b"\x0e");
+    process.expect("Untitled 1");
+    show_language("Language: Plain Text (Auto)", &mut process);
+    process.send(b"\x17");
+    process.expect("Unsaved changes");
+    process.send(b"\t\t\r");
+    process.expect_absent("Untitled 1");
+    show_language("Language: JSON (Manual)", &mut process);
+
+    assert_eq!(std::fs::read(&saved).unwrap(), b"source text\n");
+    assert_eq!(std::fs::read(&busy).unwrap(), b"existing\n");
+    process.send(b"\x11");
+    assert!(process.wait().success());
+    process.assert_restored();
+}
+
 /// Stage 06 must expose a real non-modal search surface through portable input.
 #[test]
 fn literal_find_panel_uses_unsaved_text() {
@@ -110,6 +356,7 @@ impl PtyChild {
             .stdin(Stdio::from(slave.try_clone().unwrap()))
             .stdout(Stdio::from(slave.try_clone().unwrap()))
             .stderr(Stdio::from(slave.try_clone().unwrap()))
+            .env_remove("NO_COLOR")
             .env("TERM", "xterm-256color")
             .env("PS1", "EDE_TEST_PROMPT> ");
         // SAFETY: setsid and ioctl are async-signal-safe; fd 0 is the already-duplicated
@@ -531,23 +778,46 @@ impl PtyChild {
         args: impl IntoIterator<Item = impl AsRef<std::ffi::OsStr>>,
         state: Option<&std::path::Path>,
     ) -> Self {
+        Self::editor_with_options(term, args, state, None, None)
+    }
+
+    /// Start the editor with isolated state, highlighting configuration and optional soft limit.
+    fn editor_with_options(
+        term: Option<&str>,
+        args: impl IntoIterator<Item = impl AsRef<std::ffi::OsStr>>,
+        state: Option<&std::path::Path>,
+        config: Option<&std::path::Path>,
+        descriptor_limit: Option<u16>,
+    ) -> Self {
         // The interactive parent supplies job control and stays alive after ede exits,
         // allowing exact post-exit termios capture before Darwin revokes the slave PTY.
         let mut command = Command::new("/bin/sh");
-        let script = "# The nested shell expands its own PID and positional parameters.\n# shellcheck disable=SC2016\nif [ \"$1\" = unset ]; then unset TERM; else TERM=$2; export TERM; fi; shift 2; /bin/sh -c 'printf \"EDE_PID:%s\\n\" \"$$\"; program=$1; shift; exec \"$program\" \"$@\"' ede-child \"$@\"; result=$?; printf '\\nEDE_EXIT:%s\\n' \"$result\"; read -r _completion; exit \"$result\"";
+        let script = r#"
+if [ "$1" = unset ]; then unset TERM; else TERM=$2; export TERM; fi
+if [ -n "$3" ]; then ulimit -Sn "$3" || exit 1; fi
+shift 3
+# The nested shell expands its own PID and positional parameters.
+# shellcheck disable=SC2016
+/bin/sh -c 'printf "EDE_PID:%s\n" "$$"; program=$1; shift; exec "$program" "$@"' ede-child "$@"
+result=$?
+printf '\nEDE_EXIT:%s\n' "$result"
+read -r _completion
+exit "$result"
+"#;
         let script = if std::env::var_os("EDE_BENCH_PEAK_RSS").is_some() {
             script.replacen(
-                "; /bin/sh -c",
+                "\n/bin/sh -c",
                 if cfg!(target_os = "macos") {
-                    "; /usr/bin/time -l /bin/sh -c"
+                    "\n/usr/bin/time -l /bin/sh -c"
                 } else {
-                    "; /usr/bin/time -v /bin/sh -c"
+                    "\n/usr/bin/time -v /bin/sh -c"
                 },
                 1,
             )
         } else {
             script.into()
         };
+        let descriptor_limit = descriptor_limit.map(|limit| limit.to_string());
         command.args([
             "-i",
             "-c",
@@ -555,12 +825,15 @@ impl PtyChild {
             "ede-term-test",
             if term.is_none() { "unset" } else { "set" },
             term.unwrap_or(""),
+            descriptor_limit.as_deref().unwrap_or(""),
             env!("CARGO_BIN_EXE_ede"),
         ]);
         command.args(args);
         if let Some(state) = state {
             command.env("EDE_STATE_DIR", state);
         }
+        let config_root = tempfile::tempdir().unwrap();
+        command.env("XDG_CONFIG_HOME", config.unwrap_or(config_root.path()));
         let mut child = Self::spawn(command);
         child.keep_alive = true;
         child
@@ -1915,4 +2188,372 @@ fn enhanced_shift_tab_moves_dialog_focus() {
     process.expect_status("Saved");
     process.send(b"\x11");
     assert!(process.wait().success());
+}
+
+/// F2 Actions entries remain reachable even near the end of the scrolling menu.
+fn syntax_action(process: &mut PtyChild, index: usize) {
+    process.send(&[b"\x1bOQ".as_slice(), &b"\x1b[B".repeat(index), b"\r"].concat());
+}
+
+/// Assert terminal-visible attributes, including repaint as asynchronous work settles.
+fn syntax_color(process: &mut PtyChild, line: u16, column: u16, color: vt100::Color) {
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        process.drain();
+        if process
+            .parser
+            .screen()
+            .cell(line, column)
+            .unwrap()
+            .fgcolor()
+            == color
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "waiting for {color:?} at ({line}, {column}): {}",
+            process.parser.screen().contents()
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// Custom colors and query captures can address headings and list markers independently.
+#[test]
+fn markdown_theme_can_override_headings_and_list_markers() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("notes.md");
+    let config = directory.path().join("ede");
+    let queries = config.join("queries/markdown");
+    std::fs::create_dir_all(&queries).unwrap();
+    std::fs::write(&path, "# One\n## Two\n\n- Dash\n+ Plus\n\n1. Numbered\n").unwrap();
+    let file = config.join("highlighting.toml");
+    let base = concat!(
+        "default_theme = 'Notes'\n[themes.Notes]\nbase = 'light'\n",
+        "[themes.Notes.colors]\nmarkup = '#884411'\nheading_2 = '#225588'\n",
+        "punctuation = '#664488'\n",
+    );
+    std::fs::write(&file, format!("{base}list_marker = '#116633'\n")).unwrap();
+    std::fs::write(
+        queries.join("highlights.scm"),
+        "(list_marker_plus) @heading_2\n",
+    )
+    .unwrap();
+    let mut process = PtyChild::editor_with_options(
+        Some("xterm-256color"),
+        [&path],
+        None,
+        Some(directory.path()),
+        None,
+    );
+    process.expect("## Two");
+    syntax_color(&mut process, 1, 2, vt100::Color::Rgb(0x88, 0x44, 0x11));
+    syntax_color(&mut process, 2, 3, vt100::Color::Rgb(0x22, 0x55, 0x88));
+    syntax_color(&mut process, 4, 0, vt100::Color::Rgb(0x11, 0x66, 0x33));
+    syntax_color(&mut process, 5, 0, vt100::Color::Rgb(0x22, 0x55, 0x88));
+    syntax_color(&mut process, 7, 0, vt100::Color::Rgb(0x11, 0x66, 0x33));
+    std::fs::write(&file, base.replace("#225588", "#334499")).unwrap();
+    syntax_action(&mut process, 29);
+    syntax_color(&mut process, 4, 0, vt100::Color::Rgb(0x66, 0x44, 0x88));
+    syntax_color(&mut process, 5, 0, vt100::Color::Rgb(0x33, 0x44, 0x99));
+    syntax_color(&mut process, 7, 0, vt100::Color::Rgb(0x66, 0x44, 0x88));
+    process.send(b"\x11");
+    assert!(process.wait().success());
+    process.assert_restored();
+}
+
+/// H09: real fresh config, palette repaint, user query, failed reload, and reset.
+#[test]
+fn highlighting_configuration_reload_keeps_last_good_revision() {
+    let directory = tempfile::tempdir().unwrap();
+    let config = directory.path().join("ede");
+    let rules = config.join("queries/rust/highlights.scm");
+    std::fs::create_dir_all(rules.parent().unwrap()).unwrap();
+    let file = config.join("highlighting.toml");
+    let source = directory.path().join("source.demo");
+    std::fs::write(&source, "fn example() { let a: u32 = 42; }\n").unwrap();
+    let theme = |hex: &str| {
+        format!(
+            r##"
+        default_theme = "Ocean"
+        [themes.Ocean]
+        base = "dark"
+        [themes.Ocean.colors]
+        keyword = "{hex}"
+        number = "#04AB27"
+        [files.extensions]
+        Demo = "rust"
+    "##
+        )
+    };
+    std::fs::write(&file, theme("#AA1234")).unwrap();
+    std::fs::write(&rules, "(primitive_type) @number").unwrap();
+    let mut process = PtyChild::editor_with_options(
+        Some("xterm-256color"),
+        [&source],
+        None,
+        Some(directory.path()),
+        None,
+    );
+    process.expect("fn example()");
+    syntax_color(&mut process, 1, 0, vt100::Color::Rgb(0xaa, 0x12, 0x34));
+    syntax_color(&mut process, 1, 22, vt100::Color::Rgb(4, 0xab, 0x27));
+    std::fs::write(&file, theme("#556677")).unwrap();
+    syntax_action(&mut process, 29);
+    syntax_color(&mut process, 1, 0, vt100::Color::Rgb(0x55, 0x66, 0x77));
+    syntax_color(&mut process, 1, 22, vt100::Color::Rgb(4, 0xab, 0x27));
+
+    std::fs::write(&rules, "(missing_node_kind) @keyword").unwrap();
+    std::fs::write(&file, theme("#111111")).unwrap();
+    syntax_action(&mut process, 29);
+    process.expect("Syntax config error");
+    syntax_color(&mut process, 1, 0, vt100::Color::Rgb(0x55, 0x66, 0x77));
+    syntax_action(&mut process, 17);
+    process.expect("queries/rust/highlights.scm");
+    process.send(b"\x1b");
+    process.expect_absent("queries/rust/highlights.scm");
+    std::fs::remove_file(&rules).unwrap();
+    std::fs::remove_file(&file).unwrap();
+    syntax_action(&mut process, 29);
+    process.expect_absent("Syntax config error");
+    syntax_color(&mut process, 1, 0, vt100::Color::Default);
+    process.send(b"\x11");
+    assert!(process.wait().success());
+    process.assert_restored();
+}
+
+/// H04/H06: an invisible overlong line disables a complete revision, and
+/// foreground text and replacement still work before refresh returns syntax.
+#[test]
+fn highlighting_line_fallback_preserves_editor_and_recovers_on_refresh() {
+    let directory = tempfile::tempdir().unwrap();
+    let file = directory.path().join("source.rs");
+    let mut text = String::from("fn sample() {}\r\n");
+    text.push_str(&"\r\n".repeat(100));
+    text.push_str("//");
+    text.push_str(&"x".repeat(64 * 1024 - 1));
+    text.push_str("\r\n");
+    std::fs::write(&file, text.as_bytes()).unwrap();
+    let mut process = PtyChild::editor_with_path(Some("xterm-256color"), Some(&file));
+    process.expect("Plain syntax");
+    process.expect("fn sample() {}");
+    syntax_color(&mut process, 1, 0, vt100::Color::Default);
+    syntax_action(&mut process, 17);
+    process.expect("a line exceeds 64 KiB");
+    process.send(b"\x1b");
+    process.expect_absent("a line exceeds 64 KiB");
+    process.send(b"\x06sample\r");
+    process.expect("1 match");
+    process.send(b"\x1b");
+    std::fs::write(&file, b"fn updated() {}\r\n").unwrap();
+    process.expect("fn updated() {}");
+    process.expect_absent("Plain syntax");
+    syntax_color(&mut process, 1, 0, vt100::Color::Idx(14));
+    process.send(b"\x11");
+    assert!(process.wait().success());
+    process.assert_restored();
+    assert_eq!(std::fs::read(&file).unwrap(), b"fn updated() {}\r\n");
+}
+/// H05: parking highlighted tabs releases their projection charges.
+#[test]
+fn sixty_four_highlighted_tabs_keep_foreground_budget() {
+    let directory = tempfile::tempdir().unwrap();
+    let paths: Vec<_> = (0..64)
+        .map(|index| {
+            let path = directory.path().join(format!("s{index:02}.md"));
+            std::fs::write(&path, format!("# Heading {index:02}\n")).unwrap();
+            path
+        })
+        .collect();
+    let mut process =
+        PtyChild::editor_with_options(Some("xterm-256color"), &paths, None, None, Some(256));
+    for index in 0..64 {
+        process.expect(&format!("Heading {index:02}"));
+        let until = Instant::now() + TIMEOUT;
+        while process.parser.screen().cell(1, 2).unwrap().fgcolor() == vt100::Color::Default {
+            assert!(Instant::now() < until, "tab {index} stopped highlighting");
+            process.drain();
+            thread::sleep(Duration::from_millis(5));
+        }
+        if index < 63 {
+            process.send(b"\x1b[19~");
+        }
+    }
+    process.send(b"fresh \x13");
+    process.expect("fresh # Heading 63");
+    process.expect_status("Saved");
+    assert_eq!(
+        std::fs::read_to_string(&paths[63]).unwrap(),
+        "fresh # Heading 63\n"
+    );
+    process.send(b"\x11");
+    let status = process.wait();
+    assert!(
+        status.success(),
+        "{status}: {}",
+        String::from_utf8_lossy(&process.output)
+    );
+    process.assert_restored();
+}
+
+/// H08: exercise both the size fallback and real parser work while search scans a parked 1 GiB tab.
+#[test]
+#[ignore = "allocates a large file and samples two live processes"]
+fn large_highlighting_and_search_overlap() {
+    let directory = tempfile::tempdir().unwrap();
+    let syntax = directory.path().join("syntax.rs");
+    let large = directory.path().join("oversize.rs");
+    let mut writer = File::create(&syntax).unwrap();
+    writer.write_all(b"fn LEADING_TOKEN() {}\n").unwrap();
+    let comment = format!("// {}\n", "x".repeat(40 * 1024 - 4));
+    for _ in 0..510 {
+        writer.write_all(comment.as_bytes()).unwrap();
+    }
+    writer.sync_all().unwrap();
+    drop(writer);
+    let mut writer = File::create(&large).unwrap();
+    let block = b"ordinary-search-data\n".repeat(1 << 15);
+    let mut size = 0u64;
+    let mut synced = 0u64;
+    while size < 1 << 30 {
+        let bytes = (block.len() as u64).min((1 << 30) - size) as usize;
+        writer.write_all(&block[..bytes]).unwrap();
+        size += bytes as u64;
+        if size - synced >= 8 << 20 {
+            writer.sync_data().unwrap();
+            #[cfg(target_os = "linux")]
+            nix::fcntl::posix_fadvise(
+                &writer,
+                synced as i64,
+                (size - synced) as i64,
+                nix::fcntl::PosixFadviseAdvice::POSIX_FADV_DONTNEED,
+            )
+            .unwrap();
+            synced = size;
+        }
+    }
+    writer.sync_all().unwrap();
+    drop(writer);
+    eprintln!(
+        "highlight_search fixtures_ready active_bytes={} inactive_bytes={size}",
+        std::fs::metadata(&syntax).unwrap().len()
+    );
+
+    let started = Instant::now();
+    let mut process = PtyChild::editor_with_args(Some("xterm-256color"), [&syntax, &large]);
+    process.expect_body("fn LEADING_TOKEN()", Duration::from_secs(10));
+    let first = started.elapsed();
+    process.send(b"\x1b[19~");
+    process.expect_body("ordinary-search-data", Duration::from_secs(120));
+    process.expect_with_timeout("Plain syntax", Duration::from_secs(120));
+    process.send(b"\x1b[18~");
+    process.expect_body("fn LEADING_TOKEN()", Duration::from_secs(10));
+    process.send(b"\x06ABSENT_MARKER\t\t\t\r\x1bOR");
+    process.expect("Searching");
+
+    let pid = process.editor_pid().as_raw();
+    let mut peak_editor = 0;
+    let mut peak_worker = 0;
+    let mut worker_sample = None;
+    let mut overlap = false;
+    let mut max_input = Duration::ZERO;
+    let detect = Instant::now();
+    while Instant::now() - detect < Duration::from_secs(10) {
+        process.drain();
+        let screen = process.parser.screen().contents();
+        if !screen.contains("Searching") {
+            break;
+        }
+        let output = Command::new("ps")
+            .args(["-ax", "-o", "pid=,ppid=,rss=,state=,time="])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "ps: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        for line in String::from_utf8_lossy(&output.stdout).lines() {
+            let mut fields = line.split_whitespace();
+            let (Some(child), Some(parent), Some(rss)) =
+                (fields.next(), fields.next(), fields.next())
+            else {
+                continue;
+            };
+            let rss = rss.parse::<u32>().unwrap();
+            if child.parse::<i32>() == Ok(pid) {
+                peak_editor = peak_editor.max(rss);
+            }
+            if parent.parse::<i32>() == Ok(pid) {
+                peak_worker = peak_worker.max(rss);
+                let state = fields.next().unwrap_or_default();
+                let now = fields.next().unwrap_or_default();
+                let used_cpu =
+                    worker_sample
+                        .as_ref()
+                        .is_some_and(|(old_pid, old_time): &(String, String)| {
+                            old_pid == child && old_time != now
+                        });
+                overlap |=
+                    screen.contains("/1073741824 bytes") && (state.starts_with('R') || used_cpu);
+                worker_sample = Some((child.into(), now.into()));
+            }
+        }
+        thread::sleep(Duration::from_millis(3));
+    }
+    assert!(
+        overlap,
+        "no active parser CPU sampled during the 1 GiB scan"
+    );
+    process.send(b"\x1b[17~"); // F6 transfers focus to the document.
+    for count in 1..=8 {
+        let event = Instant::now();
+        process.send(b" ");
+        process.expect_body(&format!("{}fn LEADING_TOKEN", " ".repeat(count)), TIMEOUT);
+        max_input = max_input.max(event.elapsed());
+    }
+    process.send(b"\x1b");
+    process.expect_absent("Scope: All open");
+    process.send(b"\x13");
+    process.expect_with_timeout("Saved", Duration::from_secs(30));
+    process.send(b"\x11");
+    assert!(process.wait().success());
+    process.assert_restored();
+    eprintln!(
+        "highlight_search first_text_ms={:.3} max_input_ms={:.3} editor_sample_kib={peak_editor} worker_sample_kib={peak_worker}",
+        first.as_secs_f64() * 1000.0,
+        max_input.as_secs_f64() * 1000.0
+    );
+    process.report_peak_rss();
+}
+
+/// H06: projected source style covers the entire grapheme and yields to selection and search.
+#[test]
+fn syntax_color_yields_to_selection_and_current_match() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("style.md");
+    std::fs::write(&path, "# Note 界e\u{301}\tend\n").unwrap();
+    let mut process = PtyChild::editor_with_path(Some("xterm-256color"), Some(&path));
+    process.expect("# Note 界e\u{301}");
+    syntax_color(&mut process, 1, 2, vt100::Color::Idx(13));
+    syntax_color(&mut process, 1, 7, vt100::Color::Idx(13));
+    process.send(b"\x01");
+    syntax_color(&mut process, 1, 2, vt100::Color::Idx(15));
+    assert_eq!(
+        process.parser.screen().cell(1, 7).unwrap().bgcolor(),
+        vt100::Color::Idx(4)
+    );
+    process.send(b"\x06Note\r");
+    process.expect("1 match");
+    syntax_color(&mut process, 1, 2, vt100::Color::Idx(0));
+    assert_eq!(
+        process.parser.screen().cell(1, 2).unwrap().bgcolor(),
+        vt100::Color::Idx(5)
+    );
+    process.send(b"\x1b");
+    process.expect_absent("Find:");
+    process.send(b"\x11");
+    assert!(process.wait().success());
+    process.assert_restored();
 }

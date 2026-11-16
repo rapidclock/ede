@@ -82,6 +82,13 @@
 - Be cognizant of external dependencies. Always ensure you are not pulling in old/decrepit dependencies. Use them when absolutely needed.
 - Write module, type and function level documentation comments in such a manner a new person to the project understands everything about the entity and can use and extend it.
 
+#### Testing
+
+- Put unit tests in inline `#[cfg(test)]` modules in the same Rust source file
+  as the code they test.
+- Put integration tests in the top-level `tests/` directory.
+- Use submodules wherever they help organize implementation code.
+
 ### Python
 
 - Never install anything in the system Python.
