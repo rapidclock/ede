@@ -171,7 +171,7 @@ impl Coordinator {
 
     pub(super) fn retry_refresh(&mut self, tab: TabId) -> Result<(), Error> {
         let state = self.state_mut(tab).ok_or(Error::Closed)?;
-        if state.screen.path.is_none() {
+        if state.screen.path.is_none() || state.live.is_some() {
             return Ok(());
         }
         if state.screen.modified {
@@ -421,7 +421,7 @@ impl Coordinator {
                     .iter()
                     .filter_map(|tab| {
                         let state = self.state(tab.id)?;
-                        if state.screen.loading {
+                        if state.screen.loading || state.live.is_some() {
                             return None;
                         }
                         Some(Target {

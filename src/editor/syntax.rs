@@ -282,6 +282,13 @@ impl State {
                 self.failed(editor, id, Fallback::Size);
             } else if snapshot.is_some() || self.parked.is_some() {
                 self.dispatch(editor, id, view, snapshot.take());
+            } else if let Some(live) = &editor.tab.live {
+                if Instant::now() >= live.syntax_due
+                    && let Some(snapshot) = &live.snapshot
+                    && let Ok(snapshot) = snapshot.duplicate_live()
+                {
+                    self.dispatch(editor, id, view, Some(snapshot));
+                }
             } else {
                 self.admit(editor, id);
             }

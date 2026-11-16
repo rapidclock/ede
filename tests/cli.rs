@@ -31,12 +31,47 @@ fn informational_flags_and_argument_errors() {
         assert!(String::from_utf8_lossy(&output.stdout).contains(env!("CARGO_PKG_VERSION")));
         assert!(output.stderr.is_empty());
         assert_plain(&output.stdout);
+        if matches!(flag, "--help" | "-h") {
+            let help = String::from_utf8(output.stdout).unwrap();
+            assert!(help.contains("--follow FILE"));
+            assert!(help.contains("producer | ede"));
+        }
     }
-    for args in [vec!["--unknown"], vec!["--help", "extra"], vec!["file"; 65]] {
+    for args in [
+        vec!["--unknown"],
+        vec!["--help", "extra"],
+        vec!["file"; 65],
+        vec!["--follow"],
+        vec!["--follow", "first", "second"],
+        vec!["first", "--follow", "second"],
+    ] {
         let output = command().args(args).output().unwrap();
         assert_eq!(output.status.code(), Some(2));
         assert!(output.stdout.is_empty());
         assert_plain(&output.stderr);
+    }
+}
+
+/// A pipe takes one startup slot and cannot be combined with direct following.
+#[test]
+fn incompatible_stream_startup_leaves_input_unread() {
+    for args in [vec!["file"; 64], vec!["--follow", "file"]] {
+        let (read, write_end) = pipe().unwrap();
+        write(&write_end, b"retain me").unwrap();
+        drop(write_end);
+        let output = command()
+            .args(args)
+            .stdin(Stdio::from(read.try_clone().unwrap()))
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(2));
+        assert!(output.stdout.is_empty());
+        assert_plain(&output.stderr);
+        let mut retained = String::new();
+        std::fs::File::from(read)
+            .read_to_string(&mut retained)
+            .unwrap();
+        assert_eq!(retained, "retain me");
     }
 }
 
@@ -56,6 +91,42 @@ fn non_tty_input_is_not_consumed() {
         .read_to_string(&mut retained)
         .unwrap();
     assert_eq!(retained, "retained pipe data");
+}
+
+/// A tty for stdout alone does not give the child a controlling terminal.
+#[test]
+fn stdout_pty_without_controlling_terminal_leaves_pipe_and_modes_intact() {
+    use std::os::unix::process::CommandExt;
+
+    let pty = nix::pty::openpty(None, None).unwrap();
+    let original = nix::sys::termios::tcgetattr(&pty.slave).unwrap();
+    let (reader, writer) = pipe().unwrap();
+    write(&writer, b"must stay unread").unwrap();
+    drop(writer);
+    let mut child = command();
+    child
+        .stdin(Stdio::from(reader.try_clone().unwrap()))
+        .stdout(Stdio::from(pty.slave.try_clone().unwrap()));
+    // SAFETY: setsid is async-signal-safe; the pre-exec hook uses no inherited locks.
+    unsafe {
+        child.pre_exec(|| nix::unistd::setsid().map(|_| ()).map_err(Into::into));
+    }
+    let output = child.output().unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("controlling terminal"));
+    assert_plain(&output.stderr);
+    assert_eq!(nix::sys::termios::tcgetattr(&pty.slave).unwrap(), original);
+    let flags = nix::fcntl::OFlag::O_NONBLOCK;
+    nix::fcntl::fcntl(&pty.master, nix::fcntl::FcntlArg::F_SETFL(flags)).unwrap();
+    assert_eq!(
+        nix::unistd::read(&pty.master, &mut [0; 1]),
+        Err(nix::errno::Errno::EAGAIN)
+    );
+    let mut retained = String::new();
+    std::fs::File::from(reader)
+        .read_to_string(&mut retained)
+        .unwrap();
+    assert_eq!(retained, "must stay unread");
 }
 
 /// TTY stdin alone is insufficient: redirected stdout must receive no escape sequences.

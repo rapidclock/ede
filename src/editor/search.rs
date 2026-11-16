@@ -16,11 +16,19 @@ pub(crate) enum Operation {
 /// Bounded captured fields; all-open membership is captured when admitted.
 #[derive(Clone, Debug)]
 pub(crate) struct SearchRequest {
+    pub replacement_scope: Option<ReplacementScope>,
     pub navigation: Option<u64>,
     pub query: Query,
     pub replacement: String,
     pub all: bool,
     pub operation: Operation,
+}
+
+/// Replacement authority at queue admission, including streams that must be skipped.
+#[derive(Clone, Debug)]
+pub(crate) struct ReplacementScope {
+    pub current: Option<TabId>,
+    pub tabs: Vec<(TabId, bool)>,
 }
 
 /// Exact search range is separate from the grapheme-safe ordinary caret/selection.
@@ -30,6 +38,7 @@ pub(crate) struct Found {
     pub document: DocumentId,
     pub revision: document::Revision,
     pub range: Range<u64>,
+    extent: u64,
 }
 
 /// A bounded, accessible per-target report; partial counts never become final silently.
@@ -91,6 +100,7 @@ impl Status {
 /// Live work remains singly owned, with one coalesced future search intention.
 #[derive(Default)]
 pub(super) struct State {
+    stream_anchor: Option<Found>,
     metadata: Option<document::Permit>,
     pub(super) status: Status,
     query: Option<Query>,
@@ -121,9 +131,12 @@ struct Run {
     cancel: Cancellation,
     navigation: u64,
     worker: Option<Worker>,
-    best: Option<(usize, bool, Found)>,
+    candidates: Vec<(usize, bool, Found)>,
+    held_stream: Option<TabId>,
     wrap: bool,
     exact: Option<Found>,
+    stream_resume: Option<Found>,
+    read_only: Vec<TabId>,
     progress: Arc<Mutex<Progress>>,
     previous_message: String,
 }
@@ -139,10 +152,13 @@ enum Finished {
 struct ScanResult {
     document: DocumentId,
     revision: document::Revision,
+    extent: u64,
     count: u64,
     first: Option<Range<u64>>,
     last: Option<Range<u64>>,
+    penultimate: Option<Range<u64>>,
     eligible: Option<Range<u64>>,
+    preceding_eligible: Option<Range<u64>>,
     decorations: Vec<Range<u64>>,
     partial: bool,
     layout: u64,
@@ -187,6 +203,7 @@ pub(super) fn clears_anchor(action: &Action) -> bool {
             | Action::Hit { .. }
             | Action::GoTo { .. }
             | Action::ClearSelection
+            | Action::ToggleFollow(_)
             | Action::Switch(_)
             | Action::CycleTab(_)
             | Action::Command(
@@ -223,10 +240,104 @@ pub(super) fn mutates(action: &Action) -> bool {
 }
 
 impl State {
+    pub(super) fn holds_stream(&self, tab: TabId) -> bool {
+        self.run.as_ref().is_some_and(|run| {
+            !run.cancel.is_cancelled()
+                && matches!(run.request.operation, Operation::Next | Operation::Previous)
+                && run.held_stream == Some(tab)
+        })
+    }
+
+    pub(super) fn clear_stream_anchor(&mut self) {
+        self.stream_anchor = None;
+    }
+
+    /// At most one stream can hold publication. If All Open had to release an
+    /// earlier extent, only its former EOF boundary can change an accepted match.
+    fn navigation_candidate(
+        &self,
+        owner: &mut Coordinator,
+        run: &mut Run,
+    ) -> Result<Option<(bool, Found)>, Error> {
+        run.candidates.sort_by_key(|(rank, _, _)| *rank);
+        for (_, wrapped, mut found) in run.candidates.drain(..) {
+            let Some(state) = owner.state(found.tab) else {
+                continue;
+            };
+            if state.screen.document != Some(found.document) {
+                continue;
+            }
+            let Some(info) = &state.info else {
+                continue;
+            };
+            if info.revision != found.revision {
+                if state.live.is_none() || info.len < found.extent {
+                    continue;
+                }
+                if found.range.end == found.extent && info.len > found.extent {
+                    let snapshot = owner.background_snapshot(found.tab, found.document)?;
+                    let next = snapshot.read_window(ByteOffset(found.extent), 4)?;
+                    let following = next.text().chars().next();
+                    if run.request.query.whole_word
+                        && following.is_some_and(regex_syntax::is_word_character)
+                    {
+                        continue;
+                    }
+                    if following == Some('\n') && found.extent > 0 {
+                        let at = snapshot.floor_scalar(ByteOffset(found.extent - 1))?;
+                        if snapshot.read_window(at, 4)?.text().starts_with('\r') {
+                            continue;
+                        }
+                    }
+                }
+                found.revision = owner
+                    .state(found.tab)
+                    .and_then(|state| state.info.as_ref())
+                    .ok_or(Error::Closed)?
+                    .revision;
+            }
+            return Ok(Some((wrapped, found)));
+        }
+        Ok(None)
+    }
+
+    pub(super) fn stream_advanced(&mut self, tab: TabId, revision: document::Revision) {
+        if self
+            .status
+            .current
+            .as_ref()
+            .is_some_and(|found| found.tab == tab && found.revision != revision)
+        {
+            self.status.current = None;
+        }
+        if self
+            .status
+            .decorated
+            .is_some_and(|(target, previous, ..)| target == tab && previous != revision)
+        {
+            self.status.decorations.clear();
+            self.status.decorated = None;
+        }
+    }
+
+    pub(super) fn stream_promoted(&mut self, tab: TabId) {
+        if self
+            .stream_anchor
+            .as_ref()
+            .is_some_and(|found| found.tab == tab)
+        {
+            self.clear_stream_anchor();
+        }
+        self.stream_advanced(tab, document::Revision(u64::MAX));
+    }
+
     pub(super) fn busy(&self) -> bool {
         self.run.is_some() || self.pending.is_some() || self.maintaining.is_some()
     }
     pub(super) fn cancel(&mut self, invalidate: bool) {
+        if invalidate {
+            self.stream_anchor = None;
+        }
         self.decorations_enabled = false;
         self.pending = None;
         if let Some(work) = &self.maintaining {
@@ -298,20 +409,58 @@ impl State {
                         .is_some_and(|i| i.revision == found.revision)
             })
             .cloned();
+        if self.query.as_ref() != Some(&request.query) {
+            self.clear_stream_anchor();
+        }
+        let scope = request.replacement_scope.as_ref();
+        let selected = scope.map_or(owner.tab.screen.tab, |scope| scope.current);
+        let read_only = |id| {
+            scope.is_some_and(|scope| scope.tabs.contains(&(id, true)))
+                || owner
+                    .state(id)
+                    .is_some_and(|state| state.capability == crate::search::Capability::ReadOnly)
+        };
+        if !request.all
+            && matches!(
+                request.operation,
+                Operation::ReplaceNext | Operation::ReplaceAll
+            )
+            && selected.is_some_and(read_only)
+        {
+            return Err(Error::ReadOnly);
+        }
         let exact = (request.operation == Operation::ReplaceNext)
             .then_some(current.clone())
-            .flatten();
+            .flatten()
+            .filter(|found| (request.all || Some(found.tab) == selected) && !read_only(found.tab));
+        let active = exact.as_ref().map(|f| f.tab).or(selected);
+        let targets: Vec<_> = scope.map_or_else(
+            || {
+                owner
+                    .tabs
+                    .iter()
+                    .map(|tab| tab.id)
+                    .filter(|id| request.all || Some(*id) == active)
+                    .collect()
+            },
+            |scope| {
+                scope
+                    .tabs
+                    .iter()
+                    .map(|(tab, _)| *tab)
+                    .filter(|id| request.all || Some(*id) == active)
+                    .collect()
+            },
+        );
+        let read_only = targets
+            .iter()
+            .copied()
+            .filter(|id| read_only(*id))
+            .collect();
         let mut request = request;
         if request.operation == Operation::ReplaceNext && exact.is_none() {
             request.operation = Operation::Next;
         }
-        let active = exact.as_ref().map(|f| f.tab).or(owner.tab.screen.tab);
-        let targets: Vec<_> = owner
-            .tabs
-            .iter()
-            .filter(|t| request.all || Some(t.id) == active)
-            .map(|t| t.id)
-            .collect();
         let anchor = targets
             .iter()
             .position(|id| Some(*id) == active)
@@ -331,6 +480,10 @@ impl State {
         let navigation = request
             .navigation
             .unwrap_or_else(|| owner.view_cancel.search_navigation.load(Ordering::Acquire));
+        let stream_resume = self.stream_anchor.clone().filter(|found| {
+            Some(found.tab) == active
+                && matches!(request.operation, Operation::Next | Operation::Previous)
+        });
         let run = Run {
             _permit: None,
             request,
@@ -341,9 +494,12 @@ impl State {
             cancel,
             navigation,
             worker: None,
-            best: None,
+            candidates: Vec::new(),
+            held_stream: None,
             wrap,
             exact,
+            stream_resume,
+            read_only,
             progress: Arc::new(Mutex::new(Progress::default())),
             previous_message: self.status.message.clone(),
         };
@@ -440,6 +596,11 @@ impl State {
             run.request.operation,
             Operation::ReplaceAll | Operation::ReplaceNext
         );
+        let candidate = if successful && !replaced && !decorating {
+            self.navigation_candidate(owner, &mut run)?
+        } else {
+            None
+        };
         self.status.message = if decorating && successful {
             run.previous_message.clone()
         } else if run.cancel.is_cancelled() {
@@ -460,14 +621,10 @@ impl State {
                 "{} occurrences processed; {} changed documents",
                 self.status.processed, self.status.changed
             )
-        } else if let Some((_, wrapped, found)) = run.best.take() {
-            if run.navigation == owner.view_cancel.search_navigation.load(Ordering::Acquire)
-                && owner
-                    .state(found.tab)
-                    .and_then(|s| s.info.as_ref())
-                    .is_some_and(|info| info.revision == found.revision)
-            {
+        } else if let Some((wrapped, found)) = candidate {
+            if run.navigation == owner.view_cancel.search_navigation.load(Ordering::Acquire) {
                 owner.activate(found.tab);
+                owner.tab.pause_follow();
                 let snapshot = owner.snapshot()?;
                 let mut text = Text::new(&snapshot, &run.cancel);
                 let ceil = text.ceil(found.range.start)?;
@@ -479,6 +636,7 @@ impl State {
                 owner.tab.screen.position.move_to(caret, false);
                 owner.tab.preferred = None;
                 owner.layout(true)?;
+                self.stream_anchor = owner.tab.live.is_some().then(|| found.clone());
                 self.status.current = Some(found);
             }
             format!(
@@ -782,6 +940,7 @@ impl State {
                     self.start(
                         owner,
                         SearchRequest {
+                            replacement_scope: None,
                             navigation: None,
                             query,
                             replacement: String::new(),
@@ -868,19 +1027,36 @@ impl State {
                         };
                         if let Some(range) = range
                             && (run.wrap || !wrapped)
-                            && run.best.as_ref().is_none_or(|(best, _, _)| rank < *best)
                         {
-                            run.best = Some((
-                                rank,
-                                wrapped,
-                                Found {
-                                    tab,
-                                    document: scan.document,
-                                    revision: scan.revision,
-                                    range,
-                                },
-                            ));
+                            let fallback = if previous && range.end == scan.extent {
+                                if index == run.anchor && !wrapped {
+                                    scan.preceding_eligible
+                                } else {
+                                    scan.penultimate
+                                }
+                            } else {
+                                None
+                            };
+                            for range in std::iter::once(range).chain(fallback) {
+                                run.candidates.push((
+                                    rank,
+                                    wrapped,
+                                    Found {
+                                        tab,
+                                        document: scan.document,
+                                        revision: scan.revision,
+                                        range,
+                                        extent: scan.extent,
+                                    },
+                                ));
+                            }
                         }
+                        run.held_stream = run
+                            .candidates
+                            .iter()
+                            .min_by_key(|(rank, _, _)| *rank)
+                            .map(|(_, _, candidate)| candidate.tab)
+                            .filter(|tab| target_is_stream(owner, *tab));
                         if owner.tab.screen.tab == Some(tab) {
                             self.status.decorated =
                                 Some((tab, scan.revision, scan.layout, scan.top, scan.left));
@@ -1065,12 +1241,13 @@ impl State {
         if matches!(
             run.request.operation,
             Operation::ReplaceNext | Operation::ReplaceAll
-        ) && target.capability == crate::search::Capability::ReadOnly
+        ) && (run.read_only.contains(&tab)
+            || target.capability == crate::search::Capability::ReadOnly)
         {
             self.status.outcomes.push(Outcome {
                 tab,
                 count: 0,
-                revision: target.info.as_ref().map(|i| i.revision),
+                revision: None,
                 message: "Skipped: read-only retained history".into(),
             });
             self.run = Some(run);
@@ -1163,20 +1340,32 @@ impl State {
                 })?;
             run.worker = Some(Worker { tab, handle });
         } else {
-            let snapshot = match owner.call_background(Request::BackgroundSnapshot(document))? {
-                Response::Snapshot(s) => s,
-                _ => return Err(Error::CorruptStorage),
-            };
+            let snapshot = owner.background_snapshot(tab, document)?;
+            let resume = run
+                .stream_resume
+                .as_ref()
+                .filter(|found| found.tab == tab && found.document == document)
+                .map(|found| found.range.clone());
+            if target_is_stream(owner, tab) && request.operation != Operation::Decorate {
+                run.held_stream = Some(tab);
+                self.status.message = format!(
+                    "Retained history · {} bytes · ingestion continues",
+                    snapshot.len()
+                );
+            }
             let handle = thread::Builder::new()
                 .name("ede-search-scan".into())
                 .spawn(move || {
                     let mut result = ScanResult {
                         document,
                         revision,
+                        extent: snapshot.len(),
                         count: 0,
                         first: None,
                         last: None,
+                        penultimate: None,
                         eligible: None,
+                        preceding_eligible: None,
                         decorations: Vec::with_capacity(256),
                         partial: false,
                         layout,
@@ -1199,12 +1388,18 @@ impl State {
                                 if result.first.is_none() {
                                     result.first = Some(range.clone());
                                 }
-                                result.last = Some(range.clone());
+                                result.penultimate = result.last.replace(range.clone());
                                 if request.operation == Operation::Previous {
-                                    if range.end <= bound {
-                                        result.eligible = Some(range.clone());
+                                    if resume.as_ref().map_or(range.end <= bound, |prior| {
+                                        range.start <= prior.start && range != *prior
+                                    }) {
+                                        result.preceding_eligible =
+                                            result.eligible.replace(range.clone());
                                     }
-                                } else if range.start >= bound && result.eligible.is_none() {
+                                } else if resume.as_ref().map_or(range.start >= bound, |prior| {
+                                    range.start >= prior.start && range != *prior
+                                }) && result.eligible.is_none()
+                                {
                                     result.eligible = Some(range.clone());
                                 }
                                 if range.start < visible.end && range.end > visible.start {
@@ -1230,4 +1425,8 @@ impl State {
         self.run = Some(run);
         Ok(true)
     }
+}
+
+fn target_is_stream(owner: &Coordinator, tab: TabId) -> bool {
+    owner.state(tab).is_some_and(|state| state.live.is_some())
 }

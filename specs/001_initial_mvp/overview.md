@@ -575,7 +575,7 @@ Evidence: [Stage 07 validation record](07_syntax_highlighting.md#validation-reco
 
 Design — [08_pipes_and_follow.md](08_pipes_and_follow.md). Depends on Stages 02–07.
 
-Status — Draft for approval.
+Status — Implemented, independently reviewed, and validated on macOS and Ubuntu.
 
 Branch — `stage/pipes_and_follow`. PR target — `feat/initial_mvp`.
 

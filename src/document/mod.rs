@@ -10,6 +10,7 @@ mod cleanup;
 mod compact;
 mod history;
 mod index;
+mod live;
 mod model;
 mod platform;
 mod prepared_edit;
@@ -23,7 +24,11 @@ mod transaction;
 mod tree;
 mod types;
 
+#[doc(hidden)]
+pub use live::CaptureAdoption;
+pub(crate) use live::{Capture, CaptureFactory};
 pub use model::Document;
+pub(crate) use platform::{Version as FileVersion, open_regular};
 pub use prepared_edit::{EditReport, EditTask, PreparedEdit};
 pub(crate) use refresh::observe;
 pub use refresh::{FileObservation, PreparedRefresh, RefreshProgress, RefreshReport, RefreshTask};

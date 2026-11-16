@@ -26,7 +26,7 @@ fn main() -> ExitCode {
         }
         [arg] if arg == "--help" || arg == "-h" => {
             println!(
-                "ede {}\n\nUsage: ede [--] [FILE ...]\n       ede --help | --version\n\nOpen UTF-8 files in tabs, or create an unnamed buffer.\nF1: Help    F2: Actions    Ctrl+Q: Quit",
+                "ede {}\n\nUsage: ede [--] [FILE ...]\n       producer | ede [--] [FILE ...]\n       ede [FILE ...] < INPUT\n       ede --follow FILE\n       ede --help | --version\n\nOpen UTF-8 files in tabs. Piped stdin needs a foreground tty and becomes\nan editable scratch at valid EOF. --follow requires terminal stdin and\nopens a read-only file follower. Interactive output needs a terminal.\nF1: Help    F2: Actions    Ctrl+Q: Quit",
                 env!("CARGO_PKG_VERSION")
             );
             return ExitCode::SUCCESS;
@@ -38,12 +38,18 @@ fn main() -> ExitCode {
         _ => {}
     }
     let separated = args.first().is_some_and(|arg| arg == "--");
+    let follow = args.first().is_some_and(|arg| arg == "--follow");
     let paths = &args[usize::from(separated)..];
-    if paths.len() > ede::TAB_LIMIT
-        || (!separated
-            && paths
-                .iter()
-                .any(|arg| arg.as_encoded_bytes().starts_with(b"-")))
+    if follow && args.len() != 2 {
+        eprintln!("ede: --follow requires exactly one file path");
+        return ExitCode::from(2);
+    }
+    if !follow
+        && (paths.len() > ede::TAB_LIMIT
+            || (!separated
+                && paths
+                    .iter()
+                    .any(|arg| arg.as_encoded_bytes().starts_with(b"-"))))
     {
         eprintln!(
             "ede: expected at most {} file paths; use -- before dash-prefixed paths",
@@ -54,10 +60,12 @@ fn main() -> ExitCode {
     // Printing a panic from the default hook while raw/alternate-screen modes are active
     // corrupts the display. run() catches unwinding and returns its diagnostic after cleanup.
     panic::set_hook(Box::new(|_| {}));
-    match ede::run_cli(
-        paths.iter().map(PathBuf::from).collect(),
-        env::current_exe().ok(),
-    ) {
+    let (paths, follow) = if follow {
+        (Vec::new(), Some(PathBuf::from(&args[1])))
+    } else {
+        (paths.iter().map(PathBuf::from).collect(), None)
+    };
+    match ede::run_launch(paths, follow, env::current_exe().ok()) {
         Ok(exit) => ExitCode::from(exit.code),
         Err(error) => {
             eprintln!("ede: {error}");

@@ -21,6 +21,27 @@ pub struct Snapshot {
     pub(super) blocking_leases: Option<Arc<AtomicUsize>>,
 }
 impl Snapshot {
+    /// Pin the same published extent without consulting its possibly busy source owner.
+    pub(crate) fn duplicate_live(&self) -> Result<Self, Error> {
+        let reader = Box::new(Reader {
+            source: self.reader.source.reader()?,
+            tree: self.reader.tree.reader()?,
+        });
+        self.leases
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                (n < reader.source.limits.leases).then_some(n + 1)
+            })
+            .map_err(|_| Error::Busy)?;
+        Ok(Self {
+            store: self.store.clone(),
+            state: self.state.clone(),
+            reader,
+            document: self.document,
+            revision: self.revision,
+            leases: self.leases.clone(),
+            blocking_leases: None,
+        })
+    }
     /// Charge a background client's resident work against the shared buffer pool.
     pub(crate) fn reserve_work(&self, bytes: usize) -> Result<Permit, Error> {
         self.reader.source.resources.buffers.acquire(bytes)

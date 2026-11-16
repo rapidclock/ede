@@ -223,7 +223,7 @@ impl Document {
     pub(super) fn background_snapshot(&self) -> Result<Snapshot, Error> {
         self.capture_snapshot(false)
     }
-    fn capture_snapshot(&self, blocking: bool) -> Result<Snapshot, Error> {
+    pub(super) fn capture_snapshot(&self, blocking: bool) -> Result<Snapshot, Error> {
         let store = self.store.lock().map_err(|_| Error::CorruptStorage)?;
         let limit = store.source.limits.leases;
         let mut reader = store.reader()?;

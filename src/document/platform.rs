@@ -41,7 +41,7 @@ pub(super) fn copy_prefix(
 
 /// File identity and observed version; contents are additionally compared on save.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) struct Version {
+pub(crate) struct Version {
     pub dev: u64,
     pub ino: u64,
     pub len: u64,
@@ -73,6 +73,10 @@ impl Version {
     pub fn same_object(&self, other: &Self) -> bool {
         self.dev == other.dev && self.ino == other.ino
     }
+    /// Whether length or modification time warrants rechecking a follower's witness.
+    pub(crate) fn content_changed(&self, other: &Self) -> bool {
+        self.len != other.len || self.modified != other.modified
+    }
     /// Publication may update ctime; all other captured output fields must stay unchanged.
     pub fn unchanged_after_rename(&self, before: &Self) -> bool {
         self.same_object(before)
@@ -98,6 +102,16 @@ fn flags(_: &Metadata) -> u32 {
 
 /// Open without FIFO blocking, then validate descriptor and resolved pathname identity.
 pub(super) fn open(path: &Path) -> Result<(File, PathBuf, Version), Error> {
+    let (file, version) = open_regular(path)?;
+    let resolved = fs::canonicalize(path)?;
+    if Version::of(&fs::metadata(&resolved)?) != version {
+        return Err(Error::SourceChanged);
+    }
+    Ok((file, resolved, version))
+}
+
+/// A growing follower requires descriptor identity but accepts changing length and mtime.
+pub(crate) fn open_regular(path: &Path) -> Result<(File, Version), Error> {
     if !fs::metadata(path)?.is_file() {
         return Err(Error::UnsupportedType);
     }
@@ -105,15 +119,15 @@ pub(super) fn open(path: &Path) -> Result<(File, PathBuf, Version), Error> {
         .read(true)
         .custom_flags(libc::O_NONBLOCK)
         .open(path)?;
-    if !file.metadata()?.is_file() {
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
         return Err(Error::UnsupportedType);
     }
-    let version = Version::of(&file.metadata()?);
-    let resolved = fs::canonicalize(path)?;
-    if Version::of(&fs::metadata(&resolved)?) != version {
+    let version = Version::of(&metadata);
+    if !Version::of(&fs::metadata(path)?).same_object(&version) {
         return Err(Error::SourceChanged);
     }
-    Ok((file, resolved, version))
+    Ok((file, version))
 }
 /// Check available storage before allocating, preserving configured free-space headroom.
 pub(super) fn reserve(file: &File, bytes: u64, headroom: u64) -> Result<(), Error> {

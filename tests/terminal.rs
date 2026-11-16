@@ -328,6 +328,11 @@ struct PtyChild {
 impl PtyChild {
     /// Spawn with a controlling terminal. Unsafe operations run only between fork and exec.
     fn spawn(mut command: Command) -> Self {
+        Self::spawn_with_input(&mut command, None)
+    }
+
+    /// Attach a separate producer descriptor while keeping the PTY as the controlling tty.
+    fn spawn_with_input(command: &mut Command, input: Option<Stdio>) -> Self {
         let state_root = if command
             .get_envs()
             .any(|(name, value)| name == "EDE_STATE_DIR" && value.is_some())
@@ -353,18 +358,18 @@ impl PtyChild {
         original.input_flags.insert(InputFlags::IXON);
         termios::tcsetattr(&slave, SetArg::TCSANOW, &original).unwrap();
         command
-            .stdin(Stdio::from(slave.try_clone().unwrap()))
+            .stdin(input.unwrap_or_else(|| Stdio::from(slave.try_clone().unwrap())))
             .stdout(Stdio::from(slave.try_clone().unwrap()))
             .stderr(Stdio::from(slave.try_clone().unwrap()))
             .env_remove("NO_COLOR")
             .env("TERM", "xterm-256color")
             .env("PS1", "EDE_TEST_PROMPT> ");
-        // SAFETY: setsid and ioctl are async-signal-safe; fd 0 is the already-duplicated
+        // SAFETY: setsid and ioctl are async-signal-safe; fd 1 is the already-duplicated
         // slave PTY. This closure performs no allocation, locking, or Rust-owned mutation.
         unsafe {
             command.pre_exec(|| {
                 setsid().map_err(io::Error::from)?;
-                if libc::ioctl(0, libc::TIOCSCTTY as _, 0) == -1 {
+                if libc::ioctl(1, libc::TIOCSCTTY as _, 0) == -1 {
                     return Err(io::Error::last_os_error());
                 }
                 Ok(())
@@ -661,11 +666,298 @@ impl PtyChild {
     }
 }
 
+/// A delayed producer is visible before EOF and the same tab saves exact bytes after EOF.
+#[test]
+fn piped_input_displays_incrementally_and_becomes_editable_at_eof() {
+    let directory = tempfile::tempdir().unwrap();
+    let destination = directory.path().join("capture.txt");
+    let (mut process, mut writer) = piped_editor();
+    writer.write_all(b"\xef").unwrap();
+    writer.write_all(b"\xbb\xbflead\r").unwrap();
+    process.expect("lead");
+    process.send(b"X");
+    process.expect_status("Document is read-only");
+    writer.write_all(b"\n\xf0\x9f").unwrap();
+    writer.write_all(b"\x8c\x8d tail").unwrap();
+    drop(writer);
+    process.expect("Editable scratch");
+    process.expect_absent("Pause View");
+    process.send(b"!");
+    process.expect("tail!");
+    process.send(b"\x13");
+    process.expect("Save As");
+    process.send(destination.as_os_str().as_encoded_bytes());
+    process.send(b"\r");
+    process.expect_status("Saved");
+    assert_eq!(
+        std::fs::read(destination).unwrap(),
+        b"\xef\xbb\xbflead\r\n\xf0\x9f\x8c\x8d tail!"
+    );
+    process.send(b"\x11");
+    assert!(process.wait().success());
+    process.assert_restored();
+}
+
+fn piped_editor() -> (PtyChild, File) {
+    use nix::fcntl::{FcntlArg, FdFlag, fcntl};
+    let (reader, writer) = nix::unistd::pipe().unwrap();
+    for fd in [&reader, &writer] {
+        fcntl(fd, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC)).unwrap();
+    }
+    (redirected_editor(Stdio::from(reader)), File::from(writer))
+}
+
+fn redirected_editor(input: Stdio) -> PtyChild {
+    let mut command = Command::new("/bin/sh");
+    // Drop the wrapper's pipe reader after launching EDE. Keep only its tty open
+    // so Darwin allows the parent test to inspect termios after EDE exits.
+    command.args([
+        "-c",
+        r#"
+exec 3<&0 0</dev/tty
+"$1" <&3 3<&- &
+pid=$!
+printf 'EDE_PID:%s\n' "$pid"
+exec 3<&-
+wait "$pid"
+result=$?
+printf '\nEDE_EXIT:%s\n' "$result"
+read -r _completion
+exit "$result"
+"#,
+        "ede-pipe-test",
+        env!("CARGO_BIN_EXE_ede"),
+    ]);
+    let mut process = PtyChild::spawn_with_input(&mut command, Some(input));
+    process.keep_alive = true;
+    process
+}
+
+#[test]
+fn redirected_file_stdin_reads_from_inherited_position_and_escapes_controls() {
+    use std::io::{Seek, SeekFrom};
+    let input = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(input.path(), b"ignored\nvisible-\x1b[31m-text").unwrap();
+    let mut file = input.reopen().unwrap();
+    file.seek(SeekFrom::Start(8)).unwrap();
+    let mut process = redirected_editor(Stdio::from(file));
+    process.expect("visible-<U+001B>[31m-text");
+    assert!(!process.parser.screen().contents().contains("ignored"));
+    process.expect_status("Editable scratch");
+    process.send(b"\x11");
+    assert!(process.wait().success());
+    process.assert_restored();
+}
+
+#[test]
+fn pipe_reports_hangup_and_releases_idle_producer() {
+    let (mut process, mut writer) = piped_editor();
+    writer.write_all(b"idle stream marker").unwrap();
+    process.expect("idle stream marker");
+    nix::sys::signal::kill(process.editor_pid(), nix::sys::signal::Signal::SIGHUP).unwrap();
+    assert_eq!(process.wait().code(), Some(129));
+    process.assert_restored();
+    assert_eq!(
+        writer.write(b"after hangup").unwrap_err().kind(),
+        io::ErrorKind::BrokenPipe
+    );
+}
+
+/// Retained Find continues to the next occurrence even when appends stale its decorations.
+#[test]
+fn live_find_advances_after_append() {
+    let (mut process, mut writer) = piped_editor();
+    writer.write_all(b"stream item one\n").unwrap();
+    process.expect("stream item one");
+    process.send(b"\x06");
+    process.expect("Find:");
+    process.send(b"item\r");
+    process.expect("1 matches");
+    process.expect_status("Ln 1 Col 8");
+    writer.write_all(b"stream item two\n").unwrap();
+    process.expect("Results stale");
+    process.send(b"\x1bOR");
+    process.expect_status("Ln 2 Col 8");
+    drop(writer);
+    process.expect_status("Editable scratch");
+    process.send(b"\x1b");
+    process.expect_absent("Find:");
+    process.send(b"\x11");
+    assert!(process.wait().success());
+    process.assert_restored();
+}
+
+/// Stage 08 release probe with a gated producer and a companion editable tab.
+#[test]
+#[ignore = "1 GiB retained stream; run explicitly with EDE_BENCH_CORPUS=ordinary|dense|long"]
+fn sustained_piped_capture_benchmark() {
+    use std::sync::mpsc;
+
+    let mib = std::env::var("EDE_BENCH_MIB")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(1024);
+    let corpus = std::env::var("EDE_BENCH_CORPUS").unwrap_or_else(|_| "ordinary".into());
+    let launch = Instant::now();
+    let (mut process, mut writer) = piped_editor();
+    writer.write_all(b"first stream marker").unwrap();
+    process.expect_body("first stream marker", TIMEOUT);
+    let pid = process.editor_pid();
+    let first_text = launch.elapsed();
+    let (allow, proceed) = mpsc::sync_channel(0);
+    let producer = thread::spawn(move || {
+        let mut block = [b'x'; 64 << 10];
+        let stride = match corpus.as_str() {
+            "ordinary" => 128,
+            "dense" => 2,
+            "long" => block.len() + 1,
+            _ => panic!("unknown corpus"),
+        };
+        for line in block.chunks_exact_mut(stride) {
+            *line.last_mut().unwrap() = b'\n';
+        }
+        proceed.recv().unwrap();
+        for _ in 0..mib * 16 {
+            writer.write_all(&block).unwrap();
+        }
+        writer.write_all(b"last stream marker").unwrap();
+        writer
+    });
+    let sustained = Instant::now();
+    allow.send(()).unwrap();
+    process.send(b"\x0e");
+    process.expect_status("Ready");
+    let mut max_input = Duration::ZERO;
+    for (index, letter) in b"companion".iter().enumerate() {
+        let began = Instant::now();
+        process.send(&[*letter]);
+        process.expect_body(
+            std::str::from_utf8(&b"companion"[..=index]).unwrap(),
+            TIMEOUT,
+        );
+        max_input = max_input.max(began.elapsed());
+    }
+    process.send(b"\x1b[18~");
+    let deadline = Instant::now() + Duration::from_secs(180);
+    let mut sampled = Instant::now();
+    let mut peak_rss = 0;
+    let mut peak_fds = 0;
+    while !producer.is_finished() {
+        process.reset_output();
+        if sampled.elapsed() >= Duration::from_millis(100) {
+            sampled = Instant::now();
+            let output = Command::new("ps")
+                .args(["-o", "rss=", "-p", &pid.to_string()])
+                .output()
+                .unwrap();
+            if let Ok(rss) = String::from_utf8_lossy(&output.stdout)
+                .trim()
+                .parse::<u64>()
+            {
+                peak_rss = peak_rss.max(rss);
+            }
+            if let Ok(fds) = std::fs::read_dir(format!("/proc/{pid}/fd")) {
+                peak_fds = peak_fds.max(fds.count());
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "producer blocked for more than three minutes"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+    let writer = producer.join().unwrap();
+    process.expect_body("last stream marker", Duration::from_secs(60));
+    let transferred = sustained.elapsed();
+    process.send(b"\x06");
+    process.expect("Find:");
+    process.send(b"last stream marker\r");
+    process.expect_body("1 matches", Duration::from_secs(120));
+    let eof = Instant::now();
+    drop(writer);
+    process.expect_status("Editable scratch");
+    let adopted = eof.elapsed();
+    eprintln!(
+        "stream_MiB={mib} first_text_ms={:.3} throughput_MiB_s={:.2} max_companion_input_ms={:.3} eof_adoption_ms={:.3} sampled_rss_KiB={peak_rss} proc_fd_high_water={peak_fds}",
+        first_text.as_secs_f64() * 1000.0,
+        mib as f64 / transferred.as_secs_f64(),
+        max_input.as_secs_f64() * 1000.0,
+        adopted.as_secs_f64() * 1000.0
+    );
+    // Bench state is disposable. Avoid timing the separate recovery checkpoint on exit.
+    nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGTERM).unwrap();
+    assert_eq!(process.wait().code(), Some(143));
+    process.assert_restored();
+}
+
+/// Cancel keeps the idle source available. Confirmed Close promptly drops the read end.
+#[test]
+fn idle_pipe_close_confirms_and_releases_producer() {
+    let (mut process, mut writer) = piped_editor();
+    writer.write_all(b"first marker\n").unwrap();
+    process.expect("first marker");
+    process.send(b"\x17");
+    process.expect("discard retained stream history");
+    process.send(b"\x1b");
+    process.expect_absent("discard retained stream history");
+    writer.write_all(b"after cancel\n").unwrap();
+    process.expect("after cancel");
+    process.send(b"\x17");
+    process.expect("discard retained stream history");
+    process.send(b"\x1b[Z\r");
+    process.expect("No open tabs");
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        match writer.write(b"x") {
+            Err(error) if error.kind() == io::ErrorKind::BrokenPipe => break,
+            Ok(1) if Instant::now() < deadline => thread::sleep(Duration::from_millis(5)),
+            result => panic!("closed stream did not release its reader: {result:?}"),
+        }
+    }
+    process.send(b"\x11");
+    assert!(process.wait().success());
+    process.assert_restored();
+}
+
+/// Pathname rotation retains the old generation and never joins separate partial lines.
+#[test]
+fn pathname_follow_keeps_old_text_and_separates_rotated_text() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("current.log");
+    let old = directory.path().join("old.log");
+    std::fs::write(&path, b"old line\npartial\r").unwrap();
+    let mut process = PtyChild::editor_with_args(
+        Some("xterm-256color"),
+        [std::ffi::OsStr::new("--follow"), path.as_os_str()],
+    );
+    process.expect("partial");
+    process.expect_status("Waiting for more");
+    std::fs::rename(&path, &old).unwrap();
+    std::fs::write(&path, b"\xef\xbb\xbfnew generation\n").unwrap();
+    process.expect("new generation");
+    process.expect("partial<U+000D>");
+    assert_eq!(std::fs::read(&old).unwrap(), b"old line\npartial\r");
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        b"\xef\xbb\xbfnew generation\n"
+    );
+    process.send(b"\x11");
+    process.expect("discard retained stream history");
+    process.send(b"\x1b[Z\r");
+    assert!(process.wait().success());
+    process.assert_restored();
+}
+
 impl Drop for PtyChild {
-    /// Kill/reap on assertion failure so tests never leave an orphaned editor or shell.
+    /// Terminate the owned child and give it a bounded chance to reap.
     fn drop(&mut self) {
         let _ = self.child.kill();
-        let _ = self.child.wait();
+        // A killed Darwin session leader can remain in tty revocation until
+        // this fixture's slave handle closes. Never block a failed test here.
+        let deadline = Instant::now() + Duration::from_millis(150);
+        while matches!(self.child.try_wait(), Ok(None)) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
     }
 }
 

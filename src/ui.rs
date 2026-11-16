@@ -38,6 +38,7 @@ pub(crate) enum Control {
     RecoveryPrevious,
     RecoveryNext,
     RetryRefresh,
+    ToggleFollow,
     RecoveryErrorRetry,
     RecoveryErrorCancel,
     PickerList,
@@ -73,6 +74,7 @@ impl Control {
             | Self::PickerRow(_) => None,
             Self::RecoveryRow(_) | Self::RecoveryList => None,
             Self::RetryRefresh => Some(Command::RetryRefresh),
+            Self::ToggleFollow => Some(Command::ToggleFollow),
             Self::Menu => Some(Command::Menu),
             Self::SaveErrorAs => Some(Command::SaveAs),
             Self::Help => Some(Command::Help),
@@ -104,6 +106,7 @@ impl Control {
             Self::RecoveryPrevious => "Prev",
             Self::RecoveryNext => "Next",
             Self::RetryRefresh => "Retry refresh",
+            Self::ToggleFollow => "Pause View",
             Self::RecoveryErrorRetry => "Retry",
             Self::RecoveryErrorCancel => "Cancel quit",
             Self::Tabs => "Tabs",
@@ -146,6 +149,8 @@ pub(crate) struct Signature {
     picker_request: u64,
     switching: Option<u64>,
     search: Option<(bool, usize)>,
+    stream: bool,
+    stream_confirmation: bool,
 }
 /// Immutable frame geometry; hidden surfaces have no hit targets.
 #[derive(Clone, Debug)]
@@ -238,6 +243,8 @@ impl LayoutSnapshot {
                 .search
                 .open
                 .then_some((app.search.replace, app.search.row)),
+            stream: app.screen.stream.is_some(),
+            stream_confirmation: app.stream_confirmation.is_some(),
         }
     }
     /// Modal targets replace all underlying controls, including at tiny sizes.
@@ -250,6 +257,12 @@ impl LayoutSnapshot {
         if app.modal.is_none() {
             if !app.help {
                 result.add_tab_strip(app);
+                if app.screen.stream.is_some() && area.width >= 64 {
+                    result.add(
+                        Control::ToggleFollow,
+                        Rect::new(area.right() - 16, area.bottom() - 1, 16, 1),
+                    );
+                }
                 if app.search.open {
                     if let Some(content) = result
                         .targets
@@ -444,7 +457,9 @@ impl LayoutSnapshot {
                 result.add(Control::PathCancel, Rect::new(overlay.x + 26, y, 8, 1));
             }
             Some(Modal::Confirm(..)) => {
-                result.add(Control::ConfirmSave, Rect::new(overlay.x + 1, y, 7, 1));
+                if app.stream_confirmation.is_none() {
+                    result.add(Control::ConfirmSave, Rect::new(overlay.x + 1, y, 7, 1));
+                }
                 result.add(Control::ConfirmDiscard, Rect::new(overlay.x + 9, y, 10, 1));
                 result.add(Control::ConfirmCancel, Rect::new(overlay.x + 21, y, 10, 1));
             }
@@ -465,7 +480,7 @@ impl LayoutSnapshot {
             }
             Some(Modal::Details(_) | Modal::TabDetails) => {
                 result.add(Control::DetailsClose, Rect::new(overlay.x + 2, y, 9, 1));
-                if app.screen.path.is_some() {
+                if app.screen.path.is_some() && app.screen.stream.is_none() {
                     result.add(Control::RetryRefresh, Rect::new(overlay.x + 13, y, 17, 1));
                 }
             }
@@ -799,7 +814,21 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &AppState, layout: &LayoutSnaps
     });
     frame.render_widget(
         Paragraph::new(footer),
-        Rect::new(area.x, area.bottom() - 1, area.width, 1),
+        Rect::new(
+            area.x,
+            area.bottom() - 1,
+            area.width
+                - if layout
+                    .targets
+                    .iter()
+                    .any(|target| target.control == Control::ToggleFollow)
+                {
+                    16
+                } else {
+                    0
+                },
+            1,
+        ),
     );
     if app.search.open && app.modal.is_none() && !app.help {
         let status = &app.screen.search;
@@ -832,13 +861,18 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &AppState, layout: &LayoutSnaps
             Some(Modal::Menu(_)) => " Actions (wheel/arrows) ",
             Some(Modal::Language { .. }) => " Language — Enter to apply ",
             Some(Modal::SyntaxTheme { .. }) => " Syntax Theme — Enter to apply ",
+            Some(Modal::Open(dialog)) if dialog.follow => " Follow file ",
             Some(Modal::Open(_)) => " Open file ",
             Some(Modal::Tabs(_)) => " Tabs — Enter to switch ",
             Some(Modal::Recovery(_)) => " Recovery — retained scratches ",
             Some(Modal::DiscardRecovery(..)) => " Discard retained scratch? ",
             Some(Modal::Path(PathKind::Save, _)) => " Save As (new path) ",
             Some(Modal::Path(PathKind::GoTo, _)) => " Go to line[:cell] (from 1) ",
+            Some(Modal::Path(PathKind::Export, _)) => " Export Retained Copy (new path) ",
             Some(Modal::Confirm(_, Some(_))) => " Destination may have changed ",
+            Some(Modal::Confirm(..)) if app.stream_confirmation.is_some() => {
+                " Discard stream history "
+            }
             Some(Modal::Confirm(..)) => " Unsaved changes ",
             Some(Modal::Details(_) | Modal::TabDetails) => " Details ",
             Some(Modal::SaveError(_)) => " Save failed — work retained ",
@@ -892,22 +926,26 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &AppState, layout: &LayoutSnaps
                 format!("{label}\nPermanently remove these retained contents?")
             }
             Some(Modal::Confirm(after, uncertain)) => {
-                let verb = if matches!(after, After::Close(_)) {
-                    "Close"
+                if let Some(message) = &app.stream_confirmation {
+                    message.clone()
                 } else {
-                    "Quit"
-                };
-                let id = after.target().or(app.screen.tab);
-                let label = app.tab_path_hint(id).map_or_else(
-                    || app.tab_label(id).to_owned(),
-                    |path| tail_cells(path, inner.width.saturating_sub(verb.len() as u16 + 3)),
-                );
-                let guidance = if uncertain.is_some() {
-                    "A save may have changed the destination. Discard acknowledges this."
-                } else {
-                    "Save your changes before continuing?"
-                };
-                format!("{verb} — {label}\n{guidance}")
+                    let verb = if matches!(after, After::Close(_)) {
+                        "Close"
+                    } else {
+                        "Quit"
+                    };
+                    let id = after.target().or(app.screen.tab);
+                    let label = app.tab_path_hint(id).map_or_else(
+                        || app.tab_label(id).to_owned(),
+                        |path| tail_cells(path, inner.width.saturating_sub(verb.len() as u16 + 3)),
+                    );
+                    let guidance = if uncertain.is_some() {
+                        "A save may have changed the destination. Discard acknowledges this."
+                    } else {
+                        "Save your changes before continuing?"
+                    };
+                    format!("{verb} — {label}\n{guidance}")
+                }
             }
             Some(Modal::TabDetails) => app.tab_details(),
             Some(Modal::Details(text) | Modal::SaveError(text) | Modal::PersistenceError(text)) => {
@@ -973,10 +1011,19 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &AppState, layout: &LayoutSnaps
                 render_field(frame, app, &dialog.field, target.area);
             }
         } else if let Some(Modal::Path(kind, field)) = &app.modal {
-            let label = if *kind == PathKind::GoTo {
-                "Line[:cell], starting at 1:"
-            } else {
-                "Path (no shell expansion):"
+            let label = match kind {
+                PathKind::GoTo => "Line[:cell], starting at 1:",
+                PathKind::Export
+                    if app
+                        .screen
+                        .stream
+                        .as_ref()
+                        .is_some_and(|stream| !stream.retry) =>
+                {
+                    "Only the committed prefix will be copied. Enter a new path."
+                }
+                PathKind::Export => "Export the complete retained extent to a new path.",
+                PathKind::Save => "Path (no shell expansion):",
             };
             frame.render_widget(
                 Paragraph::new(label),
@@ -1021,6 +1068,19 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &AppState, layout: &LayoutSnaps
     }
     for target in &layout.targets {
         let row = match (target.control, &app.modal) {
+            (Control::ToggleFollow, _) => app.screen.stream.as_ref().map(|status| {
+                (
+                    if status.following {
+                        "Pause View".into()
+                    } else {
+                        "Resume Follow".into()
+                    },
+                    app.focus == Some(Control::ToggleFollow),
+                )
+            }),
+            (Control::PickerOpen, Some(Modal::Open(dialog))) if dialog.follow => {
+                Some(("Follow".into(), app.focus == Some(Control::PickerOpen)))
+            }
             (Control::Tab(id), _) | (Control::TabListRow(id), _) => {
                 app.screen.tabs.iter().find(|tab| tab.id == id).map(|tab| {
                     let highlighted =

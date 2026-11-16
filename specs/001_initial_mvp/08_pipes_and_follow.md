@@ -1,6 +1,6 @@
 # 08 — Pipes, pager behavior, and live following
 
-Status — Design draft for approval.
+Status — Implemented, independently reviewed, and validated on macOS and Ubuntu.
 
 Branch — `stage/pipes_and_follow`, based on `feat/initial_mvp` at `bc25929`.
 
@@ -13,8 +13,8 @@ integrate live text with FR-04 highlighting and FR-08 search. Existing
 requirements include incremental display, read-only live streams, editable piped
 text after successful EOF, explicit follow controls, retained-history search,
 and direct file following on macOS and Linux. The CLI, file rotation policy,
-retention budgets, and error controls below are proposed Stage 08 decisions for
-user approval. The broader remote-terminal matrix remains Stage 10 work.
+retention budgets, and error controls below are the Stage 08 behavior. The broader
+remote-terminal matrix remains Stage 10 work.
 
 Preserve [Stage 02](02_document_storage.md) editing and save guarantees,
 [Stage 05](05_scratch_recovery.md) scratch recovery and named-file refresh,
@@ -170,7 +170,7 @@ key is required.
   pending and committed payload against the shared quota so concurrent
   appends cannot both spend the same capacity. Wait for a competing temporary
   reservation to settle before reporting exhaustion. Initial limits are
-  internal defaults with test injection, subject to approval and measurement.
+  internal defaults with test injection.
 - If storage falls behind, stop reading further blocks until the pending block
   commits. An upstream pipe can block through normal kernel backpressure. When
   reserve, quota, or a write failure prevents further progress, stop the source
@@ -340,9 +340,6 @@ timeouts for CI.
 
 ## Validation record
 
-Implementation validation is pending for P01–P08. Stage 08 has no runtime
-evidence yet.
-
 - Independent specification review against `bc25929` identified and verified
   fixes for rotation under backlog, pipe closure during blocked storage I/O,
   repeated Find during appends, retained-prefix boundaries, standalone CR
@@ -354,3 +351,89 @@ evidence yet.
   `cargo clippy --workspace --all-targets --locked -- -D warnings`, and
   `cargo test --workspace --locked` on arm64 macOS 27.2 with Rust 1.99.1.
   This baseline run used the default test selection.
+
+### Implementation checks on 2026-11-15
+
+- P01–P02 — CLI and PTY tests cover informational flags, argument errors,
+  startup slot accounting for stdin, absent controlling tty, redirected
+  stdout, untouched input and terminal state on startup failure, inherited
+  regular-file position, escaped control bytes, display before EOF, split
+  UTF-8 BOM/scalar/CRLF, exact Save As, and retry of an injected EOF adoption
+  failure. Stage 05 startup and recovery regressions passed in the same suites.
+- P03–P04 — A synchronized EOF test verifies that a stream Close confirmation
+  cannot discard a promoted scratch and that a replacement admitted while it
+  was read-only still skips it. A quit-readiness test covers cancel after the
+  final acknowledgement is queued. Real PTYs cover pause state, Find advance
+  after append, stale result reporting, and removal of the follow control
+  after promotion. Existing search and syntax suites ran on both hosts.
+- P05–P06 — Tests cover exact-limit EOF and extra-byte overflow, byte-exact
+  retained export with no clobber, a symlink retarget at publication, a dangling
+  source link, and ordinary pathname rotation with a BOM and standalone CR
+  at the generation seam. Older snapshots remain readable through EOF finish
+  retry. The same guarded publication routine serves Save As and export.
+- P07 — Tests cover idle-pipe close and cancel, EPIPE after confirmed Close
+  and SIGHUP, exact recoverable termios, and a gated spool write where the pipe
+  reader closes before storage unblocks. The stopped writer retains its
+  admission slot until the in-flight operation releases it. Retained capture
+  files are unlinked while their descriptors are open. An abandoned, blocked
+  worker can leave an empty private work directory.
+- Independent implementation review against `bb24330` and follow-up review of
+  the final behavioral fixes found no remaining correctness blockers. In
+  separate copies, deliberate mutations compiled and failed the intended
+  assertions for the contiguous-root integrity guard, export destination
+  recheck, exact-quota overflow, reader cancellation during blocked storage,
+  and retained scratch protections against stale Close and Replace authority.
+
+### Local and SSH environments
+
+- macOS 27.2 (26B123), Apple M1 Max, arm64, 32 GiB RAM, APFS, tmux 3.8.
+- Ubuntu 26.10, aarch64, 9.2 GiB VM RAM, ext4, tmux 3.7b. From macOS tmux pane
+  `%0`, the direct SSH shell displayed a gated pipe before EOF, accepted
+  caret navigation that paused follow, promoted after EOF, suspended and
+  resumed with `fg`, saved both lines byte for byte, and restored exact
+  `stty -g` on suspension and Quit. An isolated Ubuntu tmux server attached
+  from the same pane retained the original and replacement log generations
+  and exited after confirmation.
+- Rust 1.99.1. The Ubuntu runs also passed release highlighting and heap
+  checks, 1 GiB storage/editing/search for ordinary, dense and long corpora,
+  constrained highlighting/search overlap, scratch recovery, refresh storage,
+  and the Linux 64 MiB paste peak-RSS probe. The interactive, search, recovery
+  and paste probes used a 256 MiB limit with swap disabled. The storage
+  probes ran at 8 GiB for all corpora and at 256 MiB for ordinary text.
+- The final dev.8 tree passed `cargo fmt --all -- --check`, `cargo clippy
+  --workspace --all-targets --locked -- -D warnings`, and `cargo test
+  --workspace --locked` on both systems. The default suites passed 273 tests
+  on macOS and 276 on Ubuntu. The opt-in isolated tmux editing and suspend
+  smoke passed separately on both systems.
+
+The checks sample the requested scenarios and injected boundaries. The full
+interleaving matrix for simultaneous rotation, search, export and shutdown was
+not enumerated, and an actual uninterruptible filesystem hang was not induced.
+Native graphical shortcut delivery, mosh and Eternal Terminal remain part of
+the broader terminal compatibility work.
+
+### P08 release measurements
+
+Each run transferred 1 GiB from a generated producer after a gated first
+marker. It measured nine ordinary keystrokes in a companion editable tab during
+transfer, searched the retained stream before closing the producer descriptor,
+and timed EOF adoption. The producer ran at full speed after the gate. These
+are warm, generated fixtures under a PTY. The Ubuntu fixture and spool used
+ext4 rather than the VM's tmpfs. Ubuntu ran in a 256 MiB cgroup with swap disabled.
+
+| Host | Corpus | First text (ms) | Transfer (MiB/s) | Max input (ms) | EOF adoption (ms) | Editor RSS sample peak (KiB) | Sampled FDs |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| macOS | Ordinary | 240.0 | 583.8 | 37.5 | 24.2 | 5,504 | — |
+| macOS | Dense | 172.5 | 192.5 | 20.1 | 24.6 | 5,520 | — |
+| macOS | Long line | 170.4 | 591.7 | 20.1 | 50.2 | 5,824 | — |
+| Ubuntu | Ordinary | 26.0 | 390.8 | 17.8 | 22.0 | 19,368 | 25 |
+| Ubuntu | Dense | 27.9 | 150.7 | 17.9 | 22.1 | 19,296 | 28 |
+| Ubuntu | Long line | 31.5 | 209.6 | 17.9 | 20.8 | 19,300 | 28 |
+
+The 1 s first-text and 50 ms input targets were met in these runs. The source
+uses one outstanding 64 KiB read credit and published stream roots use one
+physical extent over the paged LF index. The expected logical spool size was
+the captured payload and the index required about 128 KiB at 1 GiB. Physical
+spool allocation and managed-cache high water were not sampled separately.
+The cgroup reported 256 MiB peak use with zero swap in all three Ubuntu runs,
+including charged filesystem cache.

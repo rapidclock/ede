@@ -26,6 +26,7 @@ pub(crate) struct TabSummary {
 /// The active or a parked document's editor state. Only the active tab has a layout.
 #[derive(Default)]
 pub(super) struct TabState {
+    pub(super) live: Option<super::streams::LiveTab>,
     pub(super) syntax_attempt: u64,
     pub(super) syntax_failure: Option<syntax_state::Failure>,
     pub(super) syntax_effective: Option<&'static syntax::Language>,
@@ -253,7 +254,7 @@ impl Coordinator {
                 attention: state.attention
                     || state.uncertain.is_some()
                     || state.watch.warning.is_some(),
-                scratch: state.screen.path.is_none(),
+                scratch: state.screen.path.is_none() && state.live.is_none(),
                 retention: if self
                     .retention
                     .as_ref()
@@ -350,6 +351,16 @@ impl Coordinator {
             .reserve_interaction(4096 + path.as_os_str().len().saturating_mul(8))
     }
 
+    pub(super) fn label_tab(&mut self, id: TabId, label: Arc<str>) {
+        if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == id) {
+            tab.label = label;
+        }
+    }
+
+    pub(super) fn startup_tab(&self, id: TabId) -> bool {
+        self.tabs.iter().any(|tab| tab.id == id && tab.startup)
+    }
+
     /// Create an unnamed tab without joining the named-file preparation queue.
     pub(super) fn add_new(&mut self) -> Result<(), Error> {
         self.startup_fallback = false;
@@ -384,6 +395,7 @@ impl Coordinator {
                 self.state(tab.id)
                     .and_then(|s| s.screen.path.as_deref())
                     .is_some_and(|p| same_path(p, &path))
+                    && self.state(tab.id).is_some_and(|state| state.live.is_none())
             })
             .map(|tab| tab.id);
         let id = match existing {
@@ -497,7 +509,9 @@ impl Coordinator {
 
     pub(super) fn cancel_open(&mut self, id: TabId) -> Result<(), Error> {
         if self.state(id).is_some_and(|state| {
-            state.screen.loading || state.info.as_ref().is_some_and(|info| info.revision.0 == 0)
+            state.live.is_none()
+                && (state.screen.loading
+                    || state.info.as_ref().is_some_and(|info| info.revision.0 == 0))
         }) && self
             .saving
             .as_ref()
@@ -550,7 +564,7 @@ impl Coordinator {
             }
         } else if let Some((tab, path, restore)) = self.tabs.iter().find_map(|t| {
             let state = t.state.as_ref().unwrap_or(&self.tab);
-            if state.screen.loading {
+            if state.screen.loading && state.live.is_none() {
                 if let Some(scratch) = &state.scratch
                     && let Some((entry, path)) = &scratch.restore
                 {
@@ -746,6 +760,9 @@ impl Coordinator {
         let Some(state) = self.state(id) else {
             return Ok(());
         };
+        if state.capability == crate::search::Capability::ReadOnly {
+            return Err(Error::ReadOnly);
+        }
         if state.screen.loading {
             return Err(Error::Busy);
         }
@@ -808,6 +825,9 @@ impl Coordinator {
         let Some(state) = self.state(id) else {
             return Ok(());
         };
+        if state.capability == crate::search::Capability::ReadOnly {
+            return Err(Error::ReadOnly);
+        }
         if path.is_none()
             && state.screen.path.is_none()
             && !self.running_save_as(id)
@@ -988,6 +1008,36 @@ impl Coordinator {
     /// Start quit as an ordered list of decisions. The UI commits only after all resolve.
     pub(super) fn guard(&mut self, after: After) -> Result<(), Error> {
         self.waiting_guard = None;
+        self.stream_guard = None;
+        let streams: Vec<_> = self
+            .tabs
+            .iter()
+            .filter(|tab| {
+                (after == After::Quit || after.target() == Some(tab.id))
+                    && self
+                        .state(tab.id)
+                        .and_then(|state| state.screen.stream.as_ref())
+                        .is_some_and(|status| !status.stopped || status.retained > 0)
+            })
+            .collect();
+        if !streams.is_empty() && !matches!(after, After::QuitTab(_)) {
+            self.stream_guard = Some(after);
+            let source = if streams.len() == 1 {
+                streams[0].label.to_string()
+            } else {
+                format!("{} streams", streams.len())
+            };
+            self.event(Event::StreamGuard(
+                self.active_sequence,
+                after,
+                format!("{source}\nStop capture and discard retained stream history?"),
+            ));
+            return Ok(());
+        }
+        self.guard_regular(after)
+    }
+
+    fn guard_regular(&mut self, after: After) -> Result<(), Error> {
         if after == After::Quit && self.tabs.len() > 1 {
             self.event(Event::QuitTabs(
                 self.active_sequence,
@@ -1005,6 +1055,10 @@ impl Coordinator {
         if let Some(id) = id
             && let Some(state) = self.state(id)
         {
+            if state.live.is_some() {
+                self.event(Event::Guard(sequence, after, false));
+                return Ok(());
+            }
             if let Some(document) = state.screen.document {
                 self.refresh_tab(id, document)?;
             }
@@ -1041,6 +1095,21 @@ impl Coordinator {
     }
 
     pub(super) fn discard(&mut self, after: After, acknowledged: Option<JobId>) {
+        if self.stream_guard == Some(after) {
+            self.stream_guard = None;
+            let result = match after {
+                After::Quit => self.guard_regular(after),
+                After::Close(tab) if self.state(tab).is_some_and(|state| state.live.is_some()) => {
+                    self.remove_tab(tab)
+                        .map(|()| self.event(Event::Proceed(self.active_sequence, after)))
+                }
+                _ => self.check_guard(after, self.active_sequence),
+            };
+            if let Err(error) = result {
+                self.event(Event::Failure(error.to_string()));
+            }
+            return;
+        }
         let Some(id) = after.target().or(self.tab.screen.tab) else {
             self.event(Event::Proceed(self.active_sequence, after));
             return;

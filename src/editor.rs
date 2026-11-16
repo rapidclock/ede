@@ -30,6 +30,8 @@ mod refresh;
 use refresh::{Monitor, Watch};
 pub(crate) mod search;
 mod session;
+mod streams;
+pub(crate) use streams::StreamStatus;
 #[path = "editor/syntax.rs"]
 mod syntax_state;
 pub(crate) use recovery::RecoveryPage;
@@ -44,6 +46,7 @@ pub(crate) use session::{TabId, TabSummary};
 struct InputEpoch {
     value: Arc<AtomicU64>,
     pending: AtomicUsize,
+    read_only: AtomicBool,
 }
 /// Shared tab admission state is small and never holds a lock during filesystem I/O.
 #[derive(Default)]
@@ -58,8 +61,23 @@ struct ViewControl {
     search: Mutex<Cancellation>,
     search_navigation: AtomicU64,
     search_replacing: AtomicBool,
+    streamed: AtomicBool,
+    export: Mutex<Option<Cancellation>>,
 }
 impl ViewControl {
+    /// Bind a queued replacement to the current tab and the capabilities visible at dispatch.
+    fn replacement_scope(&self) -> search::ReplacementScope {
+        let current = *self.current.lock().unwrap_or_else(|e| e.into_inner());
+        let targets = self.targets.lock().unwrap_or_else(|e| e.into_inner());
+        search::ReplacementScope {
+            current,
+            tabs: targets
+                .iter()
+                .map(|(tab, epoch)| (*tab, epoch.read_only.load(Ordering::Acquire)))
+                .collect(),
+        }
+    }
+
     fn admit(&self, action: &Action) -> Vec<Arc<InputEpoch>> {
         let current = *self
             .current
@@ -165,6 +183,10 @@ pub(crate) enum Action {
     Paste(Arc<Spool>),
     FieldPaste(Arc<Spool>, u64),
     Open(PathBuf),
+    Follow(PathBuf),
+    ToggleFollow(TabId),
+    RetryFinish(TabId),
+    ExportRetained(TabId, PathBuf),
     New,
     Switch(TabId),
     CycleTab(bool),
@@ -245,6 +267,8 @@ fn scrolls_combine(v: i64, h: i64, next_v: i64, next_h: i64) -> bool {
 /// UI-facing asynchronous control event, kept separate from the replaceable screen slot.
 #[derive(Clone, Debug)]
 pub(crate) enum Event {
+    Exported(String),
+    StreamGuard(u64, After, String),
     Guard(u64, After, bool),
     QuitTabs(u64, Vec<TabId>),
     Proceed(u64, After),
@@ -271,6 +295,8 @@ pub(crate) enum SaveResult {
 /// Most recent document state plus prepared immutable viewport.
 #[derive(Clone)]
 pub(crate) struct Screen {
+    pub stream: Option<StreamStatus>,
+    pub exporting: bool,
     pub syntax_language: syntax::Choice,
     pub syntax_config: Arc<syntax::Config>,
     pub syntax_status: syntax::Status,
@@ -299,6 +325,8 @@ impl Default for Screen {
     /// Pending startup is visibly distinct from a ready empty buffer.
     fn default() -> Self {
         Self {
+            stream: None,
+            exporting: false,
             syntax_language: syntax::Choice::Auto,
             syntax_config: Arc::default(),
             syntax_status: syntax::Status::Plain,
@@ -343,6 +371,7 @@ struct CommittedEdit {
 /// Charged message; dropping after handling releases the aggregate queue byte reservation.
 struct Envelope {
     action: Action,
+    reject_read_only: bool,
     sequence: u64,
     charge: usize,
     paste: bool,
@@ -404,7 +433,7 @@ impl Editor {
     /// Start storage and coordinator workers with an optional initial path.
     pub fn new(
         launch_directory: PathBuf,
-        paths: Vec<PathBuf>,
+        startup: crate::stream::Startup,
         recovery: crate::recovery::Store,
         syntax_program: Option<PathBuf>,
     ) -> std::io::Result<Self> {
@@ -435,7 +464,7 @@ impl Editor {
                         view_cancellation,
                     )
                     .with_retention(recovery)
-                    .run(launch_directory, paths),
+                    .run(launch_directory, startup),
                     Err(error) => {
                         if let Ok(mut slot) = output.lock() {
                             *slot = Some(Screen {
@@ -554,16 +583,29 @@ impl Editor {
         } else {
             self.view_cancel.navigation.load(Ordering::Acquire)
         };
+        let reject_read_only =
+            matches!(inner, Action::Save(_) | Action::SaveGuard(..)) || search::mutates(inner);
         let epochs = self.view_cancel.admit(&action);
+        let reject_read_only = reject_read_only
+            && epochs
+                .iter()
+                .any(|epoch| epoch.read_only.load(Ordering::Acquire));
         let dispatched = match &mut action {
             Action::ForTab(_, inner) => &mut **inner,
             action => action,
         };
         if let Action::Search(request) = dispatched {
             request.navigation = Some(self.view_cancel.search_navigation.load(Ordering::Acquire));
+            if matches!(
+                request.operation,
+                search::Operation::ReplaceNext | search::Operation::ReplaceAll
+            ) {
+                request.replacement_scope = Some(self.view_cancel.replacement_scope());
+            }
         }
         let envelope = Envelope {
             action,
+            reject_read_only,
             sequence,
             charge,
             paste,
@@ -606,6 +648,11 @@ impl Editor {
         if let Ok(cancel) = self.view_cancel.search.lock() {
             cancel.cancel();
         }
+        if let Ok(export) = self.view_cancel.export.lock()
+            && let Some(cancel) = &*export
+        {
+            cancel.cancel();
+        }
         self.used.cancellation.fetch_add(1, Ordering::AcqRel);
         self.cancel_paste();
         if let Ok(cancel) = self.activity.lock() {
@@ -614,6 +661,10 @@ impl Editor {
         if let Ok(cancel) = self.view_cancel.lock() {
             cancel.cancel();
         }
+    }
+    /// Sessions with independent source I/O may abandon blocked teardown after tty cleanup.
+    pub(crate) fn streamed(&self) -> bool {
+        self.view_cancel.streamed.load(Ordering::Acquire)
     }
     /// Cancel an admitted paste without affecting unrelated queued work.
     pub fn cancel_paste(&self) {
@@ -691,6 +742,10 @@ struct Coordinator {
     active_sequence: u64,
     layout_epoch: u64,
     navigation_epoch: u64,
+    reader_slots: Arc<AtomicUsize>,
+    stream_guard: Option<After>,
+    quit_ready: bool,
+    export: Option<streams::Export>,
 }
 impl Coordinator {
     /// Initialize empty interaction metadata; storage owns document contents.
@@ -742,11 +797,21 @@ impl Coordinator {
             active_sequence: 0,
             layout_epoch: 0,
             navigation_epoch: 0,
+            reader_slots: Arc::default(),
+            stream_guard: None,
+            quit_ready: false,
+            export: None,
         }
     }
     /// Process lifecycle commands and asynchronous results in admission order.
-    fn run(mut self, launch_directory: PathBuf, paths: Vec<PathBuf>) {
-        self.start(launch_directory, paths);
+    fn run(mut self, launch_directory: PathBuf, startup: crate::stream::Startup) {
+        self.launch_directory = launch_directory.clone();
+        if let Some(source) = startup.source
+            && let Err(error) = self.add_stream(source, false)
+        {
+            self.event(Event::OpenFailed(error.to_string()));
+        }
+        self.start(launch_directory, startup.paths);
         self.syntax.reload();
         self.publish();
         let mut pending = None;
@@ -811,7 +876,11 @@ impl Coordinator {
                     // Move the admitted payload; cloning would retain an extra
                     // uncharged String while the active envelope still owns it.
                     let action = std::mem::replace(&mut envelope.action, Action::ClearSelection);
-                    let result = self.action(action);
+                    let result = if envelope.reject_read_only {
+                        Err(Error::ReadOnly)
+                    } else {
+                        self.action(action)
+                    };
                     let closed = matches!(result, Err(Error::Closed));
                     self.acknowledged = envelope.sequence;
                     if let Err(error) = result {
@@ -820,7 +889,7 @@ impl Coordinator {
                         } else {
                             error.to_string()
                         };
-                        if !matches!(error, Error::Cancelled) {
+                        if !matches!(error, Error::Cancelled | Error::ReadOnly) {
                             self.event(Event::Failure(self.tab.screen.message.clone()));
                         }
                     }
@@ -834,6 +903,7 @@ impl Coordinator {
                 Err(_) => break,
             }
         }
+        self.stop_streams();
         let shutdown = self.service.shutdown();
         self.syntax.shutdown(&self.view_cancel.syntax);
         self.search.shutdown();
@@ -875,6 +945,7 @@ impl Coordinator {
     fn publish(&mut self) {
         self.syntax.screen(&mut self.tab.screen);
         self.tab.screen.can_replace = self.tab.capability == crate::search::Capability::Editable;
+        self.tab.screen.exporting = self.export.is_some();
         self.tab.screen.search = Arc::new(self.search.status.clone());
         self.summarize();
         if let Ok(mut slot) = self.output.lock() {
@@ -976,6 +1047,14 @@ impl Coordinator {
     }
 
     fn snapshot(&mut self) -> Result<Snapshot, Error> {
+        if let Some(snapshot) = self
+            .tab
+            .live
+            .as_ref()
+            .and_then(|live| live.snapshot.as_ref())
+        {
+            return snapshot.duplicate_live();
+        }
         self.snapshot_of(self.document()?)
     }
     /// Render a fresh revision/geometry-tagged view; no snapshot is retained afterward.
@@ -996,6 +1075,16 @@ impl Coordinator {
             *active = cancel.clone();
         }
         let snapshot = self.snapshot()?;
+        let following = self
+            .tab
+            .screen
+            .stream
+            .as_ref()
+            .is_some_and(|status| status.following);
+        if following {
+            self.tab.top = snapshot.line_count().saturating_sub(u64::from(self.height));
+            self.tab.left = 0;
+        }
         let result = Text::new(&snapshot, &cancel).view(
             ViewRequest {
                 position: self.tab.screen.position,
@@ -1003,7 +1092,7 @@ impl Coordinator {
                 left: self.tab.left,
                 width: self.width,
                 height: self.height,
-                reveal,
+                reveal: reveal || following,
                 generation: self.generation,
             },
             &mut self.cache,
@@ -1026,6 +1115,8 @@ impl Coordinator {
         let result = (|| {
             let changed = self.settle_completions()?
                 | self.receive()?
+                | self.poll_streams()?
+                | self.poll_export()?
                 | self.poll_opens()?
                 | self.poll_retention()?
                 | self.poll_refreshes()?
@@ -1246,6 +1337,9 @@ impl Coordinator {
             )?,
         };
         self.tab.screen.position.move_to(caret, extend);
+        if self.tab.screen.position != position || movement == Movement::Finish {
+            self.tab.pause_follow();
+        }
         self.tab.preferred = vertical.then_some(preferred);
         if movement == Movement::PageUp {
             self.tab.top = self.tab.top.saturating_sub(page);
@@ -1262,6 +1356,18 @@ impl Coordinator {
     }
     /// Handle one ordered user intention, leaving state intact on a failed edit.
     fn action(&mut self, action: Action) -> Result<(), Error> {
+        if let Some(export) = &mut self.export {
+            match &action {
+                Action::Guard(after) | Action::Discard(after, _)
+                    if after.target().is_none_or(|tab| tab == export.tab) =>
+                {
+                    export.defer(action, self.active_sequence);
+                    return Ok(());
+                }
+                Action::CancelGuard => export.cancel_deferred(),
+                _ => {}
+            }
+        }
         if self.tab.capability == crate::search::Capability::ReadOnly && search::mutates(&action) {
             return Err(Error::ReadOnly);
         }
@@ -1270,6 +1376,7 @@ impl Coordinator {
         }
         if search::clears_anchor(&action) {
             self.search.status.current = None;
+            self.search.clear_stream_anchor();
         }
         if matches!(
             action,
@@ -1394,12 +1501,35 @@ impl Coordinator {
                     self.active_open_admission = Some((tab, self.active_sequence));
                 }
             }
+            Action::Follow(path) => self.add_stream(crate::stream::Source::Follow(path), true)?,
+            Action::RetryFinish(tab) => self.retry_stream_finish(tab)?,
+            Action::ExportRetained(tab, path) => self.export_retained(tab, path)?,
+            Action::ToggleFollow(tab) => {
+                if let Some(state) = self.state_mut(tab)
+                    && let Some(status) = &mut state.screen.stream
+                {
+                    status.following = !status.following;
+                    if status.following {
+                        status.unseen = false;
+                        state
+                            .screen
+                            .position
+                            .move_to(state.info.as_ref().map_or(0, |info| info.len), false);
+                    }
+                    state.describe_stream();
+                    if self.tab.screen.tab == Some(tab) && self.tab.screen.document.is_some() {
+                        self.layout(false)?;
+                    }
+                }
+            }
             Action::Switch(tab) => self.switch_tab(tab)?,
             Action::CycleTab(backwards) => self.cycle_tab(backwards)?,
             Action::RemoveTab(tab) => self.remove_tab(tab)?,
             Action::CancelOpen(tab) => self.cancel_open(tab)?,
             Action::CancelActiveOpen(switch) => self.cancel_active_open(switch)?,
             Action::CancelGuard => {
+                self.quit_ready = false;
+                self.stream_guard = None;
                 self.waiting_guard = None;
                 self.cancel_retained_close()?;
             }
@@ -1408,6 +1538,7 @@ impl Coordinator {
                     self.cancel_retained_close()?;
                     self.begin_retained_quit(self.active_sequence);
                 } else {
+                    self.quit_ready = true;
                     self.event(Event::QuitReady(self.active_sequence));
                 }
             }
@@ -1466,6 +1597,9 @@ impl Coordinator {
                 } else {
                     0
                 };
+                if top < self.tab.top || left < self.tab.left {
+                    self.tab.pause_follow();
+                }
                 self.tab.top = top;
                 self.tab.left = left;
                 self.layout(false)?;
@@ -1483,6 +1617,9 @@ impl Coordinator {
                 }
                 let caret =
                     Text::new(&snapshot, &cancel).at_column(line, column, &mut self.cache)?;
+                if caret != self.tab.screen.position.caret {
+                    self.tab.pause_follow();
+                }
                 self.tab.screen.position.move_to(caret, false);
                 self.tab.preferred = None;
                 self.layout(true)?;
@@ -1520,6 +1657,7 @@ impl Coordinator {
                     if let PointerGesture::Press(id) = gesture {
                         self.tab.screen.pointer_press = Some(id);
                     }
+                    self.tab.pause_follow();
                     self.tab.screen.position.move_to(caret, extend);
                     self.tab.preferred = None;
                     self.layout(false)?;
@@ -1531,6 +1669,7 @@ impl Coordinator {
                 Command::Move(movement, extend) => self.movement(movement, extend)?,
                 Command::SelectAll => {
                     let snapshot = self.snapshot()?;
+                    self.tab.pause_follow();
                     self.tab.screen.position = Position {
                         anchor: 0,
                         caret: snapshot.len(),
@@ -2951,7 +3090,7 @@ mod search_tests {
             worker: None,
         };
         editor.worker = Some(thread::spawn(move || {
-            worker.run(PathBuf::new(), Vec::new())
+            worker.run(PathBuf::new(), crate::stream::Startup::default())
         }));
         let deadline = Instant::now() + Duration::from_secs(5);
         while editor.screen().is_none_or(|screen| screen.loading) {
@@ -3018,6 +3157,7 @@ mod search_tests {
 
     fn request(operation: search::Operation) -> search::SearchRequest {
         search::SearchRequest {
+            replacement_scope: None,
             navigation: None,
             query: Query {
                 literal: "one".into(),
@@ -3107,7 +3247,7 @@ mod search_tests {
             worker: None,
         };
         editor.worker = Some(thread::spawn(move || {
-            worker.run(PathBuf::new(), Vec::new())
+            worker.run(PathBuf::new(), crate::stream::Startup::default())
         }));
         let deadline = Instant::now() + Duration::from_secs(5);
         while editor.screen().is_none_or(|s| s.loading) {
@@ -3440,9 +3580,13 @@ mod search_tests {
             .unwrap();
         settle(&mut worker);
         assert_eq!(worker.search.status.total(), 1);
-        worker
-            .action(Action::Search(request(search::Operation::ReplaceAll)))
-            .unwrap();
+        assert!(matches!(
+            worker.action(Action::Search(request(search::Operation::ReplaceAll))),
+            Err(Error::ReadOnly)
+        ));
+        let mut replace = request(search::Operation::ReplaceAll);
+        replace.all = true;
+        worker.action(Action::Search(replace)).unwrap();
         settle(&mut worker);
         assert_eq!(super::tests::contents(&mut worker), "one");
         assert!(
@@ -3630,6 +3774,7 @@ mod search_tests {
             .action(Action::Command(Command::Move(Movement::Start, false)))
             .unwrap();
         let request = search::SearchRequest {
+            replacement_scope: None,
             navigation: None,
             query: Query {
                 literal: "one".into(),
