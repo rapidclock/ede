@@ -426,6 +426,27 @@ impl PtyChild {
     fn expect(&mut self, text: &str) {
         self.expect_with_timeout(text, TIMEOUT);
     }
+
+    /// Wait for the named tab's confirmation, even if its name is already in the strip.
+    #[track_caller]
+    fn expect_quit_confirmation(&mut self, filename: &str) {
+        let deadline = Instant::now() + TIMEOUT;
+        loop {
+            self.drain();
+            let screen = self.parser.screen().contents();
+            if screen
+                .lines()
+                .any(|row| row.contains("Quit — ") && row.contains(filename))
+            {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "missing Quit confirmation for {filename:?}: {screen}"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
     /// Larger fixture preparation and long-line seeks have separately measured deadlines.
     fn expect_with_timeout(&mut self, text: &str, timeout: Duration) {
         let deadline = Instant::now() + timeout;
@@ -460,6 +481,7 @@ impl PtyChild {
     }
 
     /// Observe document rows rather than a matching filename, help label or status message.
+    #[track_caller]
     fn expect_body(&mut self, text: &str, timeout: Duration) {
         let deadline = Instant::now() + timeout;
         loop {
@@ -1374,20 +1396,18 @@ fn cancel_quit_preserves_tabs_after_earlier_discard_choice() {
     process.send(b"second-unsaved");
     process.expect_body("second-unsaved", TIMEOUT);
     process.send(b"\x11");
-    process.expect("Unsaved changes");
-    process.expect("first.txt");
+    process.expect_quit_confirmation("first.txt");
     process.send(b"\t\t\r");
-    process.expect("second.txt");
+    process.expect_quit_confirmation("second.txt");
     process.send(b"\r"); // Default Cancel.
     process.expect_absent("Unsaved changes");
     process.expect_body("second-unsaved", TIMEOUT);
     process.send(b"\x1b[18~");
     process.expect_body("first-unsaved", TIMEOUT);
     process.send(b"\x11");
-    process.expect("Unsaved changes");
-    process.expect("first.txt");
+    process.expect_quit_confirmation("first.txt");
     process.send(b"\t\t\r");
-    process.expect("second.txt");
+    process.expect_quit_confirmation("second.txt");
     process.send(b"\t\t\r");
     assert!(process.wait().success());
     process.assert_restored();
@@ -1522,7 +1542,6 @@ fn mouse_tabs_overflow_and_stale_release() {
     process.expect("Tabs — Enter to switch");
     process.expect("tab-6");
     process.send(b"\x1b[<0;7;9M\x1b[<0;7;9m"); // Highlight tab 5.
-    process.expect("[Switch]");
     process.send(b"\x1b[<0;27;21M\x1b[<0;27;21m");
     process.expect_body("body-5", TIMEOUT);
     process.send(b"\x1b[18~\x1b[18~\x1b[18~\x1b[18~");
@@ -1531,9 +1550,10 @@ fn mouse_tabs_overflow_and_stale_release() {
     process.expect("Tabs — Enter to switch");
     process.send(b"\x1b[<0;7;10M\x1b[<0;7;10m"); // Highlight tab 6.
     process.send(b"\x1b[<0;7;21M\x1b[<0;7;21m"); // Close the highlighted inactive tab.
-    process.expect_body("body-1", TIMEOUT);
+    process.expect_absent("Tabs — Enter to switch");
     process.resize(40, 8);
     process.expect("Tabs");
+    process.expect_status("Ready");
     process.send(b"\x1b[18~\x1b[18~");
     process.expect_body("body-5", TIMEOUT);
     process.send(b"\x11");

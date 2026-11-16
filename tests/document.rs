@@ -1680,11 +1680,27 @@ fn retained_closed_snapshots_keep_aggregate_metadata_reservations() {
     assert!(exhausted);
     assert!(!held.is_empty());
     drop(held);
-    let job = service.submit(1000, Request::New).unwrap();
-    let completion = receive(&mut service);
-    assert!(matches!(completion.result, Ok(Response::Ready { .. })));
-    drop(completion);
-    drop(job);
+    // Dropping the last leases schedules reclamation. Capacity is returned by
+    // the reclaimer after it disposes of the retired generations.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let result = match service.submit(1000, Request::New) {
+            Ok(_job) => receive(&mut service).result,
+            Err(error) => Err(error.error),
+        };
+        match result {
+            Ok(Response::Ready { .. }) => break,
+            Err(Error::ResourceLimit(_)) => {
+                assert!(
+                    Instant::now() < deadline,
+                    "reclamation did not release metadata reservations"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Err(error) => panic!("unexpected error after releasing snapshots: {error}"),
+            Ok(_) => panic!("unexpected response to New"),
+        }
+    }
     service.shutdown().wait().unwrap();
 }
 

@@ -340,12 +340,11 @@ impl AppState {
             self.switching = None;
         }
         if self.screen.tab != screen.tab
-            || self.screen.document != screen.document
-            || (!pending
-                && self.capture.is_some_and(|capture| {
-                    capture.control == Control::Content
-                        && screen.pointer_press != Some(capture.press)
-                }))
+            || self.capture.is_some_and(|capture| {
+                capture.control == Control::Content
+                    && (self.screen.document != screen.document
+                        || (!pending && screen.pointer_press != Some(capture.press)))
+            })
         {
             self.capture = None;
         }
@@ -1892,6 +1891,40 @@ mod tests {
             Some(Modal::Confirm(After::Quit, Some(JobId(2))))
         ));
     }
+
+    /// A tab list click survives the active document finishing its background open.
+    #[test]
+    fn tab_list_click_survives_active_document_installation() {
+        let mut app = AppState::new();
+        app.screen.tab = Some(TabId(1));
+        let selected = TabId(5);
+        app.modal = Some(Modal::Tabs(Some(selected)));
+        let area = Rect::new(0, 0, 80, 24);
+        let layout = LayoutSnapshot::for_app(area, &app, 1);
+        let (column, row) = (0..24)
+            .flat_map(|row| (0..80).map(move |column| (column, row)))
+            .find(|(column, row)| layout.hit(*column, *row) == Some(Control::TabListSwitch))
+            .unwrap();
+        let mouse = |kind| {
+            Input::Pointer(MouseEvent {
+                kind,
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+        app.input(mouse(MouseEventKind::Down(MouseButton::Left)), &layout);
+        let mut loaded = app.screen.clone();
+        loaded.document = Some(crate::document::DocumentId(1));
+        loaded.loading = false;
+        app.update(loaded, false);
+        assert_eq!(layout.signature, LayoutSnapshot::signature(&app));
+        app.sync_layout(&layout);
+        assert!(matches!(
+            app.input(mouse(MouseEventKind::Up(MouseButton::Left)), &layout),
+            Some(Intent::Editor(Action::Switch(tab))) if tab == selected
+        ));
+    }
     /// Ingress rejection remains visible if an earlier paste finishes before the next frame.
     #[test]
     fn paste_rejection_survives_a_worker_update() {
@@ -2021,7 +2054,9 @@ mod tests {
                 .is_none()
         );
         assert!(app.capture.is_none());
+        app.mouse_capture = true;
         app.input(pointer(MouseEventKind::Down(MouseButton::Left)), &layout);
+        assert!(app.capture.is_some());
         app.input(Input::Resize(40, 8), &layout);
         assert!(
             app.input(pointer(MouseEventKind::Up(MouseButton::Left)), &layout)

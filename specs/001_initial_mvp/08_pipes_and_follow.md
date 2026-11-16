@@ -437,3 +437,24 @@ the captured payload and the index required about 128 KiB at 1 GiB. Physical
 spool allocation and managed-cache high water were not sampled separately.
 The cgroup reported 256 MiB peak use with zero swap in all three Ubuntu runs,
 including charged filesystem cache.
+
+### Follow-up on asynchronous test ordering
+
+- P02–P04 — A local PTY failure and a controlled reducer test exposed a
+  dropped tab-list click when the active tab's document finished loading
+  between mouse press and release. The reducer regression failed before
+  the fix and passed afterward. A resize test now verifies it has actually
+  captured the press before checking rejection of the stale release.
+- P03/P07 — The first hosted macOS run failed in the two-tab Quit cancellation
+  test. A tab's filename could satisfy the wait before its confirmation
+  appeared. The PTY test now waits for the matching Quit dialog row before
+  submitting either decision.
+- P05 — One Ubuntu run exhausted the test service's metadata quota and
+  attempted to allocate again before the asynchronous reclaimer returned
+  capacity. The test still requires exhaustion with live leases and now
+  waits for successful admission after releasing them.
+- Independent review found no production blockers. Formatting, Clippy with
+  warnings denied, the locked workspace suite, and the isolated tmux smoke
+  passed again on macOS and Ubuntu 26.10. The full macOS PTY suite passed three
+  additional runs. Each affected PTY passed 150 consecutive runs on macOS
+  and 100 on Ubuntu through tmux pane `%0`.
