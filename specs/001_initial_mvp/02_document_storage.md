@@ -560,11 +560,14 @@ parent-directory synchronization.
   storage or text growth beyond the live-state/history allowance plus 1 MiB;
   callers release leases and retry when required.
 - macOS extended attributes up to a 64 KiB names/value/accounting envelope use
-  native descriptor copying followed by exact verification. ACLs and file flags
-  remain SaveAsRequired; Linux extended attributes, including ACLs, also require
-  Save As. New files use mode 0600. Save staging lives in a same-filesystem 0700
-  directory, keeping final mode bits private until publication. Darwin inherited
-  directory ACLs that defeat privacy are rejected before private bytes are created.
+  native descriptor copying followed by exact verification of all source
+  attributes. If the source has no `com.apple.provenance`, the staged file may
+  retain that attribute with the value it had before the copy. ACLs and file
+  flags remain SaveAsRequired. Linux extended attributes, including ACLs, also
+  require Save As. New files use mode 0600. Save staging lives in a 0700
+  directory on the same filesystem, keeping final mode bits private until
+  publication. Darwin inherited directory ACLs that defeat privacy are rejected
+  before private bytes are created.
 - Non-UTF-8 filenames are exercised on Linux. APFS rejects their creation; path
   handling throughout the core still uses OS strings rather than UTF-8 conversion.
 - A 32 KiB store-metadata reservation lasts until the last snapshot releases its

@@ -1614,29 +1614,46 @@ fn open_edit_save_and_dirty_quit_round_trip() {
     let path = directory.path().join("file with spaces.txt");
     std::fs::write(&path, b"start\r\nsecond").unwrap();
     let mut process = PtyChild::editor_with_path(Some("xterm-256color"), Some(&path));
-    process.expect("Ready");
-    process.expect("start");
+    process.expect_status("Ready");
+    process.expect_body("start", TIMEOUT);
     process.send("\x1b[F界e\u{301}".as_bytes());
     process.expect("start界e\u{301}");
     process.send(b"\x13");
-    let deadline = Instant::now() + TIMEOUT;
-    while std::fs::read(&path).unwrap() != "start界e\u{301}\r\nsecond".as_bytes() {
-        process.drain();
-        assert!(Instant::now() < deadline);
-        thread::sleep(Duration::from_millis(5));
-    }
     process.expect_status("Saved");
-    process.send(b"!\x11");
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        "start界e\u{301}\r\nsecond".as_bytes()
+    );
+    process.send(b"\x11");
+    assert!(process.wait().success());
+    process.assert_restored();
+
+    // Reopening exercises the metadata left by the first save as a source baseline.
+    let mut process = PtyChild::editor_with_path(Some("xterm-256color"), Some(&path));
+    process.expect_status("Ready");
+    process.expect_body("start界e\u{301}", TIMEOUT);
+    process.send(b"+");
+    process.expect_body("+start界e\u{301}", TIMEOUT);
+    process.send(b"\x13");
+    process.expect_status("Saved");
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        "+start界e\u{301}\r\nsecond".as_bytes()
+    );
+    process.send(b"!");
+    process.expect_body("+!start界e\u{301}", TIMEOUT);
+    process.send(b"\x11");
     process.expect("Unsaved changes");
     process.send(b"\r");
-    thread::sleep(Duration::from_millis(30));
-    assert!(process.child.try_wait().unwrap().is_none());
-    process.send(b"\x1a\x11");
+    process.expect_absent("Unsaved changes");
+    process.send(b"\x1a");
+    process.expect_body("+start界e\u{301}", TIMEOUT);
+    process.send(b"\x11");
     assert!(process.wait().success());
     process.assert_restored();
     assert_eq!(
         std::fs::read(&path).unwrap(),
-        "start界e\u{301}\r\nsecond".as_bytes()
+        "+start界e\u{301}\r\nsecond".as_bytes()
     );
 }
 
@@ -2683,11 +2700,22 @@ fn sixty_four_highlighted_tabs_keep_foreground_budget() {
     let mut process =
         PtyChild::editor_with_options(Some("xterm-256color"), &paths, None, None, Some(256));
     for index in 0..64 {
-        process.expect(&format!("Heading {index:02}"));
-        let until = Instant::now() + TIMEOUT;
-        while process.parser.screen().cell(1, 2).unwrap().fgcolor() == vt100::Color::Default {
-            assert!(Instant::now() < until, "tab {index} stopped highlighting");
+        process.expect_body(&format!("# Heading {index:02}"), TIMEOUT);
+        let deadline = Instant::now() + TIMEOUT;
+        loop {
             process.drain();
+            if process.parser.screen().cell(1, 2).unwrap().fgcolor() == vt100::Color::Idx(13) {
+                break;
+            }
+            if Instant::now() >= deadline {
+                let screen = process.parser.screen().contents();
+                syntax_action(&mut process, 17);
+                process.expect("Highlighting:");
+                panic!(
+                    "tab {index} stopped highlighting: {screen}\n{}",
+                    process.parser.screen().contents()
+                );
+            }
             thread::sleep(Duration::from_millis(5));
         }
         if index < 63 {

@@ -458,3 +458,34 @@ including charged filesystem cache.
   passed again on macOS and Ubuntu 26.10. The full macOS PTY suite passed three
   additional runs. Each affected PTY passed 150 consecutive runs on macOS
   and 100 on Ubuntu through tmux pane `%0`.
+
+### Follow-up on macOS saves, scratch claims, and PTY checks
+
+- D09 — Eight local macOS PTY tests failed when a provenance-tagged editor
+  saved files without that attribute. A tagged build reproduced the failure in
+  tmux. macOS stamped the staged file before the copy. Save now accepts that
+  additional attribute only when it already had the same value before the copy
+  and the source lacks it. Every source attribute must still match. The PTY
+  regression saves, reopens, saves again, cancels Quit, and verifies Undo against
+  the saved text.
+- R04 — Full Ubuntu repetitions exposed a missed scratch claim after an owner
+  dropped its store. A duplicated owner descriptor made the same ordering fail
+  deterministically. The owner now explicitly unlocks on drop, and successful
+  liveness probes explicitly unlock before closing their descriptors. A claim
+  still freezes its original liveness classification. The following opener
+  must recover the scratch exactly once.
+- Independent review verified the save and recovery changes. Deliberate changes
+  that permit missing source metadata or remove the explicit owner unlock
+  failed the intended assertions in isolated copies.
+- H05 — One Ubuntu run failed while waiting for color on tab 13 of the 64-tab
+  test. The test now matches the heading in the document, checks its exact
+  color, and captures the reason from Tab details on failure. The original
+  cause remains unconfirmed. The Ubuntu test passed 25 isolated repetitions,
+  15 full PTY suite repetitions, and a one-CPU run with a competing process.
+- Final verification passed three consecutive plain `cargo test` runs on
+  macOS 27.2 (275 tests each) and five through tmux pane `%0` on Ubuntu 26.10
+  (277 tests each). Both passed formatting, Clippy with warnings denied, the
+  opt-in isolated tmux smoke, and 50 focused recovery repetitions. A macOS
+  executable with native provenance passed the complete PTY suite three times
+  and the save and reopen regression 25 times in tmux. The default suites
+  skipped their 10 opt-in tests on each platform.
