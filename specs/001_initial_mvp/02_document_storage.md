@@ -463,7 +463,7 @@ The [stage PR](https://github.com/rapidclock/ede/pull/2) targets `feat/initial_m
 
 ### Benchmark conditions and results
 
-The Rust harness is `examples/storage_bench.rs`, built in release mode. Every run
+The Rust harness is `benches/storage_bench.rs`, built with `cargo bench`. Every run
 writes a real, fully allocated text fixture with bounded buffers, then opens,
 reads, edits at beginning/middle/end, undoes/redoes, performs Save As and verifies
 all output bytes. The three-position edit maximum is separate from optional
@@ -641,3 +641,8 @@ No outstanding acceptance-blocking defect was identified in the reviewed paths.
 The documented concurrent-writer/filesystem limits and user-approved Stage 01
 manual compatibility deferrals remain; this review does not establish absence of
 all bugs or verify unavailable terminal/remote environments.
+
+After moving the harness to `benches/`, the macOS release smoke checks ran
+the 1 MiB dense forced-copy case through `cargo bench` and the 1 MiB ordinary
+forced-copy case through the executable reported by Cargo's JSON build output.
+Both completed with saved-byte verification.

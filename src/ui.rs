@@ -4,6 +4,7 @@ use crate::{
     app::{AppState, MENU, Modal, PathKind},
     command::{BINDINGS, Command},
     editor::{After, TabId, TabSummary},
+    syntax::{Choice, Foreground, Status as SyntaxStatus, ViewKey},
     text::safe,
 };
 use ratatui::{
@@ -49,6 +50,7 @@ pub(crate) enum Control {
     HelpSuspend,
     HelpClose,
     MenuItem(usize),
+    LanguageRow(usize),
     PathField,
     PathSubmit,
     PathCancel,
@@ -91,6 +93,7 @@ impl Control {
             | Self::PathField
             | Self::Tab(_)
             | Self::TabListRow(_)
+            | Self::LanguageRow(_)
             | Self::PickerList
             | Self::PickerRow(_)
             | Self::TabList => "",
@@ -202,9 +205,12 @@ impl LayoutSnapshot {
             Some(Modal::ReplaceAll(_)) => (11, 0),
             None => (0, 0),
             Some(Modal::Menu(index)) => (1, *index as u64),
+            Some(Modal::Language { row, .. }) => (12, *row as u64),
+            Some(Modal::SyntaxTheme { row, .. }) => (14, *row as u64),
             Some(Modal::Path(..)) => (2, 0),
             Some(Modal::Confirm(after, _)) => (3, after.target().map_or(0, |tab| tab.0)),
             Some(Modal::Details(_)) => (4, 0),
+            Some(Modal::TabDetails) => (13, u64::from(app.screen.path.is_some())),
             Some(Modal::SaveError(_)) => (5, 0),
             Some(Modal::PersistenceError(_)) => (10, 0),
             Some(Modal::Open(dialog)) => (6, dialog.highlight as u64),
@@ -292,6 +298,27 @@ impl LayoutSnapshot {
                         ),
                     );
                 }
+            }
+            Some(Modal::Language { row, .. } | Modal::SyntaxTheme { row, .. }) => {
+                let rows = overlay.height.saturating_sub(3);
+                result.list_rows = rows;
+                let start = list_start(*row, rows);
+                let count = match &app.modal {
+                    Some(Modal::SyntaxTheme { config, .. }) => config.themes().count(),
+                    _ => Choice::options().count(),
+                };
+                for index in start..(start + rows as usize).min(count) {
+                    result.add(
+                        Control::LanguageRow(index),
+                        Rect::new(
+                            overlay.x + 1,
+                            overlay.y + 1 + (index - start) as u16,
+                            overlay.width - 2,
+                            1,
+                        ),
+                    );
+                }
+                result.add(Control::PathCancel, Rect::new(overlay.x + 1, y, 10, 1));
             }
             Some(Modal::Path(..)) => {
                 result.add(
@@ -436,7 +463,7 @@ impl LayoutSnapshot {
                     Rect::new(overlay.x + 21, y, 13, 1),
                 );
             }
-            Some(Modal::Details(_)) => {
+            Some(Modal::Details(_) | Modal::TabDetails) => {
                 result.add(Control::DetailsClose, Rect::new(overlay.x + 2, y, 9, 1));
                 if app.screen.path.is_some() {
                     result.add(Control::RetryRefresh, Rect::new(overlay.x + 13, y, 17, 1));
@@ -601,6 +628,16 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &AppState, layout: &LayoutSnaps
         );
     } else if let Some(view) = &app.screen.view {
         let selection = app.screen.position.selection();
+        let syntax = app
+            .screen
+            .tab
+            .zip(app.screen.document)
+            .and_then(|(tab, document)| {
+                app.screen.syntax_projection.as_ref().filter(|projection| {
+                    projection.key == ViewKey::new(tab, document, view)
+                        && view.generation == layout.generation
+                })
+            });
         for (y, row) in view
             .rows
             .iter()
@@ -623,26 +660,32 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &AppState, layout: &LayoutSnaps
                         start,
                         Rect::new(x, area.y + 1 + y as u16, width, 1),
                     );
-                    continue;
+                } else {
+                    let selected =
+                        glyph.bytes.start < selection.end && glyph.bytes.end > selection.start;
+                    let clipped = glyph.column < view.left
+                        || glyph.column + glyph.width > view.left + area.width as u64;
+                    let text = if clipped {
+                        "·".repeat(width as usize)
+                    } else {
+                        glyph.text.clone()
+                    };
+                    frame.render_widget(
+                        Paragraph::new(text).style(selection_style(selected)),
+                        Rect::new(x, area.y + 1 + y as u16, width, 1),
+                    );
                 }
-                let selected =
-                    glyph.bytes.start < selection.end && glyph.bytes.end > selection.start;
-                let style = if selected {
-                    Style::default().bg(Color::Blue).fg(Color::White)
-                } else {
-                    Style::default()
-                };
-                let clipped = glyph.column < view.left
-                    || glyph.column + glyph.width > view.left + area.width as u64;
-                let text = if clipped {
-                    "·".repeat(width as usize)
-                } else {
-                    glyph.text.clone()
-                };
-                frame.render_widget(
-                    Paragraph::new(text).style(style),
-                    Rect::new(x, area.y + 1 + y as u16, width, 1),
-                );
+                if let Some(syntax) = syntax {
+                    paint_syntax(
+                        frame,
+                        glyph,
+                        &selection,
+                        &syntax.ranges,
+                        app.screen.syntax_palette,
+                        start,
+                        Rect::new(x, area.y + 1 + y as u16, width, 1),
+                    );
+                }
             }
         }
         // Paint search decorations from exact logical ranges over the prepared
@@ -732,8 +775,17 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &AppState, layout: &LayoutSnaps
         if app.guard_waiting() {
             return "Waiting for tab state or save | Escape cancels".into();
         }
+        let syntax = match (
+            matches!(app.screen.syntax_status, SyntaxStatus::Fallback(_)),
+            app.screen.syntax_notice.is_some(),
+        ) {
+            (true, true) => "Plain syntax | Config error | ",
+            (true, false) => "Plain syntax | ",
+            (false, true) => "Syntax config error | ",
+            (false, false) => "",
+        };
         format!(
-            "{}{} | {}{}{}",
+            "{syntax}{}{} | {}{}{}",
             severity,
             app.status.text(),
             coordinates,
@@ -778,6 +830,8 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &AppState, layout: &LayoutSnaps
         let title = match &app.modal {
             Some(Modal::ReplaceAll(_)) => " Replace all — confirm scope ",
             Some(Modal::Menu(_)) => " Actions (wheel/arrows) ",
+            Some(Modal::Language { .. }) => " Language — Enter to apply ",
+            Some(Modal::SyntaxTheme { .. }) => " Syntax Theme — Enter to apply ",
             Some(Modal::Open(_)) => " Open file ",
             Some(Modal::Tabs(_)) => " Tabs — Enter to switch ",
             Some(Modal::Recovery(_)) => " Recovery — retained scratches ",
@@ -786,7 +840,7 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &AppState, layout: &LayoutSnaps
             Some(Modal::Path(PathKind::GoTo, _)) => " Go to line[:cell] (from 1) ",
             Some(Modal::Confirm(_, Some(_))) => " Destination may have changed ",
             Some(Modal::Confirm(..)) => " Unsaved changes ",
-            Some(Modal::Details(_)) => " Details ",
+            Some(Modal::Details(_) | Modal::TabDetails) => " Details ",
             Some(Modal::SaveError(_)) => " Save failed — work retained ",
             Some(Modal::PersistenceError(_)) => " Scratch persistence failed ",
             None => " Help ",
@@ -811,9 +865,14 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &AppState, layout: &LayoutSnaps
                 request.query.match_case,
                 request.query.whole_word
             ),
-            Some(Modal::Menu(_) | Modal::Path(..) | Modal::Open(_) | Modal::Tabs(_)) => {
-                String::new()
-            }
+            Some(
+                Modal::Menu(_)
+                | Modal::Language { .. }
+                | Modal::SyntaxTheme { .. }
+                | Modal::Path(..)
+                | Modal::Open(_)
+                | Modal::Tabs(_),
+            ) => String::new(),
             Some(Modal::Recovery(dialog)) => {
                 if dialog.loading {
                     "Loading retained scratches…".into()
@@ -850,6 +909,7 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &AppState, layout: &LayoutSnaps
                 };
                 format!("{verb} — {label}\n{guidance}")
             }
+            Some(Modal::TabDetails) => app.tab_details(),
             Some(Modal::Details(text) | Modal::SaveError(text) | Modal::PersistenceError(text)) => {
                 safe(text)
             }
@@ -865,6 +925,8 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &AppState, layout: &LayoutSnaps
                     "Selection modifiers vary; tmux: copy mode.".into(),
                     "Tabs: > active, * modified, ! save attention".into(),
                     "Tabs: … waiting, ↓ loading, ⇡ queued save, ↑ saving".into(),
+                    "F2 → Language…: choose a language for this tab".into(),
+                    "F2 → Syntax Theme…, Reload Highlighting, Retry Highlighting".into(),
                 ];
                 lines.extend(BINDINGS.iter().map(|binding| {
                     format!("{:<15} {}", binding.shortcut, binding.command.label())
@@ -940,6 +1002,7 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &AppState, layout: &LayoutSnaps
                             app.modal,
                             Some(
                                 Modal::Details(_)
+                                    | Modal::TabDetails
                                     | Modal::ReplaceAll(_)
                                     | Modal::SaveError(_)
                                     | Modal::PersistenceError(_)
@@ -977,6 +1040,41 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &AppState, layout: &LayoutSnaps
                         format!("{} {}", if selected { ">" } else { " " }, row.label()),
                         selected,
                     )
+                })
+            }
+            (Control::LanguageRow(index), Some(Modal::Language { tab, selected, row })) => {
+                Choice::options().nth(index).map(|choice| {
+                    let active = app.screen.tab == Some(*tab);
+                    let name = if choice == Choice::Auto && active {
+                        let detected = Choice::Auto
+                            .name(app.screen.path.as_deref(), &app.screen.syntax_config);
+                        format!("Auto ({detected})")
+                    } else if choice == Choice::Auto {
+                        "Auto".to_owned()
+                    } else {
+                        choice.name(None, &app.screen.syntax_config).to_owned()
+                    };
+                    let selection = if active {
+                        app.screen.syntax_language
+                    } else {
+                        *selected
+                    };
+                    let current = if choice == selection {
+                        " (current)"
+                    } else {
+                        ""
+                    };
+                    (format!("{name}{current}"), index == *row)
+                })
+            }
+            (Control::LanguageRow(index), Some(Modal::SyntaxTheme { config, row })) => {
+                config.themes().nth(index).map(|name| {
+                    let current = if app.screen.syntax_theme.as_ref() == name {
+                        " (current)"
+                    } else {
+                        ""
+                    };
+                    (format!("{name}{current}"), index == *row)
                 })
             }
             (Control::RecoveryRow(index), Some(Modal::Recovery(dialog))) => {
@@ -1175,6 +1273,59 @@ fn selection_style(selected: bool) -> Style {
         Style::default().bg(Color::Blue).fg(Color::White)
     } else {
         Style::default()
+    }
+}
+
+/// Paint foreground only on visible, unselected cells of a validated glyph interval.
+fn paint_syntax(
+    frame: &mut Frame<'_>,
+    glyph: &Span,
+    selection: &Range<u64>,
+    ranges: &[crate::syntax::Styled],
+    palette: crate::syntax::Palette,
+    left: u64,
+    area: Rect,
+) {
+    let first = ranges.partition_point(|range| u64::from(range.end) <= glyph.bytes.start);
+    let unit = glyph
+        .unit
+        .map(|(bytes, cells)| (u64::from(bytes), u64::from(cells)));
+    for range in ranges[first..]
+        .iter()
+        .take_while(|range| u64::from(range.start) < glyph.bytes.end)
+    {
+        let (lo, hi) = unit.map_or(
+            (glyph.column, glyph.column + glyph.width),
+            |(bytes, cells)| {
+                (
+                    glyph.column
+                        + u64::from(range.start).saturating_sub(glyph.bytes.start) / bytes * cells,
+                    glyph.column
+                        + (u64::from(range.end).min(glyph.bytes.end) - glyph.bytes.start) / bytes
+                            * cells,
+                )
+            },
+        );
+        let foreground = match palette.color(range.category) {
+            Foreground::Ansi(index) => Color::Indexed(index),
+            Foreground::Rgb(r, g, b) => Color::Rgb(r, g, b),
+        };
+        for column in lo.max(left)..hi.min(left + u64::from(area.width)) {
+            let (start, end) =
+                unit.map_or((glyph.bytes.start, glyph.bytes.end), |(bytes, cells)| {
+                    let start = glyph.bytes.start + (column - glyph.column) / cells * bytes;
+                    (start, start + bytes)
+                });
+            if start < selection.end && selection.start < end {
+                continue;
+            }
+            if let Some(cell) = frame
+                .buffer_mut()
+                .cell_mut((area.x + (column - left) as u16, area.y))
+            {
+                cell.fg = foreground;
+            }
+        }
     }
 }
 #[cfg(test)]

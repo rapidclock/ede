@@ -1,5 +1,5 @@
-//! Reproducible bounded-memory storage benchmark. Run with `cargo run --release
-//! --example storage_bench -- <ordinary|dense|long> <MiB> <copy|clone> [churn-edits]`.
+//! Reproducible bounded-memory storage benchmark. Run with `cargo bench
+//! --bench storage_bench -- <ordinary|dense|long> <MiB> <copy|clone> [churn-edits]`.
 //! The input and output are real allocated text files in an isolated temp directory.
 
 use ede::document::{
@@ -72,7 +72,15 @@ fn memory_environment() -> Result<(), Box<dyn Error>> {
 }
 /// Parse benchmark parameters, run open/read/edit/undo/save, and verify streamed output bytes.
 fn main() -> Result<(), Box<dyn Error>> {
-    let mut arguments = std::env::args().skip(1);
+    let mut arguments: Vec<_> = std::env::args().skip(1).collect();
+    // Cargo appends this libtest flag even when the benchmark defines its own main.
+    if arguments
+        .last()
+        .is_some_and(|argument| argument == "--bench")
+    {
+        arguments.pop();
+    }
+    let mut arguments = arguments.into_iter();
     let kind = arguments.next().unwrap_or_else(|| "ordinary".into());
     let mib: u64 = arguments.next().unwrap_or_else(|| "1024".into()).parse()?;
     let mode = arguments.next().unwrap_or_else(|| "copy".into());

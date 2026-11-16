@@ -6,6 +6,7 @@ use crate::{
     input::Input,
     picker::{self, Browse},
     status::{Severity, StatusMessage},
+    syntax::Choice,
     ui::{Control, LayoutSnapshot},
 };
 use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
@@ -37,10 +38,20 @@ pub(crate) enum PathKind {
 pub(crate) enum Modal {
     ReplaceAll(crate::editor::search::SearchRequest),
     Menu(usize),
+    Language {
+        tab: TabId,
+        selected: Choice,
+        row: usize,
+    },
+    SyntaxTheme {
+        config: Arc<crate::syntax::Config>,
+        row: usize,
+    },
     Path(PathKind, String),
     Open(Box<picker::Dialog>),
     Tabs(Option<TabId>),
     Confirm(After, Option<JobId>),
+    TabDetails,
     Details(String),
     SaveError(String),
     PersistenceError(String),
@@ -86,6 +97,7 @@ pub(crate) struct AppState {
     pub status: StatusMessage,
     pub dirty: bool,
     pub screen: Screen,
+    pub(crate) syntax_epoch: u64,
     pub mouse_capture: bool,
     pub pending: bool,
     opener: Option<Control>,
@@ -144,6 +156,10 @@ pub(crate) const MENU: &[(Command, &str)] = &[
     (Command::ReplaceNext, "Replace next"),
     (Command::ReplaceAll, "Replace all"),
     (Command::CancelSearch, "Cancel search"),
+    (Command::Language, "Language…"),
+    (Command::SyntaxTheme, "Syntax Theme…"),
+    (Command::ReloadHighlighting, "Reload Highlighting"),
+    (Command::RetryHighlighting, "Retry Highlighting"),
 ];
 impl AppState {
     /// Begin with text focus and a visible asynchronous preparation state.
@@ -157,6 +173,7 @@ impl AppState {
             status: StatusMessage::new(Severity::Info, "Preparing document"),
             dirty: true,
             screen: Screen::default(),
+            syntax_epoch: 0,
             mouse_capture: true,
             pending: false,
             opener: None,
@@ -204,6 +221,47 @@ impl AppState {
         !self.screen.loading && self.switching.is_none() && self.screen.document.is_some()
     }
 
+    /// Read live tab metadata so ordered editor replies can update an open Details dialog.
+    pub(crate) fn tab_details(&self) -> String {
+        let mut label = self.screen.path.as_ref().map_or_else(
+            || self.tab_label(self.screen.tab).to_owned(),
+            |path| crate::text::safe(&path.to_string_lossy()),
+        );
+        if let Some(tab) = self
+            .screen
+            .tabs
+            .iter()
+            .find(|tab| Some(tab.id) == self.screen.tab)
+        {
+            if tab.scratch {
+                label.push_str(&format!("\nScratch — {}", tab.retention));
+            }
+            if let Some(warning) = &tab.warning {
+                label.push('\n');
+                label.push_str(&crate::text::safe(warning));
+            }
+        }
+        let choice = self.screen.syntax_language;
+        let language = choice.name(self.screen.path.as_deref(), &self.screen.syntax_config);
+        let mode = if choice == Choice::Auto {
+            "Auto"
+        } else {
+            "Manual"
+        };
+        label.push_str(&format!("\nLanguage: {language} ({mode})"));
+        label.push_str(&format!(
+            "\nHighlighting: {}",
+            self.screen.syntax_status.message()
+        ));
+        if let Some(error) = &self.screen.syntax_notice {
+            label.push_str(&format!(
+                "\nHighlighting configuration: {}",
+                crate::text::safe(error)
+            ));
+        }
+        label
+    }
+
     fn field_open(&self) -> bool {
         matches!(self.modal, Some(Modal::Path(..) | Modal::Open(_))) || self.search_field_focused()
     }
@@ -243,7 +301,13 @@ impl AppState {
         }
     }
     /// Install the latest prepared viewport; an Arc shares drawing and pointer geometry.
-    pub fn update(&mut self, screen: Screen, pending: bool) {
+    pub fn update(&mut self, mut screen: Screen, pending: bool) {
+        if self.syntax_epoch != screen.syntax_epoch {
+            screen.syntax_projection = None;
+            if screen.syntax_status == crate::syntax::Status::Ready {
+                screen.syntax_status = crate::syntax::Status::Preparing;
+            }
+        }
         if self
             .switching
             .is_some_and(|sequence| screen.acknowledged >= sequence)
@@ -725,6 +789,12 @@ impl AppState {
         }
         if matches!(
             self.modal,
+            Some(Modal::Language { .. } | Modal::SyntaxTheme { .. })
+        ) {
+            return self.syntax_picker_command(command, layout);
+        }
+        if matches!(
+            self.modal,
             Some(Modal::Recovery(_) | Modal::DiscardRecovery(..))
         ) {
             return self.recovery_command(command, layout);
@@ -924,7 +994,7 @@ impl AppState {
             }
             return None;
         }
-        if let Some(Modal::Details(_)) = self.modal {
+        if matches!(self.modal, Some(Modal::Details(_) | Modal::TabDetails)) {
             if matches!(
                 command,
                 Command::Tab | Command::FocusNext | Command::FocusPrevious
@@ -992,7 +1062,11 @@ impl AppState {
                 self.guard_return = from_menu;
                 self.guard_focus = self.focus;
             }
-            self.focus = Some(Control::Content);
+            self.focus = if matches!(command, Command::Language | Command::SyntaxTheme) {
+                self.opener.take().or(Some(Control::Content))
+            } else {
+                Some(Control::Content)
+            };
             self.dirty = true;
         }
         if self.guard_request.is_some() {
@@ -1062,29 +1136,48 @@ impl AppState {
                 ))))
             }
             Command::TabDetails => {
-                let mut label = self.screen.path.as_ref().map_or_else(
-                    || self.tab_label(self.screen.tab).to_owned(),
-                    |path| crate::text::safe(&path.to_string_lossy()),
-                );
-                if let Some(tab) = self
-                    .screen
-                    .tabs
-                    .iter()
-                    .find(|tab| Some(tab.id) == self.screen.tab)
-                {
-                    if tab.scratch {
-                        label.push_str(&format!("\nScratch — {}", tab.retention));
-                    }
-                    if let Some(warning) = &tab.warning {
-                        label.push_str(&format!("\n{warning}"));
-                    }
-                }
-                self.modal = Some(Modal::Details(label));
+                self.modal = Some(Modal::TabDetails);
                 self.focus = Some(Control::DetailsClose);
                 self.help_scroll = 0;
                 self.capture = None;
                 self.dirty = true;
                 None
+            }
+            Command::Language if self.ready() => {
+                let selected = self.screen.syntax_language;
+                let row = Choice::options()
+                    .position(|choice| choice == selected)
+                    .unwrap_or(0);
+                self.opener = self.focus;
+                self.help = false;
+                self.modal = Some(Modal::Language {
+                    tab: self.screen.tab?,
+                    selected,
+                    row,
+                });
+                self.focus = Some(Control::LanguageRow(row));
+                self.capture = None;
+                self.dirty = true;
+                None
+            }
+            Command::Language => None,
+            Command::SyntaxTheme => {
+                let config = self.screen.syntax_config.clone();
+                let row = config
+                    .themes()
+                    .position(|name| name == self.screen.syntax_theme.as_ref())
+                    .unwrap_or(0);
+                self.opener = self.focus;
+                self.help = false;
+                self.modal = Some(Modal::SyntaxTheme { config, row });
+                self.focus = Some(Control::LanguageRow(row));
+                self.capture = None;
+                self.dirty = true;
+                None
+            }
+            Command::ReloadHighlighting => Some(Intent::Editor(Action::ReloadHighlighting)),
+            Command::RetryHighlighting => {
+                Some(Intent::Editor(Action::RetryHighlighting(self.screen.tab?)))
             }
             Command::Recovery => self.open_recovery(),
             Command::RetryRefresh => {
@@ -1203,6 +1296,15 @@ impl AppState {
             if self.dialog_wheel(up, layout) {
                 return None;
             }
+            if matches!(
+                self.modal,
+                Some(Modal::Language { .. } | Modal::SyntaxTheme { .. })
+            ) {
+                return self.syntax_picker_command(
+                    Command::Move(if up { Movement::Up } else { Movement::Down }, false),
+                    layout,
+                );
+            }
             if let Some(Modal::Menu(index)) = &mut self.modal {
                 *index = if up {
                     index.saturating_sub(1)
@@ -1212,7 +1314,12 @@ impl AppState {
             } else if self.help
                 || matches!(
                     self.modal,
-                    Some(Modal::Details(_) | Modal::SaveError(_) | Modal::ReplaceAll(_))
+                    Some(
+                        Modal::Details(_)
+                            | Modal::TabDetails
+                            | Modal::SaveError(_)
+                            | Modal::ReplaceAll(_)
+                    )
                 )
             {
                 self.help_scroll = if up {
@@ -1521,6 +1628,94 @@ impl AppState {
 mod tests {
     use super::*;
     use ratatui::layout::Rect;
+
+    /// At the layout floor all options remain reachable and a row click applies to the original tab.
+    #[test]
+    fn language_picker_preserves_target_and_focus_through_resize() {
+        let mut app = AppState::new();
+        app.screen.tab = Some(TabId(1));
+        app.screen.document = Some(crate::document::DocumentId(1));
+        app.screen.loading = false;
+        app.focus = Some(Control::Help);
+        let area = Rect::new(0, 0, 40, 8);
+        let menu_layout = LayoutSnapshot::for_app(area, &app, 1);
+        app.input(Input::Command(Command::Menu), &menu_layout);
+        app.input(Input::Command(Command::Language), &menu_layout);
+        let mut layout = LayoutSnapshot::for_app(area, &app, 2);
+        for row in 1..Choice::options().count() {
+            app.input(
+                Input::Command(Command::Move(Movement::Down, false)),
+                &layout,
+            );
+            layout = LayoutSnapshot::for_app(area, &app, row as u64 + 2);
+            assert!(layout.contains(Control::LanguageRow(row)));
+        }
+
+        let tiny = LayoutSnapshot::for_app(Rect::new(0, 0, 39, 7), &app, 30);
+        assert!(app.input(Input::Command(Command::Newline), &tiny).is_none());
+        let last = Choice::options().count() - 1;
+        assert!(matches!(app.modal, Some(Modal::Language { row, .. }) if row == last));
+        let (x, y) = (0..area.height)
+            .flat_map(|y| (0..area.width).map(move |x| (x, y)))
+            .find(|&(x, y)| layout.hit(x, y) == Some(Control::LanguageRow(last)))
+            .unwrap();
+
+        app.screen.tab = Some(TabId(2));
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+        ] {
+            let intent = app.input(
+                Input::Pointer(MouseEvent {
+                    kind,
+                    column: x,
+                    row: y,
+                    modifiers: KeyModifiers::NONE,
+                }),
+                &layout,
+            );
+            if kind == MouseEventKind::Up(MouseButton::Left) {
+                assert!(
+                    matches!(intent, Some(Intent::Editor(Action::SetLanguage(TabId(1), choice))) if choice.name(None, &app.screen.syntax_config) == "CSS")
+                );
+            } else {
+                assert!(intent.is_none());
+            }
+        }
+        assert_eq!(app.focus, Some(Control::Help));
+
+        let layout = LayoutSnapshot::for_app(area, &app, 31);
+        app.input(Input::Command(Command::Language), &layout);
+        assert!(app.input(Input::Command(Command::Cancel), &tiny).is_none());
+        assert!(app.modal.is_none());
+        assert_eq!(app.focus, Some(Control::Help));
+    }
+
+    /// Tab Details uses the committed, native filename even when its stem is not UTF-8.
+    #[test]
+    fn tab_details_reports_auto_language_from_stored_name() {
+        use std::{ffi::OsStr, os::unix::ffi::OsStrExt};
+
+        let mut app = AppState::new();
+        let layout = LayoutSnapshot::for_app(Rect::new(0, 0, 80, 24), &app, 1);
+        for (name, expected) in [
+            (Some(&b"link.RS"[..]), "Rust"),
+            (Some(&b"\xff.YmL"[..]), "YAML"),
+            (Some(&b"document.rs.bak"[..]), "Plain Text"),
+            (None, "Plain Text"),
+        ] {
+            app.screen.path = name.map(|bytes| PathBuf::from(OsStr::from_bytes(bytes)));
+            app.input(Input::Command(Command::TabDetails), &layout);
+            assert!(matches!(app.modal, Some(Modal::TabDetails)));
+            assert!(
+                app.tab_details()
+                    .lines()
+                    .any(|line| line == format!("Language: {expected} (Auto)"))
+            );
+            app.input(Input::Command(Command::Cancel), &layout);
+        }
+    }
+
     /// Field paste is asynchronous, ordered with typing/submit, revocable, and cannot leak to text.
     #[test]
     fn field_paste_ordering_and_cancellation() {
