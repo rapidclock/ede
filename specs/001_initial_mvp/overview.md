@@ -1,6 +1,6 @@
 # 001 — Initial MVP overview
 
-Status: **MVP scope and roadmap accepted — Stages 01–06 merged. Stage 07 implemented and validated on its stage branch.**
+Status — **MVP scope and roadmap accepted. Stages 01–07 merged. Stage 08 design drafted for approval.**
 
 Project: **ede**, a predominantly Rust terminal text editor for macOS and Linux.
 
@@ -391,7 +391,7 @@ storage. Avoid assuming that an open file descriptor or memory map freezes data.
 | Storage | Unified or separate backends; stable snapshots; indexing and undo resource budgets |
 | Saving | Atomic replacement policy, metadata/links, cancellation, disk exhaustion, and external-change conflicts |
 | Scratch persistence | Resolved in Stage 05: machine-local state, independent live owners, recovery of retired owners, fresh restored history, and scratch-only recovery; power-loss guarantees remain outside scope |
-| Live content | Direct file-follow semantics, log rotation, retention quotas, and producer-error handling |
+| Live content | Stage 08 proposes terminal separation, pathname following and rotation, retention quotas, and producer-error handling for approval |
 | Search | Stage 06 uses bounded ripgrep literal matching, Unicode simple case folding, optional whole-word matching, and per-document atomic replacement; design and implementation authorized |
 | Performance | Benchmark corpus and CPU/storage details for the agreed 1 GiB / 8 GiB RAM baseline; measurement methods, memory budgets, and validation of agreed latency/highlighting defaults |
 | Dependencies | Libraries, grammar versions, compiler/toolchain baseline, and configuration locations |
@@ -558,7 +558,7 @@ Evidence: [Stage 06 validation record](06_search_and_replace.md#validation-recor
 ### 07 — Syntax highlighting
 
 Design: [07_syntax_highlighting.md](07_syntax_highlighting.md). Depends on: 02–06.
-Status — Implemented with Tree-sitter, independently reviewed, and validated.
+Status — Complete. [PR #7](https://github.com/rapidclock/ede/pull/7) merged into `feat/initial_mvp` at `bc25929`.
 Branch: `stage/syntax_highlighting`; PR target: `feat/initial_mvp`.
 Evidence: [Stage 07 validation record](07_syntax_highlighting.md#validation-record).
 
@@ -573,15 +573,21 @@ Evidence: [Stage 07 validation record](07_syntax_highlighting.md#validation-reco
 
 ### 08 — Pipes, pager behavior, and live following
 
-Planned file: `08_pipes_and_follow.md`. Depends on: 02–07.
+Design — [08_pipes_and_follow.md](08_pipes_and_follow.md). Depends on Stages 02–07.
 
-- Deliver incremental stdin display, bounded ingestion/spooling, follow/pause,
-  retained-history search, and direct file following. Resolve storage exhaustion,
-  producer errors, controlling-terminal access, truncation, and rotation behavior.
-- Complete when active input remains read-only, EOF makes piped content editable,
-  and partial lines/characters are handled correctly. Verify input/UI separation,
-  replacement restrictions, quitting with an active producer, and redirected-output
-  behavior. Covers FR-07 and stream integration with FR-04 and FR-08.
+Status — Draft for approval.
+
+Branch — `stage/pipes_and_follow`. PR target — `feat/initial_mvp`.
+
+Evidence — [Stage 08 validation record](08_pipes_and_follow.md#validation-record).
+
+- Deliver incremental stdin display, bounded retained history, follow/pause,
+  retained-history search, and direct file following by pathname.
+- Complete when live input remains read-only, valid stdin EOF produces an editable
+  persistent scratch, and partial lines and split scalars are handled correctly.
+  Verify terminal separation, replacement restrictions, storage exhaustion,
+  truncation and rotation, and prompt teardown with an active producer. Covers
+  FR-07 and stream integration with FR-04 and FR-08.
 
 ### 09 — Configuration and keybinding UI
 

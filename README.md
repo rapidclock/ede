@@ -23,7 +23,8 @@ cargo run --locked -- -- -filename.txt
 Run in a terminal with a usable `TERM`, at least 40 columns by 8 rows. Smaller
 windows preserve work and show a resize prompt; return to a supported size to
 answer unsaved-change prompts. `--help` and `--version` work without a terminal.
-Reading document text from pipes belongs to Stage 8.
+Piped input and live file following are planned for Stage 8.
+[Stage 8 validation record](specs/001_initial_mvp/08_pipes_and_follow.md#validation-record).
 
 Opening validates a private UTF-8 snapshot in the background. Its initial preview
 is read-only; Escape cancels preparation. Once ready, files remain editable
