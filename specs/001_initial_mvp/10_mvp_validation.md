@@ -330,8 +330,8 @@ client-side nesting separately if exercised or documented as supported.
 
 | Row | Client → editor | Required run |
 | --- | --- | --- |
-| T10-1 | macOS iTerm2 → local macOS | Base sequence in legacy and enhanced input profiles. Demonstrate direct Cmd/Super delivery and a tested Cmd-to-Ctrl mapping, with portable alternatives. |
-| T10-2 | macOS iTerm2 → local tmux → macOS | Base sequence and tmux sequence in the portable profile. Test enhanced delivery where the path supports it and record actual behavior or fallback. |
+| T10-1 | macOS iTerm2 → local macOS | Base sequence in the portable profile. Repeat it in the enhanced profile during the final macOS Cmd check. |
+| T10-2 | macOS iTerm2 → local tmux → macOS | Base sequence and tmux sequence in the portable profile. Test enhanced delivery where supported during the final macOS Cmd check. |
 | T10-3 | Native Linux graphical terminal → local Linux | Base sequence and portable operation. Reference frontend may be xterm or GNOME Terminal, with actual version recorded. |
 | T10-4 | Same Linux frontend → local tmux → Linux | Base sequence and tmux sequence. |
 | T10-5 | macOS terminal → SSH → Linux | Base sequence and SSH disconnect/reconnect sequence using an allocated remote PTY. |
@@ -393,24 +393,7 @@ interruption. A version tested on one path establishes evidence for that path.
    exact bytes. In the tmux rows also exercise explicit detach/reattach. If the
    session fails to resume, record the failure and whether a fresh connection
    can recover the tmux session or the last scratch checkpoint.
-5. **Enhanced keys.** On a named, versioned enhanced macOS profile, demonstrate
-   at least one direct Cmd/Super action through a physical shortcut. Exercise
-   one Cmd-to-Ctrl mapping end to end in an isolated profile and document its
-   exact settings. Verify portable operation with enhancements disabled.
-   For each advertised Cmd alias, use the physical shortcut on the claimed
-   path and check its corresponding portable behavior, including modifier and
-   focus distinctions. Record interception and the verified portable or
-   Actions fallback on direct, tmux and macOS-to-Linux paths. Changing a user's
-   terminal or tmux configuration is outside the editor's responsibility.
-   Include the reported Terminal.app → SSH → Ubuntu path and the reported
-   iTerm2 path through tmux, recording where the tmux server runs. Try Cmd+S
-   with a dirty fixture and check saved bytes. Apple's default Terminal.app
-   shortcut exports the terminal's text. Record such terminal actions and
-   verify Ctrl+S or a tested profile mapping saves the file in ede. If a
-   Cmd event reaches ede and fails to dispatch, reproduce and fix it.
-   [Apple Terminal keyboard shortcuts](https://support.apple.com/en-mn/guide/terminal/trmlshtcts/mac),
-   [iTerm2 profile key mappings](https://iterm2.com/documentation-preferences-profiles-keys.html).
-6. **Client clipboard (if the toggle is accepted).** Try an ordinary Copy in
+5. **Client clipboard (if the toggle is accepted).** Try an ordinary Copy in
    Terminal.app over direct SSH to Ubuntu and in iTerm2 over direct SSH and
    through the reported tmux topology. Include an iTerm2 local baseline.
    Use distinct markers for the existing macOS clipboard and the selection
@@ -524,6 +507,30 @@ versus copy where observed, and exercise the forced-copy path.
   timings distinct from editor processing and PTY timings. Use client and
   host probes separately when available and state what the clocks measure.
   Keep the 1 s and 50 ms checks on the local baseline.
+
+## Final terminal check — macOS Cmd shortcuts
+
+Run physical Cmd shortcut checks after the integrated workflows, portable
+terminal and clipboard checks, and performance runs. Verify the portable Ctrl
+shortcuts in the earlier terminal checks with enhancements disabled.
+
+- On a named, versioned enhanced macOS profile, demonstrate at least one
+  direct Cmd/Super action through a physical shortcut. Exercise one Cmd-to-Ctrl
+  mapping end to end in an isolated profile and document its exact settings.
+- For each advertised Cmd alias, use the physical shortcut on the claimed
+  path and check its corresponding portable behavior, including modifier and
+  focus distinctions. Include Terminal.app → SSH → Ubuntu and the reported
+  iTerm2 path through tmux. Record the tmux server location. Try Cmd+S with a
+  dirty fixture and check saved bytes. If a delivered Cmd event fails to
+  dispatch, reproduce and fix it.
+- Record each shortcut the OS, terminal, or tmux handles upstream as a
+  limitation of that path and document its tested Ctrl, Actions, or profile
+  mapping fallback. For example, Terminal.app can handle Cmd+S by opening its
+  text export dialog. Verify Ctrl+S or a tested mapping saves the file in ede.
+  The user accepts upstream interception when a working fallback is available.
+  Terminal and tmux settings remain under the user's control.
+  [Apple Terminal keyboard shortcuts](https://support.apple.com/en-mn/guide/terminal/trmlshtcts/mac),
+  [iTerm2 profile key mappings](https://iterm2.com/documentation-preferences-profiles-keys.html).
 
 ## Build and completion gates
 
