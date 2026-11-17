@@ -652,12 +652,13 @@ transport matrix remains open.
 | T10-5 | **Partial**. OpenSSH 10.5p1 on macOS allocated an Ubuntu PTY. Exact OSC 52 bytes crossed SSH. Ctrl+S saved exact bytes and Quit restored terminal modes. Killing a separate SSH client retired its editor. A fresh 96×32 PTY retained the last saved named-file bytes and reopened the last acknowledged scratch checkpoint, then restored its original termios on exit. Mac GUI paste and the full base sequence are open. |
 | T10-6 | **Partial**. Isolated remote tmux 3.7b forwarded the OSC 52 payload with `set-clipboard on` and `xterm*:clipboard`. A fresh SSH connection reattached at 96×32, retained the unsaved marker, saved exact bytes and restored the inner tty. Mac GUI paste and remaining base and tmux actions are open. |
 | T10-7 and T10-8 | **Partial**. Mosh 1.4.0 on macOS arm64 and Ubuntu arm64 resumed after a 12 s bidirectional UDP drop in an isolated loopback relay, both directly and through isolated tmux 3.7b. The client PTY changed from 80×24 to 96×32 during the interruption. The same editor retained the unsaved marker, accepted bracketed paste, saved exact bytes and restored the inner tty. Graphical frontend and remaining base actions are open. |
-| T10-9 and T10-10 | **Blocked**. The macOS Eternal Terminal 7.1.1 binary could not load with the available Protobuf runtime. No Eternal Terminal server package was available from the configured Ubuntu repositories. |
+| T10-9 and T10-10 | **Partial**. Eternal Terminal 7.1.1 on macOS arm64 used a checksum-verified Debian arm64 server package on Ubuntu after the Ubuntu package endpoint returned HTTP 503. The server and TCP relay were loopback-only, bridged by an isolated SSH tunnel. After a 12 s TCP disconnect and resize from 80×24 to 96×32, both the direct and remote tmux 3.7b paths retained unsaved text, accepted bracketed paste, saved exact bytes and restored the inner tty. Graphical frontend and remaining base actions are open. |
 
 Mac GUI clipboard and the final Cmd check remain open. Computer Use denied
 access to Terminal.app 2.15 and iTerm2 3.7.7. Physical Cmd delivery, Mac
 application paste and the per-path maximum clipboard payload require frontend
-evidence.
+evidence. A disposable clipboard fixture launched and exited cleanly through
+local macOS, direct SSH, and SSH with isolated remote tmux in the PTY harness.
 
 ### Performance and resources
 
@@ -715,8 +716,7 @@ MVP-01 and MVP-06 have automated candidate evidence for V01–V09. Required
 frontend workflows and exact client paste remain open. MVP-02 requires the
 rest of the terminal matrix and the final macOS Cmd check. MVP-03 retains
 the resource and timing gaps above. MVP-04 has native locked checks, independent
-review and mutation evidence. The implementation commit `5aae2e5` has a
-[macOS draft CI run](https://github.com/rapidclock/ede/actions/runs/44132439675/job/134212859697).
-The full GitHub Actions matrix is pending.
+review and mutation evidence. The [macOS draft CI job](https://github.com/rapidclock/ede/actions/runs/44132989152/job/134214839862)
+passed on `6b61405`. The full GitHub Actions matrix is pending.
 MVP-05 remains open for terminal-specific instructions and the locked
 `0.0.1` release build after validation.
