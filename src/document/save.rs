@@ -89,6 +89,7 @@ impl Document {
                 .reader()?,
             baseline: self.baseline.clone(),
             target,
+            excluded: [None, None],
         })
     }
     /// Reconcile precisely the state published by a save, preserving newer edits.
@@ -106,6 +107,40 @@ impl Document {
         completion.report
     }
 }
+
+impl Snapshot {
+    /// Publish the retained bytes to a new path without acquiring a saved baseline.
+    pub(crate) fn export_retained(
+        &self,
+        path: PathBuf,
+        sources: [Option<&Path>; 2],
+        cancel: &Cancellation,
+    ) -> SaveReport {
+        let result = (|| {
+            Ok(SaveTask {
+                document: self.document(),
+                revision: self.revision(),
+                state: *self.state,
+                reader: super::source::Reader {
+                    source: self.reader.source.reader()?,
+                    tree: self.reader.tree.reader()?,
+                },
+                baseline: None,
+                target: SaveTarget::New(path),
+                excluded: sources.map(|source| source.map(Path::to_owned)),
+            })
+        })();
+        match result {
+            Ok(task) => task.run(cancel).report,
+            Err(error) => SaveReport {
+                document: self.document(),
+                revision: self.revision(),
+                outcome: SaveOutcome::NotCommitted,
+                error: Some(error),
+            },
+        }
+    }
+}
 /// Independent immutable save input; its caller must retain the snapshot lease until reconciliation.
 pub(super) struct SaveTask {
     document: DocumentId,
@@ -114,6 +149,7 @@ pub(super) struct SaveTask {
     reader: Reader,
     baseline: Option<Baseline>,
     target: SaveTarget,
+    excluded: [Option<PathBuf>; 2],
 }
 /// Worker result, reconciled on the mutable document owner before acknowledgement.
 pub(super) struct SaveCompletion {
@@ -171,10 +207,9 @@ impl SaveTask {
         let destination = if let Some(baseline) = expected {
             baseline.resolved.clone()
         } else {
-            let parent = supplied.parent().ok_or(Error::InvalidRange)?;
-            let name = supplied.file_name().ok_or(Error::InvalidRange)?;
-            fs::canonicalize(parent)?.join(name)
+            canonical_name(&supplied)?
         };
+        self.check_export_target(&supplied, &destination)?;
         let parent_path = destination.parent().ok_or(Error::InvalidRange)?;
         let parent = File::open(parent_path)?;
         let parent_version = Version::of(&parent.metadata()?);
@@ -246,6 +281,7 @@ impl SaveTask {
         if let Some(baseline) = expected {
             check_destination(baseline, store, cancel)?;
         }
+        self.check_export_target(&supplied, &destination)?;
         cancel.check()?;
         let staged_version = Version::of(&output.as_file().metadata()?);
         let published = if expected.is_some() {
@@ -284,6 +320,39 @@ impl SaveTask {
         check_destination(&baseline, store, &Cancellation::default())?;
         Ok(baseline)
     }
+
+    fn check_export_target(&self, supplied: &Path, destination: &Path) -> Result<(), Error> {
+        for source in self.excluded.iter().flatten() {
+            if source == supplied
+                || names_source(source, destination)
+                || canonical_name(supplied)? != destination
+            {
+                return Err(Error::SaveConflict);
+            }
+        }
+        Ok(())
+    }
+}
+
+fn canonical_name(path: &Path) -> Result<PathBuf, Error> {
+    let parent = path.parent().ok_or(Error::InvalidRange)?;
+    let name = path.file_name().ok_or(Error::InvalidRange)?;
+    Ok(fs::canonicalize(parent)?.join(name))
+}
+
+/// A dangling leaf symlink can still name a forbidden log destination.
+fn names_source(source: &Path, destination: &Path) -> bool {
+    let mut path = source.to_owned();
+    for _ in 0..40 {
+        if path == destination || canonical_name(&path).is_ok_and(|path| path == destination) {
+            return true;
+        }
+        let Ok(target) = fs::read_link(&path) else {
+            break;
+        };
+        path = path.parent().unwrap_or_else(|| Path::new("")).join(target);
+    }
+    false
 }
 /// Stream preserved BOM followed by logical text using one bounded buffer.
 fn stream(
@@ -342,4 +411,85 @@ fn check_destination(
         return Err(Error::SaveConflict);
     }
     Ok(())
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::document::{Edit, FaultInjector, OpenOptions, TextRange};
+
+    #[derive(Debug)]
+    struct RetargetAtPublish {
+        alias: PathBuf,
+        next: PathBuf,
+    }
+
+    impl FaultInjector for RetargetAtPublish {
+        fn check(&self, point: IoPoint) -> io::Result<()> {
+            if point == IoPoint::Publish {
+                fs::remove_file(&self.alias)?;
+                std::os::unix::fs::symlink(&self.next, &self.alias)?;
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn export_refuses_new_source_alias_at_publication() {
+        let root = tempfile::tempdir().unwrap();
+        let old = root.path().join("old");
+        let next = root.path().join("next");
+        let alias = root.path().join("alias");
+        fs::create_dir(&old).unwrap();
+        fs::create_dir(&next).unwrap();
+        std::os::unix::fs::symlink(&old, &alias).unwrap();
+
+        let mut document = Document::new(OpenOptions {
+            faults: Some(Arc::new(RetargetAtPublish {
+                alias: alias.clone(),
+                next: next.clone(),
+            })),
+            ..OpenOptions::default()
+        })
+        .unwrap();
+        let cancel = Cancellation::default();
+        document
+            .apply(
+                document.revision(),
+                [Edit {
+                    range: TextRange::new(0, 0).unwrap(),
+                    text: "retained",
+                }],
+                &cancel,
+            )
+            .unwrap();
+        let snapshot = document.snapshot().unwrap();
+        let target = next.join("source.log");
+        let report = snapshot.export_retained(
+            target.clone(),
+            [Some(&alias.join("source.log")), None],
+            &cancel,
+        );
+        assert_eq!(report.outcome, SaveOutcome::NotCommitted);
+        assert!(matches!(report.error, Some(Error::SaveConflict)));
+        assert!(!target.exists());
+    }
+
+    #[test]
+    fn export_cannot_recreate_a_dangling_follower_target() {
+        let root = tempfile::tempdir().unwrap();
+        let alias = root.path().join("link.log");
+        let target = root.path().join("target.log");
+        std::os::unix::fs::symlink("target.log", &alias).unwrap();
+        let snapshot = Document::new(OpenOptions::default())
+            .unwrap()
+            .snapshot()
+            .unwrap();
+        let report = snapshot.export_retained(
+            target.clone(),
+            [Some(&alias), None],
+            &Cancellation::default(),
+        );
+        assert!(matches!(report.error, Some(Error::SaveConflict)));
+        assert!(!target.exists());
+    }
 }

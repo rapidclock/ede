@@ -39,6 +39,9 @@ pub enum Request {
     },
     /// Create an unnamed empty document.
     New,
+    /// Install a completely prepared capture as a new editable document.
+    #[doc(hidden)]
+    Adopt(super::CaptureAdoption),
     /// Obtain current path, dirty state and retained history positions.
     Info(DocumentId),
     /// Obtain managed cache usage and working-store disk sizes on the owner.
@@ -134,7 +137,7 @@ impl Request {
     /// Originating identity, except when opening/creating a new one.
     fn document(&self) -> Option<DocumentId> {
         match self {
-            Self::Open(_) | Self::Restore { .. } | Self::New => None,
+            Self::Open(_) | Self::Restore { .. } | Self::New | Self::Adopt(_) => None,
             Self::Info(id)
             | Self::Stats(id)
             | Self::Snapshot(id)
@@ -368,6 +371,7 @@ pub struct StorageService {
     entries: Arc<AtomicUsize>,
     resources: Arc<Resources>,
     limits: StorageLimits,
+    captures: super::CaptureFactory,
     stopping: Arc<AtomicBool>,
 }
 /// Pending orderly shutdown. Waiting may block on OS I/O and must occur off the UI thread.
@@ -395,6 +399,10 @@ impl Shutdown {
     }
 }
 impl StorageService {
+    /// Share document resource pools with independent stream owners.
+    pub(crate) fn captures(&self) -> super::CaptureFactory {
+        self.captures.clone()
+    }
     /// Charge editor-owned state to the same aggregate buffer pool as storage.
     pub(crate) fn reserve_interaction(&self, bytes: usize) -> Result<Permit, Error> {
         self.resources.buffers.acquire(bytes)
@@ -443,6 +451,7 @@ impl StorageService {
         let opener = thread::Builder::new()
             .name("ede-open".into())
             .spawn(move || prepare_opens(open_inbox, prepared, open_options, open_resources))?;
+        let captures = super::CaptureFactory::new(options.clone(), resources.clone());
         Ok(Self {
             mutations,
             reads,
@@ -452,6 +461,7 @@ impl StorageService {
             entries,
             resources,
             limits: options.limits,
+            captures,
             stopping,
         })
     }
@@ -939,7 +949,7 @@ fn worker(
             continue;
         }
         let revision = request_revision(&envelope.request);
-        let creating = matches!(envelope.request, Request::New);
+        let creating = matches!(envelope.request, Request::New | Request::Adopt(_));
         let request = std::mem::replace(&mut envelope.request, Request::New);
         let request = match request {
             Request::Refresh {
@@ -1091,9 +1101,12 @@ fn execute(
 ) -> Result<Response, Error> {
     envelope.cancel.check()?;
     match request {
-        Request::New => {
+        Request::New | Request::Adopt(_) => {
             let permit = resources.buffers.acquire(4096)?;
-            let document = Document::new_shared(options.clone(), resources)?;
+            let document = match request {
+                Request::Adopt(value) => value.take(&envelope.cancel)?,
+                _ => Document::new_shared(options.clone(), resources)?,
+            };
             Ok(install(
                 envelope.document,
                 OwnedDocument {
@@ -1184,6 +1197,7 @@ fn execute(
                 | Request::Save { .. }
                 | Request::Open(_)
                 | Request::Restore { .. }
+                | Request::Adopt(_)
                 | Request::New => unreachable!("routed before executing a document mutation"),
             }
         }

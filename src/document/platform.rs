@@ -41,7 +41,7 @@ pub(super) fn copy_prefix(
 
 /// File identity and observed version; contents are additionally compared on save.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) struct Version {
+pub(crate) struct Version {
     pub dev: u64,
     pub ino: u64,
     pub len: u64,
@@ -73,6 +73,10 @@ impl Version {
     pub fn same_object(&self, other: &Self) -> bool {
         self.dev == other.dev && self.ino == other.ino
     }
+    /// Whether length or modification time warrants rechecking a follower's witness.
+    pub(crate) fn content_changed(&self, other: &Self) -> bool {
+        self.len != other.len || self.modified != other.modified
+    }
     /// Publication may update ctime; all other captured output fields must stay unchanged.
     pub fn unchanged_after_rename(&self, before: &Self) -> bool {
         self.same_object(before)
@@ -98,6 +102,16 @@ fn flags(_: &Metadata) -> u32 {
 
 /// Open without FIFO blocking, then validate descriptor and resolved pathname identity.
 pub(super) fn open(path: &Path) -> Result<(File, PathBuf, Version), Error> {
+    let (file, version) = open_regular(path)?;
+    let resolved = fs::canonicalize(path)?;
+    if Version::of(&fs::metadata(&resolved)?) != version {
+        return Err(Error::SourceChanged);
+    }
+    Ok((file, resolved, version))
+}
+
+/// A growing follower requires descriptor identity but accepts changing length and mtime.
+pub(crate) fn open_regular(path: &Path) -> Result<(File, Version), Error> {
     if !fs::metadata(path)?.is_file() {
         return Err(Error::UnsupportedType);
     }
@@ -105,15 +119,15 @@ pub(super) fn open(path: &Path) -> Result<(File, PathBuf, Version), Error> {
         .read(true)
         .custom_flags(libc::O_NONBLOCK)
         .open(path)?;
-    if !file.metadata()?.is_file() {
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
         return Err(Error::UnsupportedType);
     }
-    let version = Version::of(&file.metadata()?);
-    let resolved = fs::canonicalize(path)?;
-    if Version::of(&fs::metadata(&resolved)?) != version {
+    let version = Version::of(&metadata);
+    if !Version::of(&fs::metadata(path)?).same_object(&version) {
         return Err(Error::SourceChanged);
     }
-    Ok((file, resolved, version))
+    Ok((file, version))
 }
 /// Check available storage before allocating, preserving configured free-space headroom.
 pub(super) fn reserve(file: &File, bytes: u64, headroom: u64) -> Result<(), Error> {
@@ -301,9 +315,12 @@ fn copy_xattrs(original: &File, _: &File) -> Result<(), Error> {
     }
     Ok(())
 }
+#[cfg(target_os = "macos")]
+type Xattrs = std::collections::BTreeMap<Vec<u8>, Vec<u8>>;
+
 /// Bounded Darwin xattr snapshot. Names and values together may not exceed 64 KiB.
 #[cfg(target_os = "macos")]
-fn xattrs(file: &File) -> Result<std::collections::BTreeMap<Vec<u8>, Vec<u8>>, Error> {
+fn xattrs(file: &File) -> Result<Xattrs, Error> {
     use std::ffi::CString;
     const LIMIT: usize = 64 << 10;
     // SAFETY: null/zero requests the size on a live descriptor.
@@ -366,7 +383,28 @@ fn xattrs(file: &File) -> Result<std::collections::BTreeMap<Vec<u8>, Vec<u8>>, E
     }
     Ok(result)
 }
-/// Copy macOS xattrs through the native descriptor API, then compare every name/value.
+/// The name of the provenance attribute macOS can attach when creating a file.
+#[cfg(target_os = "macos")]
+const PROVENANCE: &[u8] = b"com.apple.provenance";
+
+/// Verify exact source metadata, allowing the staged file's own pre-copy provenance.
+#[cfg(target_os = "macos")]
+fn copied_xattrs_match(
+    source: &Xattrs,
+    mut staged: Xattrs,
+    staged_provenance: Option<&[u8]>,
+) -> bool {
+    if !source.contains_key(PROVENANCE)
+        && staged
+            .get(PROVENANCE)
+            .is_some_and(|value| Some(value.as_slice()) == staged_provenance)
+    {
+        staged.remove(PROVENANCE);
+    }
+    staged == *source
+}
+
+/// Copy macOS xattrs through the native descriptor API and verify the resulting metadata.
 #[cfg(target_os = "macos")]
 fn copy_xattrs(original: &File, output: &File) -> Result<(), Error> {
     unsafe extern "C" {
@@ -378,6 +416,8 @@ fn copy_xattrs(original: &File, output: &File) -> Result<(), Error> {
         ) -> libc::c_int;
     }
     let before = xattrs(original)?;
+    // macOS can stamp the output on creation. Record that tag before the native copy.
+    let staged_provenance = xattrs(output)?.remove(PROVENANCE);
     // SAFETY: live descriptors; null state requests internal temporary state; flag 4 is COPYFILE_XATTR only.
     if unsafe {
         fcopyfile(
@@ -390,12 +430,74 @@ fn copy_xattrs(original: &File, output: &File) -> Result<(), Error> {
     {
         return Err(io::Error::last_os_error().into());
     }
-    if xattrs(output)? != before || xattrs(original)? != before {
+    if !copied_xattrs_match(&before, xattrs(output)?, staged_provenance.as_deref())
+        || xattrs(original)? != before
+    {
         return Err(Error::SaveAsRequired(
             "extended metadata could not be preserved exactly",
         ));
     }
     Ok(())
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::*;
+
+    /// Allow a pre-existing staged provenance value only as an addition to exact source metadata.
+    #[test]
+    fn copied_xattrs_allow_only_preexisting_staged_provenance() {
+        let name = b"user.ede".to_vec();
+        let source = Xattrs::from([(name.clone(), b"source".to_vec())]);
+        let mut staged = source.clone();
+        let provenance = b"staged";
+        staged.insert(PROVENANCE.to_vec(), provenance.to_vec());
+        assert!(copied_xattrs_match(
+            &source,
+            staged.clone(),
+            Some(provenance)
+        ));
+        assert!(!copied_xattrs_match(&source, staged.clone(), None));
+        assert!(!copied_xattrs_match(
+            &source,
+            staged.clone(),
+            Some(b"different")
+        ));
+
+        let mut tagged_source = source.clone();
+        tagged_source.insert(PROVENANCE.to_vec(), b"original".to_vec());
+        assert!(copied_xattrs_match(
+            &tagged_source,
+            tagged_source.clone(),
+            Some(provenance)
+        ));
+        assert!(!copied_xattrs_match(
+            &tagged_source,
+            source.clone(),
+            Some(provenance)
+        ));
+        assert!(!copied_xattrs_match(
+            &tagged_source,
+            staged.clone(),
+            Some(provenance)
+        ));
+
+        staged.insert(b"com.apple.quarantine".to_vec(), b"unexpected".to_vec());
+        assert!(!copied_xattrs_match(
+            &source,
+            staged.clone(),
+            Some(provenance)
+        ));
+        staged.remove(b"com.apple.quarantine".as_slice());
+        staged.insert(name.clone(), b"changed".to_vec());
+        assert!(!copied_xattrs_match(
+            &source,
+            staged.clone(),
+            Some(provenance)
+        ));
+        staged.remove(&name);
+        assert!(!copied_xattrs_match(&source, staged, Some(provenance)));
+    }
 }
 
 /// Restrict a newly created, empty owner directory before putting private bytes in it.

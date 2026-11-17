@@ -2,7 +2,10 @@
 
 use std::{
     env,
-    io::{self, IsTerminal},
+    fs::File,
+    io::{self, IsTerminal, Write},
+    os::fd::AsRawFd,
+    os::unix::fs::OpenOptionsExt,
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -10,6 +13,7 @@ use std::{
 };
 
 use crossterm::{cursor, event, execute, terminal};
+use nix::sys::termios::{self, SetArg, Termios};
 use nix::unistd::{getpgid, getpgrp, getpid, getppid, getsid, tcgetpgrp};
 use signal_hook::{SigId, consts::signal::*, flag, low_level};
 
@@ -43,15 +47,123 @@ pub(crate) trait TerminalDriver {
     fn query_keyboard(&mut self) -> io::Result<()> {
         Ok(())
     }
+    /// Check foreground ownership against the terminal used for input.
+    fn foreground(&self) -> bool {
+        false
+    }
 }
 
-/// Production driver. Crossterm captures/restores the original termios state for raw mode.
-pub(crate) struct UnixTerminal;
+/// The controlling tty is explicit when fd 0 was supplied by a producer.
+#[derive(Default)]
+pub(crate) struct UnixTerminal {
+    tty: Option<File>,
+    raw: Option<Termios>,
+}
+
+impl UnixTerminal {
+    /// Validate the controlling terminal before touching the inherited data descriptor.
+    pub(crate) fn controlling() -> io::Result<Self> {
+        let tty = File::options().read(true).write(true).open("/dev/tty")?;
+        if tcgetpgrp(&tty)? != getpgrp() {
+            return Err(io::Error::other(
+                "controlling terminal is not in the foreground",
+            ));
+        }
+        termios::tcgetattr(&tty)?;
+        size_of(&tty)?;
+        Ok(Self {
+            tty: Some(tty),
+            raw: None,
+        })
+    }
+
+    /// Independent CLOEXEC handle for the single terminal input decoder.
+    pub(crate) fn input(&self) -> io::Result<Option<File>> {
+        self.tty
+            .as_ref()
+            .map(|_| {
+                File::options()
+                    .read(true)
+                    .custom_flags(nix::libc::O_NONBLOCK)
+                    .open("/dev/tty")
+            })
+            .transpose()
+    }
+
+    /// Keep the normal stdout path and use the controlling tty in stream mode.
+    pub(crate) fn output(&self) -> io::Result<TerminalOutput> {
+        Ok(match &self.tty {
+            Some(tty) => TerminalOutput::Tty(tty.try_clone()?),
+            None => TerminalOutput::Stdout(io::stdout()),
+        })
+    }
+
+    /// Obtain geometry from the same endpoint used for display and input.
+    pub(crate) fn size(&self) -> io::Result<(u16, u16)> {
+        self.tty.as_ref().map_or_else(terminal::size, size_of)
+    }
+}
+
+/// Output destination shared by terminal commands and the rendering backend.
+pub(crate) enum TerminalOutput {
+    Stdout(io::Stdout),
+    Tty(File),
+}
+
+impl Write for TerminalOutput {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self {
+            Self::Stdout(out) => out.write(buf),
+            Self::Tty(out) => out.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            Self::Stdout(out) => out.flush(),
+            Self::Tty(out) => out.flush(),
+        }
+    }
+}
+
+/// Kernel geometry is local to this tty and requires no decoder round trip.
+pub(crate) fn size_of(tty: &impl AsRawFd) -> io::Result<(u16, u16)> {
+    use nix::libc;
+    let mut size = libc::winsize {
+        ws_row: 0,
+        ws_col: 0,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    // SAFETY: the descriptor is borrowed and the kernel writes a winsize to live storage.
+    if unsafe { libc::ioctl(tty.as_raw_fd(), libc::TIOCGWINSZ as _, &mut size) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if size.ws_col == 0 || size.ws_row == 0 {
+        return Err(io::Error::other("terminal has no usable cell dimensions"));
+    }
+    Ok((size.ws_col, size.ws_row))
+}
 
 impl TerminalDriver for UnixTerminal {
     /// Issue each command independently, so one write failure does not skip later cleanup.
     fn set(&mut self, mode: Mode, enabled: bool) -> io::Result<()> {
-        let mut out = io::stdout();
+        if mode == Mode::Raw
+            && let Some(tty) = &self.tty
+        {
+            if enabled {
+                let original = termios::tcgetattr(tty)?;
+                let mut raw = original.clone();
+                termios::cfmakeraw(&mut raw);
+                self.raw = Some(original);
+                termios::tcsetattr(tty, SetArg::TCSANOW, &raw)?;
+            } else if let Some(original) = &self.raw {
+                termios::tcsetattr(tty, SetArg::TCSANOW, original)?;
+                self.raw = None;
+            }
+            return Ok(());
+        }
+        let mut out = self.output()?;
         match (mode, enabled) {
             (Mode::Raw, true) => terminal::enable_raw_mode(),
             (Mode::Raw, false) => terminal::disable_raw_mode(),
@@ -76,10 +188,18 @@ impl TerminalDriver for UnixTerminal {
     }
     /// Query only; the sole input reader consumes any response asynchronously.
     fn query_keyboard(&mut self) -> io::Result<()> {
-        use std::io::Write;
-        let mut output = io::stdout();
+        let mut output = self.output()?;
         output.write_all(b"\x1b[?u")?;
         output.flush()
+    }
+    fn foreground(&self) -> bool {
+        let group = self
+            .tty
+            .as_ref()
+            .map_or_else(|| tcgetpgrp(io::stdin()), tcgetpgrp);
+        getsid(None).is_ok_and(|session| session != getpid())
+            && group.is_ok_and(|foreground| foreground == getpgrp())
+            && getpgid(Some(getppid())).is_ok_and(|parent| parent != getpgrp())
     }
 }
 
@@ -92,6 +212,10 @@ pub(crate) struct TerminalSession<D: TerminalDriver> {
 }
 
 impl<D: TerminalDriver> TerminalSession<D> {
+    /// Borrow the device to construct the renderer and ingress handles.
+    pub(crate) fn driver(&self) -> &D {
+        &self.driver
+    }
     /// Construct an inactive owner; construction itself has no terminal side effects.
     pub(crate) fn new(driver: D) -> Self {
         Self {
@@ -165,7 +289,7 @@ impl<D: TerminalDriver> TerminalSession<D> {
 
     /// Return to the shell before stopping. Reacquire only after SIGCONT resumes execution.
     pub(crate) fn suspend(&mut self) -> io::Result<bool> {
-        if !job_control_available() {
+        if !self.driver.foreground() {
             return Ok(false);
         }
         self.restore()?;
@@ -184,9 +308,19 @@ impl<D: TerminalDriver> Drop for TerminalSession<D> {
 
 /// Validate without reading input, writing escapes, or changing terminal state.
 pub(crate) fn validate() -> io::Result<()> {
-    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+    if !io::stdin().is_terminal() {
         return Err(io::Error::other(
-            "interactive mode requires terminal stdin and stdout; pipes are not supported yet",
+            "interactive mode requires terminal stdin and stdout",
+        ));
+    }
+    validate_output()
+}
+
+/// Check stdout and TERM before opening any private or terminal state.
+pub(crate) fn validate_output() -> io::Result<()> {
+    if !io::stdout().is_terminal() {
+        return Err(io::Error::other(
+            "interactive mode requires terminal stdout",
         ));
     }
     if env::var("TERM")
@@ -198,13 +332,6 @@ pub(crate) fn validate() -> io::Result<()> {
         ));
     }
     Ok(())
-}
-
-/// A foreground job must have a controlling terminal and a parent shell session.
-fn job_control_available() -> bool {
-    getsid(None).is_ok_and(|session| session != getpid())
-        && tcgetpgrp(io::stdin()).is_ok_and(|foreground| foreground == getpgrp())
-        && getpgid(Some(getppid())).is_ok_and(|parent| parent != getpgrp())
 }
 
 /// Flags written by signal-safe handlers, consumed only by the application thread.

@@ -134,7 +134,7 @@ impl Options {
 pub(crate) struct Store {
     options: Options,
     owner: Id,
-    _owner_lock: File,
+    owner_lock: File,
     registry: File,
     maintenance: Mutex<Option<String>>,
 }
@@ -172,7 +172,7 @@ impl Store {
         let store = Self {
             options,
             owner,
-            _owner_lock: owner_lock,
+            owner_lock,
             registry,
             maintenance: Mutex::new(None),
         };
@@ -551,8 +551,12 @@ impl Store {
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
             Err(error) => return Err(error),
         };
-        // A temporary probe is safe: owner identities are never reused.
-        Ok(!try_lock(&file)?)
+        // Release a successful probe even if a concurrent fork inherited the descriptor.
+        let acquired = try_lock(&file)?;
+        if acquired {
+            unlock(&file);
+        }
+        Ok(!acquired)
     }
 
     /// Freeze liveness once per startup claim, even if an owner exits during a scan.
@@ -727,6 +731,13 @@ impl Store {
     }
 }
 
+impl Drop for Store {
+    fn drop(&mut self) {
+        // Closing this descriptor alone leaves the lock held if a fork has yet to exec.
+        unlock(&self.owner_lock);
+    }
+}
+
 /// File-descriptor-scoped registry lock; never unlink the lock inode.
 struct Lock<'a>(&'a File);
 fn lock_file<'a>(file: &'a File, cancel: &Cancellation) -> io::Result<Lock<'a>> {
@@ -740,10 +751,15 @@ fn lock_file<'a>(file: &'a File, cancel: &Cancellation) -> io::Result<Lock<'a>> 
 }
 impl Drop for Lock<'_> {
     fn drop(&mut self) {
-        // SAFETY: the borrowed descriptor remains live through this destructor.
-        unsafe {
-            libc::flock(self.0.as_raw_fd(), libc::LOCK_UN);
-        }
+        unlock(self.0);
+    }
+}
+
+/// Release the lock on the open file description, including any inherited copies.
+fn unlock(file: &File) {
+    // SAFETY: flock accepts a live descriptor and no pointers.
+    unsafe {
+        libc::flock(file.as_raw_fd(), libc::LOCK_UN);
     }
 }
 
@@ -1277,6 +1293,8 @@ mod tests {
         };
         let claiming = thread::spawn(move || Store::open(options).unwrap());
         observed.recv_timeout(Duration::from_secs(5)).unwrap();
+        // Model a child between fork and exec that still holds the close-on-exec descriptor.
+        let inherited_owner_lock = a.owner_lock.try_clone().unwrap();
         drop(a);
         release.send(()).unwrap();
         let b = claiming.join().unwrap();
@@ -1287,9 +1305,10 @@ mod tests {
         assert_eq!(
             entries.len(),
             1,
-            "the exiting owner's scratch must never be duplicated"
+            "the exiting owner's scratch must be recovered exactly once"
         );
         assert_eq!(entries[0].id, id);
+        drop(inherited_owner_lock);
     }
 
     /// R03/R07: failed staging leaves the complete previous checkpoint and its text reachable.

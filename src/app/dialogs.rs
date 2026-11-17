@@ -67,7 +67,11 @@ impl AppState {
         {
             PasteTarget::Field(self.field_generation)
         } else if self.editor_focused() && self.ready() && self.guard_request.is_none() {
-            PasteTarget::Tab(self.screen.tab)
+            if self.screen.stream.is_some() {
+                PasteTarget::ReadOnly
+            } else {
+                PasteTarget::Tab(self.screen.tab)
+            }
         } else {
             PasteTarget::Ignore
         }
@@ -140,10 +144,15 @@ impl AppState {
                 self.field_error = None;
             }
             Ok(picker::Outcome::File(path)) => {
+                let follow = picker.follow;
                 self.modal = None;
                 self.field_paste = None;
                 self.field_submit = None;
-                return self.tab_change(Action::Open(path));
+                return self.tab_change(if follow {
+                    Action::Follow(path)
+                } else {
+                    Action::Open(path)
+                });
             }
             Err(error) => self.field_message(&error),
         }

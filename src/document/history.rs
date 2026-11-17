@@ -267,3 +267,44 @@ impl Document {
         Ok(begin)
     }
 }
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::document::{Edit, OpenOptions, TextRange};
+
+    #[test]
+    fn undo_rejects_a_persisted_stream_marker() {
+        let mut document = Document::new(OpenOptions::default()).unwrap();
+        let cancel = Cancellation::default();
+        document
+            .apply(
+                document.revision(),
+                [Edit {
+                    range: TextRange::new(0, 0).unwrap(),
+                    text: "retained",
+                }],
+                &cancel,
+            )
+            .unwrap();
+        let previous = document.history.cursor;
+        document
+            .apply(
+                document.revision(),
+                [Edit {
+                    range: TextRange::new(0, 1).unwrap(),
+                    text: "R",
+                }],
+                &cancel,
+            )
+            .unwrap();
+        document
+            .history
+            .file
+            .write_all_at(&u64::MAX.to_le_bytes(), previous * 64 + 8)
+            .unwrap();
+        assert!(matches!(
+            document.undo(document.revision()),
+            Err(Error::CorruptStorage)
+        ));
+    }
+}

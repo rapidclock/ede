@@ -1,8 +1,8 @@
 # ede
 
 A Rust terminal text editor for macOS and Linux, built in reviewed stages.
-Current version **0.0.1-dev.7**. This version includes literal search, atomic
-replacement, and customizable syntax highlighting. See the
+Current version **0.0.1-dev.8**. This version adds streamed stdin and live file
+following. See the
 [MVP overview](specs/001_initial_mvp/overview.md),
 [Stage 6 validation record](specs/001_initial_mvp/06_search_and_replace.md#validation-record),
 and [Stage 7 validation record](specs/001_initial_mvp/07_syntax_highlighting.md#validation-record).
@@ -18,12 +18,30 @@ cargo run --locked
 cargo run --locked -- path/to/file.txt
 cargo run --locked -- first.txt second.txt
 cargo run --locked -- -- -filename.txt
+producer | cargo run --locked
+cargo run --locked < path/to/input.txt
+cargo run --locked -- --follow path/to/current.log
 ```
 
 Run in a terminal with a usable `TERM`, at least 40 columns by 8 rows. Smaller
 windows preserve work and show a resize prompt; return to a supported size to
 answer unsaved-change prompts. `--help` and `--version` work without a terminal.
-Reading document text from pipes belongs to Stage 8.
+
+Pipe, FIFO, and regular-file stdin open a read-only **Stdin** tab ahead of any
+named files. Use a foreground controlling terminal and leave stdout attached to
+a terminal. A clean text EOF converts the same tab into an editable, recoverable
+scratch. `--follow FILE` requires terminal stdin and accepts exactly one path.
+Actions → Follow File opens the same kind of read-only follower from the picker.
+
+Live tabs open at the tail. **Pause View** keeps the current viewport while
+ingestion continues. **Resume Follow** returns to the tail. Find searches the
+retained history, and moving away or selecting text pauses the view. Followers
+track pathname replacement and common truncations. Tab Details reports the
+latest detected boundary. Up to four live sources share an 8 GiB payload cap,
+with a 2 GiB cap per source. A stopped capture keeps its committed prefix and
+offers **Export Retained Copy** to a new path. A failed EOF conversion also
+offers **Retry Finish**. See the
+[Stage 8 validation record](specs/001_initial_mvp/08_pipes_and_follow.md#validation-record).
 
 Opening validates a private UTF-8 snapshot in the background. Its initial preview
 is read-only; Escape cancels preparation. Once ready, files remain editable
@@ -302,6 +320,8 @@ EDE_BENCH_MIB=1024 EDE_BENCH_CORPUS=ordinary EDE_BENCH_PEAK_RSS=1 \
   large_search_and_replace_benchmark -- --ignored --exact --nocapture
 cargo test --locked --test terminal isolated_tmux_editing_and_suspend_smoke \
   -- --ignored --exact --nocapture
+EDE_BENCH_CORPUS=ordinary cargo test --release --locked --test terminal \
+  sustained_piped_capture_benchmark -- --ignored --exact --nocapture
 ```
 
 The opt-in interactive benchmark generates an allocated file, opens it in a real

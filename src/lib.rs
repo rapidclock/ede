@@ -14,16 +14,17 @@ mod runtime;
 pub mod search;
 mod spool;
 pub mod status;
+mod stream;
 mod syntax;
 mod terminal;
 mod text;
 mod ui;
 
-use std::path::PathBuf;
 use std::{
     fmt, io,
     panic::{self, AssertUnwindSafe},
 };
+use std::{fs::File, io::IsTerminal, os::fd::AsFd, path::PathBuf};
 
 use status::StatusInbox;
 use terminal::{Signals, TerminalDriver, TerminalSession, UnixTerminal};
@@ -98,9 +99,65 @@ pub fn run_with_paths(paths: Vec<PathBuf>) -> Result<Exit, Failure> {
 /// Start the ede CLI with an executable that implements the private syntax protocol.
 #[doc(hidden)]
 pub fn run_cli(paths: Vec<PathBuf>, executable: Option<PathBuf>) -> Result<Exit, Failure> {
+    run_launch(paths, None, executable)
+}
+
+/// Validate CLI stream admission before terminal mode changes or recovery claims.
+#[doc(hidden)]
+pub fn run_launch(
+    paths: Vec<PathBuf>,
+    follow: Option<PathBuf>,
+    executable: Option<PathBuf>,
+) -> Result<Exit, Failure> {
+    use nix::sys::stat::{SFlag, fstat};
+    let stdin = io::stdin();
+    let terminal_input = stdin.is_terminal();
+    if paths.len() > TAB_LIMIT - usize::from(!terminal_input)
+        || (follow.is_some() && (!terminal_input || !paths.is_empty()))
+    {
+        return Err(Failure {
+            message: if follow.is_some() {
+                "--follow requires terminal stdin and exactly one file".into()
+            } else {
+                format!("Maximum {TAB_LIMIT} startup tabs, including Stdin")
+            },
+            code: 2,
+        });
+    }
+    terminal::validate_output()?;
+    let (terminal, source) = if terminal_input {
+        (UnixTerminal::default(), follow.map(stream::Source::Follow))
+    } else {
+        let kind = SFlag::from_bits_truncate(fstat(&stdin).map_err(io::Error::from)?.st_mode)
+            & SFlag::S_IFMT;
+        if !matches!(kind, SFlag::S_IFIFO | SFlag::S_IFREG) {
+            return Err(Failure::from(io::Error::other(
+                "interactive mode requires terminal, pipe, or regular-file stdin",
+            )));
+        }
+        let terminal = UnixTerminal::controlling().map_err(|error| {
+            io::Error::other(format!(
+                "piped input requires a foreground controlling terminal: {error}"
+            ))
+        })?;
+        let inherited = File::from(stdin.as_fd().try_clone_to_owned()?);
+        // Replacing fd 0 removes the extra pipe reader before spawning any helper.
+        nix::unistd::dup2_stdin(
+            terminal
+                .input()?
+                .ok_or_else(|| io::Error::other("missing controlling terminal"))?,
+        )
+        .map_err(io::Error::from)?;
+        (terminal, Some(stream::Source::Stdin(inherited)))
+    };
     provide_descriptor_headroom();
     let (_sender, inbox) = status::mailbox();
-    run_session(inbox, paths, executable)
+    run_validated(
+        inbox,
+        stream::Startup { paths, source },
+        executable,
+        terminal,
+    )
 }
 
 /// Raise the process's soft limit, when permitted, before opening document stores.
@@ -132,11 +189,28 @@ fn run_session(
         });
     }
     terminal::validate()?;
+    run_validated(
+        inbox,
+        stream::Startup {
+            paths,
+            source: None,
+        },
+        executable,
+        UnixTerminal::default(),
+    )
+}
+
+fn run_validated(
+    inbox: StatusInbox,
+    startup: stream::Startup,
+    executable: Option<PathBuf>,
+    terminal: UnixTerminal,
+) -> Result<Exit, Failure> {
     let launch_directory = std::env::current_dir()?;
     let recovery = recovery::Store::open(recovery::Options::environment()?)?;
     // Keep signal subscriptions alive through explicit restoration and the Drop retry.
     let signals = Signals::register()?;
-    let mut session = TerminalSession::new(UnixTerminal);
+    let mut session = TerminalSession::new(terminal);
     guarded(&mut session, |session| {
         session.acquire()?;
         runtime::run(
@@ -144,7 +218,7 @@ fn run_session(
             &signals,
             inbox,
             launch_directory,
-            paths,
+            startup,
             recovery,
             executable,
         )

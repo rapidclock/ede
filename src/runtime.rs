@@ -17,7 +17,7 @@ use crate::{
     app::{AppState, Intent},
     input::Input,
     status::{Severity, StatusInbox, StatusMessage},
-    terminal::{Signals, TerminalSession, UnixTerminal},
+    terminal::{Signals, TerminalOutput, TerminalSession, UnixTerminal},
     ui::{self, LayoutSnapshot},
 };
 
@@ -62,7 +62,7 @@ trait Host {
 
 /// Concrete session adapter; backend rendering and lifecycle ownership remain separate.
 struct TerminalHost<'a> {
-    terminal: Terminal<CrosstermBackend<io::Stdout>>,
+    terminal: Terminal<CrosstermBackend<TerminalOutput>>,
     session: &'a mut TerminalSession<UnixTerminal>,
     signals: &'a Signals,
     started: Instant,
@@ -88,8 +88,8 @@ impl Host for TerminalHost<'_> {
     }
     /// Read the backend dimensions without capability queries.
     fn area(&self) -> io::Result<Rect> {
-        let size = self.terminal.size()?;
-        Ok(Rect::new(0, 0, size.width, size.height))
+        let (width, height) = self.session.driver().size()?;
+        Ok(Rect::new(0, 0, width, height))
     }
     /// Forward signal flags without signal-handler I/O.
     fn termination(&self) -> Option<u8> {
@@ -133,28 +133,29 @@ pub(crate) fn run(
     signals: &Signals,
     inbox: StatusInbox,
     launch_directory: PathBuf,
-    paths: Vec<PathBuf>,
+    startup: crate::stream::Startup,
     recovery: crate::recovery::Store,
     syntax_program: Option<PathBuf>,
 ) -> io::Result<Exit> {
-    let (width, height) = crossterm::terminal::size()?;
+    let (width, height) = session.driver().size()?;
     // The event loop owns resize/layout changes. A fixed viewport prevents Ratatui
     // independently resizing between snapshot construction, drawing, and hit-testing.
     let terminal = Terminal::with_options(
-        CrosstermBackend::new(io::stdout()),
+        CrosstermBackend::new(session.driver().output()?),
         TerminalOptions {
             viewport: Viewport::Fixed(Rect::new(0, 0, width, height)),
         },
     )?;
     let picker = crate::picker::Picker::new()?;
+    let ingress = Ingress::new(session.driver().input()?)?;
     let mut host = TerminalHost {
         terminal,
         session,
         signals,
         started: Instant::now(),
-        ingress: Ingress::new()?,
+        ingress,
     };
-    let mut editor = Editor::new(launch_directory.clone(), paths, recovery, syntax_program)?;
+    let mut editor = Editor::new(launch_directory.clone(), startup, recovery, syntax_program)?;
     let highlighting = editor.highlighting_process();
     let mut app = AppState::new();
     app.set_launch_directory(launch_directory);
@@ -162,17 +163,25 @@ pub(crate) fn run(
         event_loop_impl(&mut host, inbox, Some(&mut editor), Some(&picker), app)
     }));
     host.ingress.stop();
+    let streamed = editor.streamed();
     let worker = editor.shutdown();
     let picker_worker = picker.shutdown();
     let restoration = host.session.restore();
     highlighting.pause();
-    host.ingress.join();
-    drop(host);
-    if let Some(worker) = worker {
-        let _ = worker.join();
+    if !streamed {
+        host.ingress.join();
     }
-    if let Some(worker) = picker_worker {
-        let _ = worker.join();
+    drop(host);
+    let deadline = Instant::now() + Duration::from_millis(250);
+    for worker in [worker, picker_worker].into_iter().flatten() {
+        if streamed {
+            while !worker.is_finished() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        if !streamed || worker.is_finished() {
+            let _ = worker.join();
+        }
     }
     match result {
         Ok(result) => {
@@ -441,6 +450,7 @@ fn effect(
                     action,
                     Action::New
                         | Action::Open(_)
+                        | Action::Follow(_)
                         | Action::Switch(_)
                         | Action::CycleTab(_)
                         | Action::RemoveTab(_)
