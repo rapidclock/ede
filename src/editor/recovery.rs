@@ -263,17 +263,17 @@ impl Coordinator {
 
     /// Admit restored tabs after explicit CLI files, leaving overflow in the catalog.
     pub(super) fn restore_startup(&mut self) -> Result<(), Error> {
-        let Some(retention) = &mut self.retention else {
-            return Ok(());
-        };
-        let mut entries = std::mem::take(&mut retention.startup);
-        let remaining = entries.split_off((crate::TAB_LIMIT - self.tabs.len()).min(entries.len()));
-        retention.startup = remaining;
         let had_cli = !self.tabs.is_empty();
         let mut active = None;
         let mut first = None;
-        for (entry, path) in entries.into_iter().take(crate::TAB_LIMIT - self.tabs.len()) {
+        while self.tab_slots_used() < crate::TAB_LIMIT
+            && self
+                .retention
+                .as_ref()
+                .is_some_and(|retention| !retention.startup.is_empty())
+        {
             let id = self.admit_tab(None)?;
+            let (entry, path) = self.retention.as_mut().unwrap().startup.remove(0);
             let state = self.state_mut(id).ok_or(Error::Closed)?;
             state.scratch = Some(RetainedScratch {
                 id: entry.id,
@@ -913,7 +913,12 @@ pub(super) mod tests {
         faults: Option<Arc<dyn FaultInjector>>,
         storage_faults: Option<Arc<dyn FaultInjector>>,
     ) -> (Coordinator, Receiver<Event>) {
-        coordinator_with_paths(root, faults, storage_faults, Vec::new())
+        let (mut coordinator, events) =
+            coordinator_with_paths(root, faults, storage_faults, Vec::new());
+        if coordinator.tabs.is_empty() {
+            coordinator.action(Action::New).unwrap();
+        }
+        (coordinator, events)
     }
 
     fn coordinator_with_paths(
@@ -1254,6 +1259,54 @@ pub(super) mod tests {
         assert!(retained.page(None).unwrap().is_empty());
     }
 
+    /// An admitted Cut after catalog removal must revoke the retired scratch identity.
+    #[test]
+    fn clipboard_cut_revokes_already_retired_scratch_close() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut worker, events) = coordinator(root.path(), None);
+        worker
+            .action(Action::Insert("preserve this".into()))
+            .unwrap();
+        worker.action(Action::Command(Command::SelectAll)).unwrap();
+        let tab = worker.tab.screen.tab.unwrap();
+        let original = worker.tab.scratch.as_ref().unwrap().id;
+        worker.retention.as_mut().unwrap().sweep = true;
+        poll_until(&mut worker, |worker| {
+            worker.tab.scratch.as_ref().unwrap().retained.is_some()
+        });
+        worker.discard(After::Close(tab), None);
+        poll_until(&mut worker, |worker| {
+            worker.tab.scratch.as_ref().unwrap().retiring
+        });
+        assert!(
+            matches!(events.recv_timeout(Duration::from_secs(5)).unwrap(), Event::Proceed(_, After::Close(id)) if id == tab)
+        );
+        worker
+            .action(Action::Clipboard {
+                cut: true,
+                system: Some(1),
+            })
+            .unwrap();
+        let scratch = worker.tab.scratch.as_ref().unwrap();
+        assert!(
+            !scratch.retiring,
+            "Cut retained stale scratch retirement authority"
+        );
+        assert_ne!(scratch.id, original);
+        assert!(worker.snapshot().unwrap().is_empty());
+        worker.action(Action::Command(Command::Paste)).unwrap();
+        assert_eq!(
+            worker
+                .snapshot()
+                .unwrap()
+                .read_window(ByteOffset(0), "preserve this".len())
+                .unwrap()
+                .text(),
+            "preserve this"
+        );
+        shutdown(worker);
+    }
+
     /// Toggle a real post-publication failure without changing the application or test environment.
     #[derive(Debug, Default)]
     struct UncertainRemoval {
@@ -1550,6 +1603,69 @@ pub(super) mod tests {
                 .text(),
             "recover me"
         );
+        shutdown(worker);
+    }
+
+    /// An in-flight cancellation keeps its charge, then hands that slot to retained work.
+    #[test]
+    fn cancelled_startup_open_releases_slot_for_recovery_after_settlement() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut first, _events) = coordinator(root.path(), None);
+        first
+            .action(Action::Insert("recover after cancellation".into()))
+            .unwrap();
+        first.retention.as_mut().unwrap().sweep = true;
+        poll_until(&mut first, |worker| {
+            worker.tab.scratch.as_ref().unwrap().retained.is_some()
+        });
+        let retained = first.tab.scratch.as_ref().unwrap().id;
+        shutdown(first);
+
+        let paths: Vec<_> = (0..crate::TAB_LIMIT)
+            .map(|index| {
+                let path = root.path().join(format!("input-{index}"));
+                std::fs::write(&path, "candidate").unwrap();
+                path
+            })
+            .collect();
+        let (entered, reached) = mpsc::sync_channel(1);
+        let (release, held) = mpsc::sync_channel(1);
+        let gate = Arc::new(Gate {
+            entered,
+            release: Mutex::new(held),
+            armed: AtomicBool::new(true),
+            point: IoPoint::Read,
+        });
+        let (mut worker, _events) = coordinator_with_paths(root.path(), None, Some(gate), paths);
+        let tab = worker.tab.screen.tab.unwrap();
+        reached.recv_timeout(Duration::from_secs(5)).unwrap();
+        worker.cancel_open(tab).unwrap();
+        assert_eq!(worker.tab_slots_used(), crate::TAB_LIMIT);
+        assert_eq!(worker.retention.as_ref().unwrap().startup.len(), 1);
+        release.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            worker.receive().unwrap();
+            if worker
+                .tabs
+                .iter()
+                .filter_map(|tab| worker.state(tab.id))
+                .any(|state| {
+                    state
+                        .scratch
+                        .as_ref()
+                        .is_some_and(|scratch| scratch.id == retained)
+                })
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "cancelled open did not release recovery capacity"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(worker.tabs.len(), crate::TAB_LIMIT);
         shutdown(worker);
     }
 

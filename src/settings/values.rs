@@ -72,15 +72,18 @@ impl Scalar {
 
 /// Explicit overrides are separate from their effective defaults.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) struct Values([Option<u64>; 4]);
+pub(crate) struct Values {
+    scalars: [Option<u64>; 4],
+    pub(crate) system_clipboard_override: Option<bool>,
+}
 
 impl Values {
     pub fn set(&mut self, setting: Scalar, value: Option<u64>) {
-        self.0[setting as usize] = value;
+        self.scalars[setting as usize] = value;
     }
 
     pub fn override_value(self, setting: Scalar) -> Option<u64> {
-        self.0[setting as usize]
+        self.scalars[setting as usize]
     }
 
     pub fn get(self, setting: Scalar) -> u64 {
@@ -90,6 +93,11 @@ impl Values {
 
     pub fn checkpoint(self) -> Duration {
         Duration::from_secs(self.get(Scalar::Checkpoint))
+    }
+
+    /// System clipboard requests require an explicit applied opt-in.
+    pub fn copy_to_system(self) -> bool {
+        self.system_clipboard_override.unwrap_or(false)
     }
 
     pub fn syntax(self) -> SyntaxLimits {

@@ -3,6 +3,8 @@
 use super::*;
 use crate::settings::{Base, Chord, Revision, SaveState, Scalar, Update};
 
+const GENERAL_ROWS: usize = Scalar::ALL.len() + 1;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Operation {
     Scalar(Scalar),
@@ -123,7 +125,11 @@ impl Draft {
     }
 
     fn index(&self) -> usize {
-        self.selected.saturating_sub(Scalar::ALL.len())
+        self.selected.saturating_sub(GENERAL_ROWS)
+    }
+
+    fn clipboard_row(&self) -> bool {
+        self.selected == Scalar::ALL.len()
     }
 
     fn changed(&self) -> bool {
@@ -133,12 +139,22 @@ impl Draft {
     fn row_label(&self) -> String {
         if let Some(scalar) = self.scalar() {
             format!("{} {}", scalar.label(), self.revision.values.get(scalar))
+        } else if self.clipboard_row() {
+            let state = if self.revision.values.copy_to_system() {
+                "On"
+            } else {
+                "Off"
+            };
+            format!("Copy to system clipboard [{state}]")
         } else {
             self.revision.map.rows[self.index()].identifier()
         }
     }
 
     fn detail(&self) -> String {
+        if self.clipboard_row() {
+            return "Edit toggles • default Off".into();
+        }
         if let Some(scalar) = self.scalar() {
             return format!(
                 "Range 1–{} • default {}",
@@ -249,7 +265,7 @@ impl Draft {
                         "{state}{}  {}/{}",
                         if self.changed() { " • Draft" } else { "" },
                         self.selected + 1,
-                        Scalar::ALL.len() + self.revision.map.rows.len()
+                        GENERAL_ROWS + self.revision.map.rows.len()
                     ),
                 ),
                 (2, self.row_label()),
@@ -362,7 +378,7 @@ impl Draft {
             self.selected = self
                 .selected
                 .saturating_add_signed(delta)
-                .min(Scalar::ALL.len() + self.revision.map.rows.len() - 1);
+                .min(GENERAL_ROWS + self.revision.map.rows.len() - 1);
             self.chord = 0;
         } else if self.page == Page::Binding {
             self.chord = self.chord.saturating_add_signed(delta).min(
@@ -564,7 +580,7 @@ impl AppState {
                 return None;
             }
             Command::Move(movement, _) => {
-                let count = Scalar::ALL.len() + draft.revision.map.rows.len();
+                let count = GENERAL_ROWS + draft.revision.map.rows.len();
                 let step = match movement {
                     Movement::Up | Movement::Left => -1,
                     Movement::Down | Movement::Right => 1,
@@ -692,7 +708,14 @@ impl AppState {
             B::Back if page == Page::Options => self.settings_page(Page::List, B::Edit),
             B::Close | B::Back => self.settings_back(layout),
             B::Edit => {
-                if let Some(scalar) = draft.scalar() {
+                if draft.clipboard_row() {
+                    if writable {
+                        draft.revision.values.system_clipboard_override =
+                            Some(!draft.revision.values.copy_to_system());
+                        draft.validate();
+                        self.dirty = true;
+                    }
+                } else if let Some(scalar) = draft.scalar() {
                     if writable {
                         draft.field = draft.revision.values.get(scalar).to_string();
                         self.switch_settings(
@@ -859,7 +882,7 @@ mod tests {
             .iter()
             .position(|row| row.command == Command::Settings)
             .unwrap()
-            + Scalar::ALL.len();
+            + GENERAL_ROWS;
         draft.page = Page::Capture(Operation::Add);
         let area = Rect::new(0, 0, 40, 8);
         let layout = LayoutSnapshot::for_app(area, &app, 1);
@@ -887,7 +910,7 @@ mod tests {
         let mut app = AppState::new();
         app.open_settings();
         let draft = app.settings_ui.as_mut().unwrap();
-        draft.selected = Scalar::ALL.len();
+        draft.selected = GENERAL_ROWS;
         draft.page = Page::Capture(Operation::Add);
         let area = Rect::new(0, 0, 40, 8);
         let escape = |kind| {

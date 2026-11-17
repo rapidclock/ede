@@ -146,6 +146,21 @@ fn parse(text: &str) -> io::Result<Revision> {
         }
     }
     settings.map.revalidate().map_err(invalid)?;
+    if let Some(clipboard) = table.remove("clipboard") {
+        let Value::Table(entries) = clipboard else {
+            return Err(invalid("clipboard: expected table"));
+        };
+        for (key, value) in entries {
+            if key != "copy_to_system" {
+                return Err(invalid(format!("clipboard.{key}: unknown setting")));
+            }
+            settings.values.system_clipboard_override = Some(
+                value
+                    .as_bool()
+                    .ok_or_else(|| invalid("clipboard.copy_to_system: expected boolean"))?,
+            );
+        }
+    }
     for (name, entries) in table {
         if !matches!(name.as_str(), "recovery" | "highlighting") {
             return Err(invalid(format!("{name}: unknown setting")));
@@ -292,6 +307,14 @@ fn serialize(base: &Base, draft: &Revision) -> io::Result<String> {
         draft.values,
         &mut comments,
     )?;
+    if previous.values.system_clipboard_override != draft.values.system_clipboard_override {
+        let clipboard = table(doc.as_table_mut(), "clipboard")?;
+        if let Some(value) = draft.values.system_clipboard_override {
+            change(clipboard, "copy_to_system", toml_edit::value(value));
+        } else {
+            remove(clipboard, "copy_to_system", &mut comments);
+        }
+    }
     for (before, after) in previous.map.rows.iter().zip(&draft.map.rows) {
         if before.override_keys == after.override_keys {
             continue;

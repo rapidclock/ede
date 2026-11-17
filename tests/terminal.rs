@@ -396,7 +396,16 @@ impl PtyChild {
 
     /// Keep the parent shell alive until attributes are captured; macOS revokes a PTY on hangup.
     fn editor() -> Self {
-        Self::editor_with_term(Some("xterm-256color"))
+        let mut process = Self::editor_with_term(Some("xterm-256color"));
+        process.new_scratch();
+        process
+    }
+
+    /// Create the scratch needed by a fixture through the regular New command.
+    fn new_scratch(&mut self) {
+        self.expect_body("New Scratch", TIMEOUT);
+        self.send(b"\x0e");
+        self.expect_status("Ready");
     }
 
     /// Read all currently available output without blocking.
@@ -550,10 +559,54 @@ impl PtyChild {
         }
     }
 
+    /// Wait for the bracketed tab and its active terminal attributes.
+    fn expect_active_tab(&mut self, label: &str) {
+        let deadline = Instant::now() + TIMEOUT;
+        loop {
+            self.drain();
+            let screen = self.parser.screen();
+            let strip = screen.rows(0, 80).next().unwrap();
+            if let Some(start) = strip.find(label)
+                && screen
+                    .cell(
+                        0,
+                        unicode_width::UnicodeWidthStr::width(&strip[..start]) as u16,
+                    )
+                    .is_some_and(|cell| cell.inverse())
+            {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "active tab {label:?} missing: {strip}"
+            );
+            thread::sleep(Duration::from_millis(2));
+        }
+    }
+
     /// Separate subsequent assertions from text drawn by earlier frames.
     fn reset_output(&mut self) {
         self.drain();
         self.output.clear();
+    }
+
+    /// Send complete SGR button presses over a visible ASCII label.
+    fn click_label(&mut self, label: &str, count: usize) {
+        self.expect(label);
+        let (row, column) = self
+            .parser
+            .screen()
+            .rows(0, 80)
+            .enumerate()
+            .find_map(|(row, text)| {
+                text.find(label).map(|start| {
+                    let column = unicode_width::UnicodeWidthStr::width(&text[..start]);
+                    (row + 1, column + 1)
+                })
+            })
+            .unwrap();
+        let click = format!("\x1b[<0;{column};{row}M\x1b[<0;{column};{row}m");
+        self.send(click.repeat(count).as_bytes());
     }
 
     /// Send actual bytes a conventional terminal would transmit.
@@ -1338,7 +1391,7 @@ fn settings_capture_and_dirty_confirmation_at_minimum_size() {
     process.resize(40, 8);
     process.send(b"\x1b[20~");
     process.expect("Checkpoint interval (s)");
-    process.send(&b"\x1b[B".repeat(4));
+    process.send(&b"\x1b[B".repeat(5));
     process.expect("controls.activate");
     process.send(b"\x1b[<0;5;6M\x1b[<0;5;6m"); // Edit.
     process.expect("Default 1/1 Enter");
@@ -1576,7 +1629,7 @@ fn scratch_quit_and_relaunch_retains_text_without_save_prompts() {
         std::iter::empty::<&str>(),
         Some(&profile),
     );
-    first.expect("Ready");
+    first.new_scratch();
     first.send("retained scratch 界e\u{301}".as_bytes());
     first.expect_body("retained scratch", TIMEOUT);
     first.send(b"\x11");
@@ -1605,7 +1658,7 @@ fn replaced_scratch_is_restored_after_normal_quit() {
         std::iter::empty::<&str>(),
         Some(&profile),
     );
-    first.expect("Ready");
+    first.new_scratch();
     first.send(b"one two one\x08one\t1\t\t\t\t\t\t\t\r");
     first.expect("Replace all — confirm scope");
     first.send(b"\t\r");
@@ -1656,7 +1709,7 @@ fn xdg_state_root_works_without_home() {
     ]);
     command.env("XDG_STATE_HOME", directory.path());
     let mut process = PtyChild::spawn(command);
-    process.expect_status("Ready");
+    process.new_scratch();
     process.send(b"\x11");
     assert!(process.wait().success());
     assert!(directory.path().join("ede/catalog").exists());
@@ -1720,9 +1773,9 @@ fn independent_instances_restore_overflow_and_open_after_freeing_a_slot() {
         )
     };
     let mut a = launch();
-    a.expect_status("Ready");
+    a.new_scratch();
     let mut b = launch();
-    b.expect_status("Ready");
+    b.new_scratch();
     a.send(&[0x0e; 32]);
     a.expect("Untitled 33");
     b.send(&[0x0e; 32]);
@@ -1751,11 +1804,11 @@ fn independent_instances_restore_overflow_and_open_after_freeing_a_slot() {
     c.send(b"\x17");
     c.expect("Unsaved changes");
     c.send(b"\t\t\r");
-    c.expect("> ~Untitled 34");
+    c.expect_active_tab("[~Untitled 34]");
     c.send(&recovery_menu);
     c.expect("Scratch 65");
     c.send(b"\r");
-    c.expect("> ~Untitled 65");
+    c.expect_active_tab("[~Untitled 65]");
     c.send(b"\x11");
     assert!(c.wait().success());
     c.assert_restored();
@@ -1804,7 +1857,7 @@ fn cancel_quit_preserves_tabs_after_earlier_discard_choice() {
     process.send(b"first-unsaved");
     process.expect_body("first-unsaved", TIMEOUT);
     process.send(b"\x1b[19~");
-    process.expect("> second.txt");
+    process.expect_active_tab("[second.txt]");
     process.send(b"second-unsaved");
     process.expect_body("second-unsaved", TIMEOUT);
     process.send(b"\x11");
@@ -1848,6 +1901,239 @@ fn picker_browses_directories_and_opens_literal_pasted_path() {
     process.send(b"\x11");
     assert!(process.wait().success());
     process.assert_restored();
+}
+
+/// A double click uses the same file/directory activation as keyboard Enter.
+#[test]
+fn picker_double_click_enters_folder_and_opens_file() {
+    let directory = tempfile::tempdir().unwrap();
+    let original = directory.path().join("original.txt");
+    let folder = directory.path().join("nested");
+    std::fs::create_dir(&folder).unwrap();
+    std::fs::write(&original, "original").unwrap();
+    std::fs::write(folder.join("picked.txt"), "selected file payload").unwrap();
+    let mut process = PtyChild::editor_with_path(Some("xterm-256color"), Some(&original));
+    process.expect_status("Ready");
+    process.send(b"\x0f");
+    process.expect("Open file");
+    process.click_label("nested/", 2);
+    process.click_label("picked.txt", 2);
+    process.expect_body("selected file payload", TIMEOUT);
+    process.send(b"\x11");
+    assert!(process.wait().success());
+    process.assert_restored();
+}
+
+/// No-argument launch presents existing commands without allocating a scratch.
+#[test]
+fn fresh_launch_waits_for_explicit_new_scratch() {
+    let state = tempfile::tempdir().unwrap();
+    let profile = state.path().join("state");
+    let launch =
+        || PtyChild::editor_with_state(Some("xterm-256color"), [] as [&str; 0], Some(&profile));
+    let mut process = launch();
+    process.expect_body("Open File (Ctrl+O)", TIMEOUT);
+    process.expect_body("New Scratch (Ctrl+N)", TIMEOUT);
+    process.expect_absent("Untitled");
+    process.send(b"\x11");
+    assert!(process.wait().success());
+    let mut process = launch();
+    process.expect_body("New Scratch (Ctrl+N)", TIMEOUT);
+    process.click_label("New Scratch (Ctrl+N)", 1);
+    process.expect_status("Ready");
+    process.expect("Untitled 1");
+    process.send(b"retained welcome scratch");
+    process.expect_body("retained welcome scratch", TIMEOUT);
+    process.send(b"\x11");
+    assert!(process.wait().success());
+    process.assert_restored();
+
+    let missing = state.path().join("missing-startup");
+    let mut process =
+        PtyChild::editor_with_state(Some("xterm-256color"), [&missing], Some(&profile));
+    process.expect("Open missing-startup:");
+    process.send(b"\r");
+    process.expect_body("retained welcome scratch", TIMEOUT);
+    process.expect_active_tab("[~Untitled 1]");
+    process.expect_absent("Untitled 2");
+    process.send(b"\x11");
+    assert!(process.wait().success());
+}
+
+/// Opt-in system copy sends an OSC 52 write as well as filling the internal clipboard.
+#[test]
+fn enabled_system_copy_sends_terminal_clipboard_request() {
+    let directory = tempfile::tempdir().unwrap();
+    let config = directory.path().join("ede");
+    std::fs::create_dir(&config).unwrap();
+    std::fs::write(
+        config.join("config.toml"),
+        "[clipboard]\ncopy_to_system = true\n",
+    )
+    .unwrap();
+    let file = directory.path().join("clip.txt");
+    std::fs::write(&file, "界\nz").unwrap();
+    let mut process = PtyChild::editor_with_options(
+        Some("xterm-256color"),
+        [&file],
+        None,
+        Some(directory.path()),
+        None,
+    );
+    process.expect_status("Ready");
+    process.send(b"\x01\x03");
+    process.expect_raw("\x1b]52;c;55WMCno=\x1b\\");
+    process.expect_status("Clipboard request sent");
+    process.send(b"\x11");
+    assert!(process.wait().success());
+    process.assert_restored();
+}
+
+/// A temporarily paused terminal reader must not lose the session mid-frame.
+#[test]
+fn maximum_clipboard_frame_survives_a_paced_terminal_reader() {
+    use base64::Engine;
+
+    let directory = tempfile::tempdir().unwrap();
+    let config = directory.path().join("ede");
+    std::fs::create_dir(&config).unwrap();
+    std::fs::write(
+        config.join("config.toml"),
+        "[clipboard]\ncopy_to_system = true\n",
+    )
+    .unwrap();
+    let file = directory.path().join("clip.txt");
+    let bytes = vec![b'x'; 8 * 1024];
+    std::fs::write(&file, &bytes).unwrap();
+    let mut process = PtyChild::editor_with_options(
+        Some("xterm-256color"),
+        [&file],
+        None,
+        Some(directory.path()),
+        None,
+    );
+    process.resize(40, 8);
+    process.expect_status("Ready");
+    process.send(b"\x01");
+    process.expect_status("Col 8193");
+    process.reset_output();
+    process.send(b"\x18");
+    let mut prefix = Vec::new();
+    let deadline = Instant::now() + TIMEOUT;
+    while !prefix.ends_with(b"\x1b]52;") {
+        let mut byte = [0];
+        match process.master.read(&mut byte) {
+            Ok(1) => prefix.push(byte[0]),
+            Ok(_) => thread::sleep(Duration::from_millis(1)),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(1));
+            }
+            Err(error) => panic!("PTY read: {error}"),
+        }
+        assert!(Instant::now() < deadline, "clipboard frame did not begin");
+    }
+    thread::sleep(Duration::from_millis(150));
+    process.parser.process(&prefix);
+    process.output.extend_from_slice(&prefix);
+    let payload = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    process.expect_raw(&format!("\x1b]52;c;{payload}\x1b\\"));
+    process.expect_status("Clipboard request sent");
+    process.send(b"\x16\x13");
+    process.expect_status("Saved");
+    assert_eq!(std::fs::read(file).unwrap(), bytes);
+    process.send(b"\x11");
+    assert!(process.wait().success());
+    process.assert_restored();
+}
+
+/// Active stdin can copy by way of the controlling terminal, while Cut stays read-only.
+#[test]
+fn system_clipboard_uses_the_separate_tty_during_a_pipe() {
+    let directory = tempfile::tempdir().unwrap();
+    let config = directory.path().join("ede");
+    std::fs::create_dir(&config).unwrap();
+    std::fs::write(
+        config.join("config.toml"),
+        "[clipboard]\ncopy_to_system = true\n",
+    )
+    .unwrap();
+    let (mut process, mut producer) = piped_editor_with_options(&[], Some(directory.path()));
+    producer.write_all(b"abc\n").unwrap();
+    process.expect_body("abc", TIMEOUT);
+    process.expect_status("User config");
+    process.send(b"\x01\x03");
+    process.expect_raw("\x1b]52;c;YWJjCg==\x1b\\");
+    process.reset_output();
+    process.send(b"\x18");
+    process.expect_status("Document is read-only");
+    assert!(!process.output.windows(5).any(|bytes| bytes == b"\x1b]52;"));
+    drop(producer);
+    process.expect_status("Editable scratch");
+    process.send(b"\x11");
+    assert!(process.wait().success());
+    process.assert_restored();
+}
+
+/// Apply the clipboard toggle only through saved Settings and default it off in safe mode.
+#[test]
+fn system_clipboard_settings_saves_and_safe_config_uses_internal_copy() {
+    let directory = tempfile::tempdir().unwrap();
+    let config = directory.path().join("ede");
+    std::fs::create_dir(&config).unwrap();
+    let config_file = config.join("config.toml");
+    std::fs::write(&config_file, "[keybindings.global]\nsettings = ['F9']\n").unwrap();
+    let source = directory.path().join("source.txt");
+    std::fs::write(&source, b"abc").unwrap();
+    let mut process = PtyChild::editor_with_options(
+        Some("xterm-256color"),
+        [&source],
+        None,
+        Some(directory.path()),
+        None,
+    );
+    process.expect_status("Ready");
+    process.send(b"\x01\x03");
+    process.expect_status("Copied internally");
+    assert!(!process.output.windows(5).any(|bytes| bytes == b"\x1b]52;"));
+    process.send(b"\x1b[20~");
+    process.expect("Checkpoint interval (s)");
+    process.send(&b"\x1b[B".repeat(4));
+    process.expect("Copy to system clipboard [Off]");
+    process.send(b"\r");
+    process.expect("Copy to system clipboard [On]");
+    assert!(
+        !std::fs::read_to_string(&config_file)
+            .unwrap()
+            .contains("copy_to_system")
+    );
+    process.send(b"\t\r");
+    process.expect("Save Settings");
+    process.send(b"\r");
+    process.expect_status("Settings saved");
+    assert!(
+        std::fs::read_to_string(&config_file)
+            .unwrap()
+            .contains("copy_to_system = true")
+    );
+    process.send(b"\x1b");
+    process.expect_absent("Copy to system clipboard");
+    process.send(b"\x01\x03");
+    process.expect_raw("\x1b]52;c;YWJj\x1b\\");
+    process.send(b"\x11");
+    assert!(process.wait().success());
+    let mut safe = PtyChild::editor_with_options(
+        Some("xterm-256color"),
+        [std::ffi::OsStr::new("--safe-config"), source.as_os_str()],
+        None,
+        Some(directory.path()),
+        None,
+    );
+    safe.expect_status("Ready");
+    safe.send(b"\x01\x03");
+    safe.expect_status("Copied internally");
+    assert!(!safe.output.windows(5).any(|bytes| bytes == b"\x1b]52;"));
+    safe.send(b"\x11");
+    assert!(safe.wait().success());
 }
 
 /// Earlier accepted input is applied before a close prompt, even at a fresh tab.
@@ -1928,8 +2214,8 @@ fn startup_reports_each_failure_and_falls_back() {
     process.expect("Details");
     process.send(b"\r");
     process.expect_absent("Details");
-    process.expect_status("Ready");
-    process.expect("Untitled 1");
+    process.expect_body("New Scratch (Ctrl+N)", TIMEOUT);
+    process.expect_absent("Untitled 1");
     process.send(b"\x11");
     assert!(process.wait().success());
     process.assert_restored();
@@ -1999,7 +2285,7 @@ fn suspend_and_resume_under_job_control() {
         .as_bytes(),
     );
     process.expect_status("User config");
-    process.expect_status("Ready");
+    process.expect_body("New Scratch", TIMEOUT);
     let foreground = process.editor_pid();
     process.reset_output();
     process.send(b"\x1bOP");
@@ -2298,7 +2584,6 @@ fn large_recovery_and_refresh_benchmark() {
 #[test]
 #[ignore = "large-file benchmark: run explicitly with EDE_BENCH_MIB and EDE_BENCH_CORPUS"]
 fn large_file_interactive_benchmark() {
-    use std::os::unix::fs::FileExt;
     let mib: u64 = std::env::var("EDE_BENCH_MIB")
         .unwrap_or_else(|_| "1024".into())
         .parse()
@@ -2349,8 +2634,10 @@ fn large_file_interactive_benchmark() {
     process.expect_with_timeout("Ready", Duration::from_secs(120));
     let ready = started.elapsed();
     process.send(b"\x1b[19~");
+    process.expect_active_tab("[companion.txt]");
     process.expect_body("Companion tab", TIMEOUT);
     process.send(b"\x1b[18~");
+    process.expect_active_tab("[allocated.txt]");
     process.expect_body(first, TIMEOUT);
     let pid = process.editor_pid();
     let rss = || {
@@ -2376,7 +2663,8 @@ fn large_file_interactive_benchmark() {
     process.send(b"\x07");
     process.expect("Go to line[:cell]");
     let middle = if corpus == "long" {
-        format!("1:{}", length / 2 + 1)
+        // The first 40 edits already shifted the original midpoint by 40 cells.
+        format!("1:{}", length / 2 + 41)
     } else {
         format!("{}", lines / 2 + 1)
     };
@@ -2402,11 +2690,6 @@ fn large_file_interactive_benchmark() {
         latency[latency.len() * 95 / 100],
         latency.last().unwrap()
     );
-    let file = File::open(&path).unwrap();
-    let mut bytes = [0; 40];
-    file.read_exact_at(&mut bytes, 0).unwrap();
-    assert_eq!(&bytes, b"ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ");
-    assert_eq!(file.metadata().unwrap().len(), length + 42);
     // The later D was not in the captured save, so normal quit must still protect it.
     process.send(b"\x11");
     process.expect("Unsaved changes");
@@ -2414,19 +2697,84 @@ fn large_file_interactive_benchmark() {
     assert!(process.wait().success());
     process.assert_restored();
     process.report_peak_rss();
+    let file = File::open(&path).unwrap();
+    assert_eq!(file.metadata().unwrap().len(), length + 42);
+    let mut reader = io::BufReader::new(file);
+    let mut actual = vec![0; chunk.len()];
+    check_saved_chunk(&mut reader, &mut actual, &[b'Z'; 40]);
+    let mut remaining = length;
+    let mut newlines = lines / 2;
+    let mut inserted = false;
+    while remaining > 0 {
+        let count = remaining.min(chunk.len() as u64) as usize;
+        let expected = &chunk[..count];
+        let middle = if inserted {
+            None
+        } else if corpus == "long" {
+            let start = length - remaining;
+            (start..start + count as u64)
+                .contains(&(length / 2))
+                .then(|| (length / 2 - start) as usize)
+        } else if newlines == 0 {
+            Some(0)
+        } else {
+            memchr::memchr_iter(b'\n', expected).find_map(|index| {
+                newlines -= 1;
+                (newlines == 0).then_some(index + 1)
+            })
+        };
+        if let Some(middle) = middle {
+            check_saved_chunk(&mut reader, &mut actual, &expected[..middle]);
+            check_saved_chunk(&mut reader, &mut actual, b"B");
+            check_saved_chunk(&mut reader, &mut actual, &expected[middle..]);
+            inserted = true;
+        } else {
+            check_saved_chunk(&mut reader, &mut actual, expected);
+        }
+        remaining -= count as u64;
+    }
+    assert!(inserted, "expected a middle edit");
+    check_saved_chunk(&mut reader, &mut actual, b"C");
+    assert_eq!(reader.read(&mut actual).unwrap(), 0);
+}
+
+/// Compare all saved bytes in chunks without loading a file-sized expected value.
+fn check_saved_chunk(reader: &mut impl Read, actual: &mut [u8], expected: &[u8]) {
+    let actual = &mut actual[..expected.len()];
+    reader.read_exact(actual).unwrap();
+    if actual != expected {
+        let first = actual
+            .iter()
+            .zip(expected)
+            .position(|(actual, expected)| actual != expected)
+            .unwrap();
+        panic!(
+            "saved chunk differs at byte {first} ({} vs {})",
+            actual[first], expected[first]
+        );
+    }
 }
 
 /// Search/replace over a real larger-than-cache fixture while measuring live input.
 #[test]
 #[ignore = "search resource benchmark: EDE_BENCH_MIB=1024 EDE_BENCH_CORPUS=ordinary|dense|long"]
 fn large_search_and_replace_benchmark() {
-    use std::os::unix::fs::FileExt;
     let mib: u64 = std::env::var("EDE_BENCH_MIB")
         .unwrap_or_else(|_| "1024".into())
         .parse()
         .unwrap();
     let corpus = std::env::var("EDE_BENCH_CORPUS").unwrap_or_else(|_| "ordinary".into());
     assert!(mib > 0);
+    let marker_stride = std::env::var("EDE_BENCH_MARKER_STRIDE_MIB")
+        .map_or(1, |value| value.parse::<u64>().unwrap());
+    assert!(marker_stride > 0);
+    let matches = mib.div_ceil(marker_stride);
+    let has_exact_count = |screen: &str, label: &str| {
+        let count = format!("{matches} {label}");
+        screen
+            .match_indices(&count)
+            .any(|(index, _)| index == 0 || !screen.as_bytes()[index - 1].is_ascii_digit())
+    };
     let pattern: &[u8] = match corpus.as_str() {
         "ordinary" => b"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef012\n",
         "dense" => b"x\n",
@@ -2439,10 +2787,16 @@ fn large_search_and_replace_benchmark() {
     for (index, byte) in chunk.iter_mut().enumerate() {
         *byte = pattern[index % pattern.len()];
     }
-    chunk[..10].copy_from_slice(b"SEEK_TOKEN");
+    let mut marked = chunk.clone();
+    marked[..10].copy_from_slice(b"SEEK_TOKEN");
     let mut file = File::create(&path).unwrap();
     for index in 0..mib {
-        file.write_all(&chunk).unwrap();
+        let block = if index.is_multiple_of(marker_stride) {
+            &marked
+        } else {
+            &chunk
+        };
+        file.write_all(block).unwrap();
         if (index + 1).is_multiple_of(8) {
             file.sync_data().unwrap();
         }
@@ -2450,7 +2804,7 @@ fn large_search_and_replace_benchmark() {
     file.sync_all().unwrap();
     drop(file);
     eprintln!(
-        "search fixture_ready corpus={corpus} bytes={} warm",
+        "search fixture_ready corpus={corpus} bytes={} marker_stride_MiB={marker_stride} warm",
         mib << 20
     );
     let started = Instant::now();
@@ -2475,13 +2829,8 @@ fn large_search_and_replace_benchmark() {
     process.send(b"\x06SEEK_TOKEN\r");
     let scan_started = Instant::now();
     process.expect_with_timeout("exact match differs", Duration::from_secs(120));
-    assert!(
-        process
-            .parser
-            .screen()
-            .contents()
-            .contains(&format!("{mib} matches"))
-    );
+    let screen = process.parser.screen().contents();
+    assert!(has_exact_count(&screen, "matches"), "{screen}");
     let scan = scan_started.elapsed();
     process.send(b"\x06\x7f\x7f\x7f\x7f\x7f\x7f\x7f\x7f\x7f\x7f");
     process.send(if corpus == "ordinary" { b"0\r" } else { b"x\r" });
@@ -2518,22 +2867,25 @@ fn large_search_and_replace_benchmark() {
     let replace_started = Instant::now();
     process.send(b"\t\r");
     process.expect_with_timeout(
-        &format!("{mib} occurrences processed"),
+        &format!("{matches} occurrences processed"),
         Duration::from_secs(180),
+    );
+    let screen = process.parser.screen().contents();
+    assert!(
+        has_exact_count(&screen, "occurrences processed"),
+        "{screen}"
     );
     let replacement = replace_started.elapsed();
     peak_rss = peak_rss.max(rss());
     process.send(b"\x1b");
     process.expect_absent("Replace all…");
+    let save_started = Instant::now();
     process.send(b"\x13");
-    process.expect_with_timeout("Saved", Duration::from_secs(120));
-    let file = File::open(&path).unwrap();
-    assert_eq!(file.metadata().unwrap().len(), (mib << 20) + 40);
-    let mut bytes = [0; 10];
-    for block in [0, mib / 2, mib - 1] {
-        file.read_exact_at(&mut bytes, (block << 20) + 40).unwrap();
-        assert_eq!(&bytes, b"FOUND_DONE");
-    }
+    // Guarded Save rereads both the destination and the private captured revision.
+    // Allow proportionally more time to verify a published larger-than-RAM file.
+    let save_timeout = Duration::from_secs(120.max(mib.div_ceil(1024) * 60));
+    process.expect_with_timeout("Saved", save_timeout);
+    let saved = save_started.elapsed();
     process.send(b"\x1a");
     process.expect_body("SEEK_TOKEN", TIMEOUT);
     process.send(b"\x11");
@@ -2542,13 +2894,29 @@ fn large_search_and_replace_benchmark() {
     assert!(process.wait().success());
     process.assert_restored();
     process.report_peak_rss();
+    let file = File::open(&path).unwrap();
+    assert_eq!(file.metadata().unwrap().len(), (mib << 20) + 40);
+    let mut reader = io::BufReader::new(file);
+    let mut actual = vec![0; chunk.len()];
+    check_saved_chunk(&mut reader, &mut actual, &[b'Z'; 40]);
+    marked[..10].copy_from_slice(b"FOUND_DONE");
+    for index in 0..mib {
+        let block = if index.is_multiple_of(marker_stride) {
+            &marked
+        } else {
+            &chunk
+        };
+        check_saved_chunk(&mut reader, &mut actual, block);
+    }
+    assert_eq!(reader.read(&mut actual).unwrap(), 0);
     latency.sort_by(f64::total_cmp);
     eprintln!(
-        "search_ui corpus={corpus} MiB={mib} first_text_ms={:.3} ready_ms={:.3} full_scan_ms={:.3} replace_ms={:.3} cancellation_observed={cancellation_observed} cancellation_ms={:.3} input_p50_ms={:.3} input_p95_ms={:.3} input_max_ms={:.3} sampled_peak_RSS_KiB={peak_rss}",
+        "search_ui corpus={corpus} MiB={mib} first_text_ms={:.3} ready_ms={:.3} full_scan_ms={:.3} replace_ms={:.3} save_ms={:.3} cancellation_observed={cancellation_observed} cancellation_ms={:.3} input_p50_ms={:.3} input_p95_ms={:.3} input_max_ms={:.3} sampled_peak_RSS_KiB={peak_rss}",
         first_text.as_secs_f64() * 1000.0,
         ready.as_secs_f64() * 1000.0,
         scan.as_secs_f64() * 1000.0,
         replacement.as_secs_f64() * 1000.0,
+        saved.as_secs_f64() * 1000.0,
         cancellation.as_secs_f64() * 1000.0,
         latency[20],
         latency[38],

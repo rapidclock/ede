@@ -2,7 +2,10 @@
 use crate::{
     command::{Command, Movement},
     document::{Cancellation, JobId},
-    editor::{Action, After, Event, PointerGesture, SaveResult, Screen, TabId},
+    editor::{
+        Action, After, COPIED_INTERNALLY, CUT_INTERNALLY, Event, PointerGesture, SaveResult,
+        Screen, TabId,
+    },
     input::Input,
     picker::{self, Browse},
     settings::{self, Context},
@@ -13,7 +16,12 @@ use crate::{
 use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
-use std::{collections::VecDeque, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    collections::VecDeque,
+    path::PathBuf,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 mod dialogs;
 pub(crate) mod recovery;
 pub(crate) mod search;
@@ -94,6 +102,13 @@ enum PasteTarget {
     Ignore,
     ReadOnly,
 }
+/// A terminal-side result belongs to one unchanged worker status.
+struct ClipboardFeedback {
+    sequence: u64,
+    tab: Option<TabId>,
+    source: String,
+    message: &'static str,
+}
 /// Shell state contains only bounded prepared data; document bytes remain with storage.
 pub(crate) struct AppState {
     pub search: search::Panel,
@@ -109,6 +124,8 @@ pub(crate) struct AppState {
     pub(crate) settings: settings::Service,
     pub(crate) settings_ui: Option<Box<settings_ui::Draft>>,
     pub(crate) settings_generation: u64,
+    clipboard_epoch: u64,
+    clipboard_feedback: Option<ClipboardFeedback>,
     pub(crate) settings_save_state: Option<settings::SaveState>,
     pub(crate) settings_saved: bool,
     pub mouse_capture: bool,
@@ -199,6 +216,8 @@ impl AppState {
             settings: settings::Service::default(),
             settings_ui: None,
             settings_generation: 0,
+            clipboard_epoch: 0,
+            clipboard_feedback: None,
             settings_save_state: None,
             settings_saved: false,
             mouse_capture: true,
@@ -391,6 +410,9 @@ impl AppState {
         {
             self.capture = None;
         }
+        if self.screen.tab.is_none() && screen.tab.is_some() && self.modal.is_none() && !self.help {
+            self.focus = Some(Control::Content);
+        }
         if self
             .screen
             .view
@@ -400,7 +422,16 @@ impl AppState {
         {
             self.dirty = true;
         }
-        self.notify(StatusMessage::new(Severity::Info, &screen.message));
+        self.clipboard_feedback = self.clipboard_feedback.take().filter(|feedback| {
+            feedback.sequence == screen.acknowledged
+                && feedback.tab == screen.tab
+                && feedback.source == screen.message
+        });
+        let message = self
+            .clipboard_feedback
+            .as_ref()
+            .map_or(screen.message.as_str(), |feedback| feedback.message);
+        self.notify(StatusMessage::new(Severity::Info, message));
         self.screen = screen;
         self.pending = pending;
         self.dirty = true;
@@ -698,6 +729,11 @@ impl AppState {
     }
     /// Route one input to the owning modal, control, or text surface.
     pub fn input(&mut self, input: Input, layout: &LayoutSnapshot) -> Option<Intent> {
+        if !matches!(input, Input::Pointer(_))
+            && let Some(Modal::Open(picker)) = &mut self.modal
+        {
+            picker.reset_click();
+        }
         if self.settings.starting {
             match input {
                 Input::Key(KeyEvent {
@@ -873,6 +909,7 @@ impl AppState {
 
     /// Reconcile the completed file operation, then enqueue its editor values before later input.
     pub(crate) fn poll_settings(&mut self, editor: Option<&mut crate::editor::Editor>) {
+        let clipboard_enabled = self.settings.applied.values.copy_to_system();
         if let Some(update) = self.settings.poll(&self.config_location) {
             self.settings_updated(update);
             self.dirty = true;
@@ -893,6 +930,52 @@ impl AppState {
             self.settings_save_state = save_state;
             self.dirty = true;
         }
+        if clipboard_enabled && !self.settings.applied.values.copy_to_system() {
+            self.revoke_clipboard();
+        }
+    }
+
+    /// Capture or validate the current opt-in at the terminal's dispatch boundary.
+    pub(crate) fn system_clipboard_epoch(&self) -> Option<u64> {
+        self.settings
+            .applied
+            .values
+            .copy_to_system()
+            .then_some(self.clipboard_epoch)
+    }
+
+    /// A disabled or suspended session cannot publish any previously queued write.
+    pub(crate) fn revoke_clipboard(&mut self) {
+        self.clipboard_epoch = self.clipboard_epoch.wrapping_add(1);
+    }
+
+    /// Retain the delivery outcome when the coordinator republishes the same action.
+    pub(crate) fn report_clipboard(&mut self, sequence: u64, message: &'static str) {
+        let source = &self.screen.message;
+        if sequence != self.screen.acknowledged
+            || !matches!(source.as_str(), COPIED_INTERNALLY | CUT_INTERNALLY)
+            || self.status.text() != source
+        {
+            return;
+        }
+        self.clipboard_feedback = Some(ClipboardFeedback {
+            sequence,
+            tab: self.screen.tab,
+            source: source.clone(),
+            message,
+        });
+        self.notify(StatusMessage::new(Severity::Info, message));
+    }
+
+    /// Clipboard delivery has room for the complete outcome even at 40 columns.
+    pub(crate) fn reports_clipboard(&self) -> bool {
+        let status = self.status.text();
+        status.starts_with(COPIED_INTERNALLY)
+            || status.starts_with(CUT_INTERNALLY)
+            || self
+                .clipboard_feedback
+                .as_ref()
+                .is_some_and(|feedback| feedback.message == status)
     }
 
     /// Handle named commands once for keyboard/menu/buttons, preserving modal ownership.
@@ -1556,6 +1639,10 @@ impl AppState {
             {
                 None
             }
+            Command::Copy | Command::Cut => Some(Intent::Editor(Action::Clipboard {
+                cut: command == Command::Cut,
+                system: self.system_clipboard_epoch(),
+            })),
             _ => Some(Intent::Editor(Action::Command(command))),
         }
     }
@@ -1563,6 +1650,17 @@ impl AppState {
     fn pointer(&mut self, mouse: MouseEvent, layout: &LayoutSnapshot) -> Option<Intent> {
         if !self.mouse_capture {
             return None;
+        }
+        let hit = layout.hit(mouse.column, mouse.row);
+        if let Some(Modal::Open(picker)) = &mut self.modal {
+            match (mouse.kind, hit) {
+                (MouseEventKind::Down(MouseButton::Left), Some(Control::PickerRow(row))) => {
+                    picker.press(row, mouse.row);
+                }
+                (MouseEventKind::Up(MouseButton::Left), Some(Control::PickerRow(_)))
+                | (MouseEventKind::Moved, _) => {}
+                _ => picker.reset_click(),
+            }
         }
         if matches!(self.modal, Some(Modal::Settings))
             && layout.overlay.is_some()
@@ -1642,7 +1740,6 @@ impl AppState {
             self.dirty = true;
             return None;
         }
-        let hit = layout.hit(mouse.column, mouse.row);
         if hit == Some(Control::Content) && (!self.ready() || self.guard_request.is_some()) {
             return None;
         }
@@ -1675,6 +1772,12 @@ impl AppState {
                 }
             }
             MouseEventKind::Drag(MouseButton::Left) => {
+                if self
+                    .capture
+                    .is_some_and(|capture| matches!(capture.control, Control::PickerRow(_)))
+                {
+                    self.capture = None;
+                }
                 if let Some(capture) = &mut self.capture
                     && capture.control == Control::Content
                     && capture.generation == layout.generation
@@ -1706,6 +1809,16 @@ impl AppState {
                             );
                         }
                     } else if hit == Some(capture.control) {
+                        if let (Control::PickerRow(row), Some(Modal::Open(picker))) =
+                            (capture.control, &mut self.modal)
+                        {
+                            let activate = picker.click(row, mouse.row, Instant::now());
+                            self.focus = Some(Control::PickerList);
+                            self.dirty = true;
+                            return activate
+                                .then(|| self.picker_command(Command::Activate, layout))
+                                .flatten();
+                        }
                         if self.dialog_click(capture.control) {
                             return None;
                         }

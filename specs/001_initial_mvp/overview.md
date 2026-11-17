@@ -1,6 +1,6 @@
 # 001 — Initial MVP overview
 
-Status — **MVP scope and roadmap accepted. Stages 01–09 merged. Stage 10 design drafted.**
+Status — **MVP scope and roadmap accepted. Stages 01–09 merged. Stage 10 in progress.**
 
 Project: **ede**, a predominantly Rust terminal text editor for macOS and Linux.
 
@@ -612,13 +612,13 @@ Evidence — [Stage 09 validation record](09_configuration_and_keybindings.md#va
 
 Design — [10_mvp_validation.md](10_mvp_validation.md). Depends on Stages 01–09.
 
-Status — Design draft. Integrated validation pending.
+Status — Implementation authorized. Integrated validation in progress.
 
 Branch — `stage/mvp_validation`. PR target — `feat/initial_mvp`.
 
 Evidence — [Stage 10 validation record](10_mvp_validation.md#validation-record).
 
-Under review — [Proposed pre-release changes](10_mvp_validation.md#proposed-pre-release-changes)
+Approved — [Pre-release changes](10_mvp_validation.md#approved-pre-release-changes)
 cover a system clipboard toggle, an empty-session welcome view, tab boundaries,
 and double-click activation in the Open picker. The terminal checks include
 the reported macOS shortcuts and SSH clipboard paths.

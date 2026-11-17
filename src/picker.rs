@@ -8,9 +8,11 @@ use std::{
     path::{Path, PathBuf},
     sync::{Arc, Condvar, Mutex},
     thread::{self, JoinHandle},
+    time::{Duration, Instant},
 };
 
 const PAGE_SIZE: usize = 128;
+const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 
 /// Direct native filename, sorted with directories before all other entries.
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -260,6 +262,16 @@ pub(crate) struct Dialog {
     pub generation: u64,
     pub requested_file: Option<PathBuf>,
     pub revision: u64,
+    click: Option<Click>,
+}
+
+/// A completed click belongs to one row of one rendered listing.
+#[derive(Clone, Debug)]
+struct Click {
+    row: usize,
+    y: u16,
+    generation: u64,
+    at: Instant,
 }
 
 impl Dialog {
@@ -274,6 +286,7 @@ impl Dialog {
             generation: 0,
             requested_file: None,
             revision: 0,
+            click: None,
         }
     }
 
@@ -283,6 +296,45 @@ impl Dialog {
 
     pub fn count(&self) -> usize {
         self.page.as_ref().map_or(0, |page| page.entries.len())
+    }
+
+    /// Select a current row. Return true when a second complete click activates it.
+    pub fn click(&mut self, row: usize, y: u16, now: Instant) -> bool {
+        if self.loading || self.row(row).is_none() {
+            return false;
+        }
+        if self.click.take().is_some_and(|first| {
+            first.row == row
+                && first.y == y
+                && first.generation == self.generation
+                && now.duration_since(first.at) <= DOUBLE_CLICK
+        }) {
+            return true;
+        }
+        self.highlight = row;
+        self.click = Some(Click {
+            row,
+            y,
+            generation: self.generation,
+            at: now,
+        });
+        false
+    }
+
+    /// Discard click history when another input changes selection or pointer geometry.
+    pub fn reset_click(&mut self) {
+        self.click = None;
+    }
+
+    /// A press on a different visible row interrupts a double click in progress.
+    pub fn press(&mut self, row: usize, y: u16) {
+        if self
+            .click
+            .as_ref()
+            .is_some_and(|click| click.row != row || click.y != y)
+        {
+            self.reset_click();
+        }
     }
 
     pub fn scroll(&mut self, delta: isize) {
@@ -312,6 +364,7 @@ impl Dialog {
     }
 
     pub fn accept(&mut self, page: Page) {
+        self.reset_click();
         self.directory.clone_from(&page.directory);
         self.page = Some(page);
         self.highlight = 0;
@@ -322,6 +375,31 @@ impl Dialog {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The clock, hit row, and listing all have to agree before a second click opens anything.
+    #[test]
+    fn double_click_requires_current_same_row_and_bounded_interval() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a"), "a").unwrap();
+        fs::write(dir.path().join("b"), "b").unwrap();
+        let page = || list(dir.path(), &Browse::First, &Cancellation::default()).unwrap();
+        let mut dialog = Dialog::new(dir.path().to_path_buf());
+        dialog.accept(page());
+        let start = Instant::now();
+        assert!(!dialog.click(0, 3, start));
+        let late = start + DOUBLE_CLICK + Duration::from_millis(1);
+        assert!(!dialog.click(0, 3, late));
+        dialog.press(1, 4);
+        assert!(!dialog.click(0, 3, late));
+        assert!(dialog.click(0, 3, late));
+        dialog.accept(page());
+        assert!(
+            !dialog.click(0, 3, late),
+            "trailing click opened the next listing"
+        );
+        dialog.reset_click();
+        assert!(!dialog.click(0, 3, late), "stale input armed another click");
+    }
     use std::{
         os::unix::fs::symlink,
         sync::mpsc,

@@ -1,15 +1,15 @@
 # 10 — Integrated MVP validation
 
-Status — **Design draft. Integrated validation pending.**
+Status — **Implementation authorized. Integrated validation in progress.**
 
 Branch — `stage/mvp_validation`. PR target — `feat/initial_mvp`.
 
 Depends on Stages 01–09, integrated through Stage 09 at `dfacfe2`. The
 [approved MVP overview](overview.md) defines the scope and FR-01–FR-10. This
-draft specifies the validation scenarios, reference environments, and proposed
-pre-release changes. Exact terminal versions and profiles are determined by
-the runs. Approval of this draft and authorization to carry it out are
-separate decisions.
+specification defines the validation scenarios, reference environments, and
+pre-release changes. The user authorized Stage 10 implementation and validation
+after confirming the shortcut checks should run last. Record the actual terminal
+versions and profiles used for validation.
 
 ## Outcome and scope
 
@@ -18,8 +18,8 @@ occasional editing of files larger than RAM, and live-output inspection. The
 stage closes when the acceptance criteria have recorded evidence and a user can
 build, operate, configure, and recover the editor with the README. Reuse the
 existing CLI, TUI, storage policies, and tests. Implementation work covers
-validation tooling, fixes needed to satisfy the approved contracts, and any
-pre-release proposals below that are accepted. Packaging, installers,
+validation tooling, fixes needed to satisfy the approved contracts, and the
+pre-release changes below. Packaging, installers,
 automatic updates, release distribution, and deployment are outside this stage.
 
 Use prior validation records for detailed behavioral coverage, failure guards,
@@ -29,18 +29,18 @@ its behavior or conditions. Run the integrated workflows, candidate build and
 native gates on the candidate revision. A Stage 01 or Stage 03 deferral of a
 manual check leaves it open for Stage 10.
 
-## Proposed pre-release changes
+## Approved pre-release changes
 
 The user reported that Copy in ede on Ubuntu left the Mac clipboard unchanged,
 both through their tmux pane and in Terminal.app over direct SSH. They proposed
 a Settings toggle to keep both clipboard workflows. They also reported that
 physical Cmd shortcuts invoked Mac or terminal actions, including a dialog to
-export terminal output on Cmd+S. The proposed clipboard details and UI scope
-below are for design review. The existing Cmd requirement already applies.
+export terminal output on Cmd+S. Stage 10 covers the clipboard and UI changes
+below and verifies the existing Cmd requirement at the end.
 
 ### Clipboard setting and client paste
 
-Stage 03 defines a private clipboard per running ede process. Add a proposed
+Stage 03 defines a private clipboard per running ede process. Add a
 **Copy to system clipboard** toggle to Settings. In `config.toml`, use the
 optional boolean `clipboard.copy_to_system` under `[clipboard]`. Omission,
 Restore Defaults, and `--safe-config` select `false`. Apply changes through the
@@ -58,8 +58,8 @@ invalid reload. An existing config needs no migration.
   the client terminal's system clipboard, including when ede runs remotely.
   Use only the write operation. Reading system clipboard contents is outside
   this integration.
-- Propose an 8 KiB limit on the UTF-8 byte count of the outgoing selection.
-  Check exact round trips up to the proposed limit on each supported path.
+- Limit outgoing selections to 8 KiB of UTF-8. Check exact round trips up to
+  that limit on each supported path.
   Leave larger selections available internally and report the reason they
   were kept internal. Send one bounded base64 payload with terminal framing.
   Keep spool reads off the UI thread and serialize the frame with other tty
@@ -108,20 +108,20 @@ The editor leaves terminal and tmux settings under the user's control.
   followers use their existing tab flow. A scratch is created by New Scratch
   or an existing explicit workflow such as stdin promotion. The same welcome
   view works after closing the last tab. This supersedes the automatic blank
-  scratch in Stages 04–05 if accepted.
+  scratch in Stages 04–05.
 - Give each visible tab a compact visual boundary and distinguish the active
   tab through its shape or text emphasis as well as any color. Preserve
   modified and attention indicators, tab hit targets, and access to overflow
   tabs at 40×8. Keep the header to its existing one row.
 - In the Open picker, a single click selects a row. Two consecutive completed
-  left clicks on the same current row within a proposed 400 ms interval invoke
+  left clicks on the same current row within a 400 ms interval invoke
   the existing Open action once, entering a directory or opening a file. Keep
   keyboard Enter and the Open button. Clear click history on activation, a
   different target, a drag, focus loss, or a listing or layout change, so an
   old click cannot activate another path.
 
 The user clarified that reStructuredText, CSV, and TSV support means syntax
-highlighting. Defer those additions until after `0.0.1` under this proposal.
+highlighting. Those additions are deferred until after `0.0.1`.
 
 ## Candidate and test fixtures
 
@@ -277,7 +277,7 @@ catalog.
 
 [Stage 09 settings](09_configuration_and_keybindings.md#acceptance-criteria)
 
-### V08 — System clipboard toggle (proposed, FR-03 and FR-09)
+### V08 — System clipboard toggle (FR-03 and FR-09)
 
 Use a disposable config to toggle, save, relaunch, reload, and restore defaults.
 Verify a changed or reset draft takes effect only after save. Test a malformed
@@ -297,7 +297,7 @@ Copy while disabling and re-enabling. Neither held command may send a frame.
 Exercise pending-write revocation on newer Copy and suspension. Run the client
 clipboard sequence below with the actual frontend and tmux/SSH path.
 
-### V09 — Empty session, tab strip, and picker (proposed, FR-03, FR-05, FR-10)
+### V09 — Empty session, tab strip, and picker (FR-03, FR-05, FR-10)
 
 Launch with an empty state profile and no paths. Verify zero tabs, visible
 Open/New actions, and no scratch created on Quit. Repeat with failed CLI
@@ -393,7 +393,7 @@ interruption. A version tested on one path establishes evidence for that path.
    exact bytes. In the tmux rows also exercise explicit detach/reattach. If the
    session fails to resume, record the failure and whether a fresh connection
    can recover the tmux session or the last scratch checkpoint.
-5. **Client clipboard (if the toggle is accepted).** Try an ordinary Copy in
+5. **Client clipboard.** Try an ordinary Copy in
    Terminal.app over direct SSH to Ubuntu and in iTerm2 over direct SSH and
    through the reported tmux topology. Include an iTerm2 local baseline.
    Use distinct markers for the existing macOS clipboard and the selection
@@ -439,11 +439,12 @@ environment. Use the interactive file probe or an equivalent executable PTY run
 with an explicit MiB size. Verify open, navigation, beginning/middle/end edits
 and save while preserving newer edits. Run literal Find, Replace All and Undo
 using `large_search_and_replace_benchmark` or the same-size marked corpus with
-a known match count. Compare saved output in bounded chunks against an
-independently generated expected stream, covering the entire edited and
-replaced files and all unchanged ranges. The current PTY probes sample
-positions and length, so supplement them for full comparison. A cgroup-only run
-on a larger host addresses the separate constrained-editor check.
+a known match count. The opt-in search probe accepts
+`EDE_BENCH_MARKER_STRIDE_MIB` to exercise the same file size within the
+existing Replace All undo budget. Compare saved output in bounded chunks
+against independently generated expected bytes, covering the entire edited and
+replaced files including unchanged ranges. A cgroup-only run on a larger host
+addresses the separate constrained-editor check.
 
 ### B10-3 — Constrained editor
 
@@ -575,15 +576,15 @@ shortcuts in the earlier terminal checks with enhancements disabled.
 | MVP-03 | B10-1 through B10-4 have results with measured latency, memory and disk behavior. The 1 GiB / 8 GiB baseline and larger-than-RAM runs are evidenced independently. Missed goals or exceeded budgets are fixed and rechecked or resolved by user-approved requirement changes. |
 | MVP-04 | Native locked checks, opted-in regressions, and independent review for the candidate are recorded. Required failure and controlled ordering evidence is present. |
 | MVP-05 | A fresh source build and documented workflows work as described, and Cargo metadata, the executable and README agree on `0.0.1`. The validation record states supported paths, observed limitations, and approved dispositions. |
-| MVP-06 | Record candidate evidence for each accepted pre-release proposal. Clipboard acceptance uses V08 and the client clipboard sequence, with README guidance for the toggle, default, tested paths, and fallbacks. Use the applicable V09 cases for each accepted UI change. |
+| MVP-06 | Record candidate evidence for V08, V09, and the client clipboard sequence. The README covers the clipboard toggle, its default, tested paths, and fallbacks. |
 
 ## Validation record
 
-Integrated implementation and release validation are **pending**. Record the
-candidate SHA, commands or manual steps, environment, results, and logs for each
-applicable V, T10, B10 and MVP criterion here as checks run. Keep design review
-evidence and actual implementation evidence identifiable by revision. No new
-coverage deferral has been approved.
+Implementation and automated validation are recorded below for the
+`0.0.1-dev.10` build inputs in [draft PR #10](https://github.com/rapidclock/ede/pull/10).
+Release acceptance is **open**. No coverage deferral has been approved.
+
+### Design and pre-implementation baseline
 
 - Independent design review against `dfacfe2` found gaps in terminal and mouse
   coverage, stream Close and Quit, refresh, syntax fallback, larger-than-RAM
@@ -602,3 +603,118 @@ coverage deferral has been approved.
   review of the fixes found no remaining actionable findings. Formatting,
   Clippy, and the 313 enabled macOS baseline tests passed again. Real clipboard
   and shortcut behavior remains to be verified on the reported terminal paths.
+
+### Candidate builds and workflows
+
+Rust 1.99.1 locked builds passed on macOS 27.2 (26B123, M1 Max, arm64, 32 GiB),
+Ubuntu 26.10 (Linux 7.3.0-10-generic, arm64 VM, 9,395 MiB), and Debian 12
+(Linux 5.15.49-linuxkit-pr, arm64 guest). Formatting and workspace Clippy
+passed with warnings denied. Workspace tests passed with a 256-descriptor
+soft limit. There were 325 enabled tests on macOS, 327 on each Linux build,
+and ten opt-in tests excluded in each default run. Release-profile
+`ede --version` and `ede --help` reported `0.0.1-dev.10` on macOS and Ubuntu.
+
+| Workflow | Candidate evidence |
+| --- | --- |
+| V01 editing and navigation | Real PTY tests cover portable editing and paste, Unicode mouse drag and copy/paste, resize, picker and tab activation, and narrow-window prompt protection. Document tests check saved bytes, newline conventions and rejected inputs. |
+| V02 guarded save and refresh | Document fault hooks cover conflicts, publication and uncertainty. Editor and real PTY tests cover active and inactive updates, missing and invalid replacements returning to valid text, dirty-tab protection and stale prepared refreshes. |
+| V03 scratch recovery | Real PTY tests cover restart, ordering, views, configurable checkpoints and retained content. Recovery tests control catalog publication and concurrent owners. |
+| V04 search and replace | Real PTY tests exercise Find, Replace All and Undo. Coordinator tests exercise cancellation and partial failure across tabs, read-only live input, and changes after stream promotion. |
+| V05 highlighting | Native suites cover bundled grammars, embedded and unknown fences, reload and last-good behavior, timeout and stale results, and threshold equality. Real PTY tests exercise visible fallback and refresh recovery. |
+| V06 pipes and follow | Process and real PTY tests cover partial input, capture and EOF promotion, read-only guards, follow rotation and truncation, Close and Quit with active input, and rejected tty or stdout configurations. |
+| V07 configuration | Settings and real PTY tests cover remapping, effective bindings, malformed reload and fallback, stale Settings save, and safe-config editing and recovery. |
+| V08 clipboard | Real PTY tests cover exact UTF-8 OSC 52 bytes, internal-only mode, committed Cut, live pipe copy, Settings save and safe mode, and the 8 KiB boundary with a paced reader. Controlled checks exercise authorization, revocation, write failure and suppression of output after an incomplete frame. |
+| V09 welcome, tabs and picker | Real PTY and reducer tests cover explicit initial scratch creation, zero tabs after close, visible CLI errors and recovery order, tab styles and overflow, and double-click activation and invalidation across listing, drag and geometry changes. |
+
+The welcome, CLI error, picker, clipboard and paced-terminal regressions first
+failed before their fixes. Holding the PTY reader for 150 ms reproduced a
+process exit when one deadline covered both initial admission and partial
+writes. With separate deadlines the maximum selection survived the pause.
+Five isolated guard mutations produced the intended assertion failures for
+stale Cut retirement, clipboard configuration revocation, output after
+incomplete OSC, writer admission after revocation, and slot recovery after
+startup cancellation. Independent review followed [REVIEW.md](../../REVIEW.md)
+against stage design head `e42ad16` and feature baseline `dfacfe2`. Findings
+were fixed and reviewed again. The reviewer also ran a 17 MiB search fixture
+with a marker in the final partial stride.
+
+### Terminal, transport and client clipboard evidence
+
+Portable PTY checks used `xterm-256color` at 80×24. Isolated local tmux editing
+and job-control suspension tests passed on macOS and Debian. The frontend and
+transport matrix remains open.
+
+| Row | Result |
+| --- | --- |
+| T10-1 and T10-2 | **Blocked** pending iTerm2 3.7.7 frontend and physical Cmd evidence. Native PTY and isolated local tmux input and suspension passed on macOS. |
+| T10-3 | **Partial**. XTerm 379 under Xvfb on Debian copied the marker into the X11 system clipboard, resized, saved exact bytes with Ctrl+S and restored `stty -g` on Quit. The remaining base sequence is open. |
+| T10-4 | **Partial**. XTerm 379 with tmux 3.3a did not transfer the marker to the X11 clipboard with `set-clipboard on` and `xterm*:clipboard`. The isolated tmux PTY editing and suspend probe passed. The graphical sequence and clipboard fallback are open. |
+| T10-5 | **Partial**. OpenSSH 10.5p1 on macOS allocated an Ubuntu PTY. Exact OSC 52 bytes crossed SSH. Ctrl+S saved exact bytes and Quit restored terminal modes. Killing a separate SSH client retired its editor. A fresh 96×32 PTY retained the last saved named-file bytes and reopened the last acknowledged scratch checkpoint, then restored its original termios on exit. Mac GUI paste and the full base sequence are open. |
+| T10-6 | **Partial**. Isolated remote tmux 3.7b forwarded the OSC 52 payload with `set-clipboard on` and `xterm*:clipboard`. A fresh SSH connection reattached at 96×32, retained the unsaved marker, saved exact bytes and restored the inner tty. Mac GUI paste and remaining base and tmux actions are open. |
+| T10-7 and T10-8 | **Partial**. Upstream Mosh 1.4.0 for macOS arm64 and the staged Ubuntu Mosh 1.4.0 server ran. Full interruption/resumption and graphical frontend evidence are open. |
+| T10-9 and T10-10 | **Blocked**. The macOS Eternal Terminal 7.1.1 binary could not load with the available Protobuf runtime. No Eternal Terminal server package was available from the configured Ubuntu repositories. |
+
+Mac GUI clipboard and the final Cmd check remain open. Computer Use denied
+access to Terminal.app 2.15 and iTerm2 3.7.7. Physical Cmd delivery, Mac
+application paste and the per-path maximum clipboard payload require frontend
+evidence.
+
+### Performance and resources
+
+The release probes used 80×24 PTYs and warm, just-generated allocated files.
+The Debian guest had 8,142,192 KiB RAM, three test CPUs and disk-backed ext4
+at `/verify`. The baseline and larger-than-RAM containers had
+`memory.max=8589934592`. The constrained containers had
+`memory.max=268435456`. All Linux benchmark containers had
+`memory.swap.max=0`. macOS runs used APFS.
+
+- **B10-1 measured probes passed.** Two runs each of 1 GiB ordinary, dense and
+  long corpora verified all saved bytes. On macOS first text was 56.340–64.935 ms
+  and Ready was 356–3,991 ms. In each 40-sample run, p50 was 12.562–20.622 ms,
+  p95 was 19.670–35.472 ms and maximum was at most 38.269 ms. Peak RSS reached
+  154,368 KiB. On Linux first text was 27.287–31.838 ms and Ready was
+  1,521–5,361 ms. The p50 was 12.741–14.501 ms and p95 was 16.128–28.213 ms,
+  with maximum at most 29.954 ms and peak RSS at most 137,056 KiB. Linux
+  forced-copy storage runs verified output and Undo/Redo, taking 2.695–6.680
+  CPU seconds and 1,886–2,163 ms to save. The measured maximum managed cache
+  was 67,174,400 bytes with about 1 GiB working text and 196,872 bytes working
+  metadata. The 1 GiB Find and Replace All probes passed with maximum live
+  edit latency of 28.533 ms on macOS and 29.921 ms on Linux.
+- **B10-2 editing passed.** An 8,589,934,592-byte file exceeded guest physical
+  RAM with swap disabled. First text appeared in 30.732 ms and Ready at
+  22.266 s. The 40 samples measured p50 15.208 ms, p95 30.715 ms, and maximum
+  34.560 ms. Peak RSS was 72,236 KiB. The 160.40-second run compared every saved
+  byte and confirmed a later edit still required a quit decision. A search
+  run with 8,192 markers reached the existing undo budget and replacement
+  was refused. With 1,024 matches spaced 8 MiB apart, Replace All completed
+  and guarded Save exceeded the probe's original 120-second wait. The rerun
+  passed with the longer deadline. Find took 10.589 s, replacement 46.978 s
+  and Save 133.835 s. All saved bytes matched, Undo restored the first marker
+  and marked the tab dirty, and cancellation was observed. The 40 input
+  samples measured p50 13.036 ms, p95 26.910 ms and maximum 30.661 ms.
+  Peak RSS was 71,916 KiB and the cgroup reported zero OOM events.
+- **B10-3 measured probes passed.** Under 256 MiB with zero swap, 1 GiB
+  editing, Find/Replace All, streams, recovery/refresh with a 64 MiB scratch,
+  and highlighting/search overlap completed. The highest edit and search
+  input latencies were 28.936 ms and 16.786 ms. Peak editor RSS for edits was
+  137,040 KiB. The refresh storage probe measured 4,295,438,336 allocated bytes
+  including the fixture and working files and 979,200 bytes of managed refresh
+  buffers. The scratch checkpoint used 67,112,960 allocated bytes.
+- **B10-4 measured probes passed.** 1 GiB gated producer and companion-tab
+  tests passed for all corpora. Maximum companion latency was 40.982 ms on
+  macOS, 18.503 ms in the Linux baseline and 18.784 ms under 256 MiB.
+  Full-speed capture across the nine runs was 154–544 MiB/s and EOF adoption
+  was 20.915–30.111 ms. Linux observed 25–28 open descriptors at high water.
+
+Client-visible timing, standalone mouse and navigation latency samples, and
+complete per-workload allocation and peak measurements remain open.
+
+### Remaining acceptance
+
+MVP-01 and MVP-06 have automated candidate evidence for V01–V09. Required
+frontend workflows and exact client paste remain open. MVP-02 requires the
+rest of the terminal matrix and the final macOS Cmd check. MVP-03 retains
+the resource and timing gaps above. MVP-04 has native locked checks, independent
+review and mutation evidence. The full GitHub Actions matrix is pending.
+MVP-05 remains open for terminal-specific instructions and the locked
+`0.0.1` release build after validation.
