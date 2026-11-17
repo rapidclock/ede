@@ -1,6 +1,6 @@
 # 001 — Initial MVP overview
 
-Status — **MVP scope and roadmap accepted. Stages 01–07 merged. Stage 08 design drafted for approval.**
+Status — **MVP scope and roadmap accepted. Stages 01–08 merged. Stage 09 implementation verified on macOS and Ubuntu.**
 
 Project: **ede**, a predominantly Rust terminal text editor for macOS and Linux.
 
@@ -391,8 +391,9 @@ storage. Avoid assuming that an open file descriptor or memory map freezes data.
 | Storage | Unified or separate backends; stable snapshots; indexing and undo resource budgets |
 | Saving | Atomic replacement policy, metadata/links, cancellation, disk exhaustion, and external-change conflicts |
 | Scratch persistence | Resolved in Stage 05: machine-local state, independent live owners, recovery of retired owners, fresh restored history, and scratch-only recovery; power-loss guarantees remain outside scope |
-| Live content | Stage 08 proposes terminal separation, pathname following and rotation, retention quotas, and producer-error handling for approval |
+| Live content | Stage 08 defines terminal separation, pathname following and rotation, retention quotas, and producer-error handling |
 | Search | Stage 06 uses bounded ripgrep literal matching, Unicode simple case folding, optional whole-word matching, and per-document atomic replacement; design and implementation authorized |
+| Configuration and keybindings | Stage 09 defines the settings schema, contextual keymap, persistent remapping UI, and safe startup mode |
 | Performance | Benchmark corpus and CPU/storage details for the agreed 1 GiB / 8 GiB RAM baseline; measurement methods, memory budgets, and validation of agreed latency/highlighting defaults |
 | Dependencies | Libraries, grammar versions, compiler/toolchain baseline, and configuration locations |
 
@@ -575,7 +576,7 @@ Evidence: [Stage 07 validation record](07_syntax_highlighting.md#validation-reco
 
 Design — [08_pipes_and_follow.md](08_pipes_and_follow.md). Depends on Stages 02–07.
 
-Status — Implemented, independently reviewed, and validated on macOS and Ubuntu.
+Status — Complete. [PR #8](https://github.com/rapidclock/ede/pull/8) merged into `feat/initial_mvp` at `a258b85`.
 
 Branch — `stage/pipes_and_follow`. PR target — `feat/initial_mvp`.
 
@@ -591,7 +592,13 @@ Evidence — [Stage 08 validation record](08_pipes_and_follow.md#validation-reco
 
 ### 09 — Configuration and keybinding UI
 
-Planned file: `09_configuration_and_keybindings.md`. Depends on: 01–08.
+Design — [09_configuration_and_keybindings.md](09_configuration_and_keybindings.md). Depends on Stages 01–08.
+
+Status — Implemented and verified on macOS and Ubuntu. Draft PR targets the feature branch.
+
+Branch — `stage/configuration_and_keybindings`. PR target — `feat/initial_mvp`.
+
+Evidence — [Stage 09 validation record](09_configuration_and_keybindings.md#validation-record).
 
 - Deliver configuration loading/persistence and a keyboard/mouse UI for remapping
   all commands. Expose effective bindings and make the agreed highlighting and

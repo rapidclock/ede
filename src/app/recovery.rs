@@ -69,6 +69,21 @@ impl AppState {
         let Some(Modal::Recovery(dialog)) = &mut self.modal else {
             return None;
         };
+        let requested = match command {
+            Command::RecoveryPrevious => Some(Control::RecoveryPrevious),
+            Command::RecoveryNext => Some(Control::RecoveryNext),
+            Command::RecoveryOpen | Command::SelectRow => Some(Control::RecoveryList),
+            Command::RecoveryDiscard => Some(Control::RecoveryDiscard),
+            Command::RecoveryRetry => Some(Control::RecoveryRetry),
+            _ => None,
+        };
+        if requested.is_some_and(|target| {
+            !layout.contains(target)
+                || matches!(command, Command::RecoveryDiscard | Command::RecoveryRetry)
+                    && self.focus != Some(target)
+        }) {
+            return None;
+        }
         match command {
             Command::Tab | Command::FocusNext | Command::FocusPrevious => {
                 self.focus = layout.next(self.focus, command == Command::FocusPrevious);
@@ -91,16 +106,23 @@ impl AppState {
                 self.focus = Some(Control::RecoveryList);
                 self.dirty = true;
             }
-            Command::Activate | Command::Newline => {
-                if self.focus == Some(Control::PathCancel) {
+            Command::Activate
+            | Command::Newline
+            | Command::SelectRow
+            | Command::RecoveryPrevious
+            | Command::RecoveryNext
+            | Command::RecoveryOpen
+            | Command::RecoveryDiscard
+            | Command::RecoveryRetry => {
+                if requested.or(self.focus) == Some(Control::PathCancel) {
                     return self.command(Command::Cancel, layout);
                 }
                 if dialog.loading {
                     return None;
                 }
-                match self.focus {
+                match requested.or(self.focus) {
                     Some(Control::RecoveryPrevious | Control::RecoveryNext) => {
-                        let previous = self.focus == Some(Control::RecoveryPrevious);
+                        let previous = requested.or(self.focus) == Some(Control::RecoveryPrevious);
                         if previous && !dialog.page.previous || !previous && !dialog.page.next {
                             return None;
                         }
@@ -249,11 +271,13 @@ mod tests {
     fn persistence_failure_export_retains_its_original_tab() {
         let mut app = AppState::new();
         app.screen.tab = Some(TabId(1));
+        app.help = true;
         app.event(Event::PersistenceFailed(
             TabId(2),
             After::Quit,
             "disk unavailable".into(),
         ));
+        assert!(!app.help, "a late persistence error owns the entire dialog");
         assert_eq!(app.focus, Some(Control::RecoveryErrorCancel));
         let layout = LayoutSnapshot::for_app(Rect::new(0, 0, 40, 8), &app, 1);
         app.command(Command::SaveAs, &layout);

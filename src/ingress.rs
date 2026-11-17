@@ -3,13 +3,9 @@
 //! Crossterm's complete-string paste event is deliberately bypassed. One reader
 //! thread owns stdin, parses keys/mouse/protocol replies, and stages paste bytes
 //! directly to a private file. Bounded queues apply backpressure to the terminal.
-use crate::{
-    document::Cancellation,
-    input::{self, Input},
-    spool::Spool,
-};
+use crate::{document::Cancellation, input::Input, spool::Spool};
 use crossterm::event::{
-    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use nix::poll::{PollFd, PollFlags, poll};
 use std::{
@@ -214,7 +210,7 @@ impl Parser {
         self.reclaim();
         if self.paste.is_none() && self.pending == b"\x1b" {
             self.pending.clear();
-            return vec![Input::Command(crate::command::Command::Cancel)];
+            return vec![Input::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))];
         }
         vec![]
     }
@@ -249,7 +245,7 @@ impl Parser {
         }
         if self.pending == b"\x1b" && byte == 0x1b {
             // Two Escapes are two cancels, rather than an unbound Alt+Escape.
-            return vec![Input::Command(crate::command::Command::Cancel)];
+            return vec![Input::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))];
         }
         if !self.pending.is_empty() && self.pending[0] != 0x1b && byte & 0xc0 != 0x80 {
             // Discard a truncated UTF-8 scalar, then decode the fresh key. An
@@ -325,10 +321,9 @@ enum Decoded {
     Ignore,
     Input(Input),
 }
-/// Convert a decoded key through the shared exact binding table.
+/// Retain decoded keys and their delivery kind for context-aware UI dispatch.
 fn key(code: KeyCode, modifiers: KeyModifiers, kind: KeyEventKind) -> Decoded {
-    input::normalize(Event::Key(KeyEvent::new_with_kind(code, modifiers, kind)))
-        .map_or(Decoded::Ignore, Decoded::Input)
+    Decoded::Input(Input::Key(KeyEvent::new_with_kind(code, modifiers, kind)))
 }
 /// Parse xterm/Kitty modifiers (protocol value is bitset + one).
 fn modifiers(value: u32) -> KeyModifiers {
@@ -595,7 +590,6 @@ fn decode(bytes: &[u8]) -> Decoded {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::command::Command;
     /// Completed paste files cannot fill the input queue; rejected payload controls remain data.
     #[test]
     fn one_outstanding_paste_and_reader_owned_cleanup() {
@@ -641,20 +635,49 @@ mod tests {
                 .collect();
         assert!(matches!(
             events.as_slice(),
-            [Input::Command(Command::Cancel)]
+            [
+                Input::Key(KeyEvent {
+                    code: KeyCode::Char(' '),
+                    modifiers: KeyModifiers::CONTROL,
+                    ..
+                }),
+                Input::Key(KeyEvent {
+                    code: KeyCode::Esc,
+                    ..
+                })
+            ]
         ));
         assert!(matches!(
             parser.expire().as_slice(),
-            [Input::Command(Command::Cancel)]
+            [Input::Key(KeyEvent {
+                code: KeyCode::Esc,
+                ..
+            })]
         ));
-        assert!(matches!(parser.push(b'x').as_slice(), [Input::Text(text)] if text == "x"));
+        assert!(matches!(
+            parser.push(b'x').as_slice(),
+            [Input::Key(KeyEvent {
+                code: KeyCode::Char('x'),
+                ..
+            })]
+        ));
         assert!(parser.push(0xe7).is_empty());
         assert!(matches!(
             parser.push(0x11).as_slice(),
-            [Input::Command(Command::Quit)]
+            [Input::Key(KeyEvent {
+                code: KeyCode::Char('q'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            })]
         ));
         assert!(parser.push(0xf0).is_empty());
-        assert!(matches!(parser.push(b'z').as_slice(), [Input::Text(text)] if text == "z"));
+        assert!(matches!(
+            parser.push(b'z').as_slice(),
+            [Input::Key(KeyEvent {
+                code: KeyCode::Char('z'),
+                ..
+            })]
+        ));
     }
     /// A multi-megabyte paste never builds a payload-sized buffer and preserves embedded controls.
     #[test]
@@ -692,15 +715,25 @@ mod tests {
     /// CSI-u modifiers/releases, legacy navigation/mouse and capability replies share one reader.
     #[test]
     fn keyboard_mouse_and_capability_normalization() {
-        for (sequence, command) in [
-            ("\x1b[115;9u", Command::Save),
-            ("\x1b[115;10u", Command::SaveAs),
-            ("\x1b[122;10u", Command::Redo),
-            ("\x13", Command::Save),
+        for (sequence, code, modifiers) in [
+            ("\x1b[115;9u", KeyCode::Char('s'), KeyModifiers::SUPER),
+            (
+                "\x1b[115;10u",
+                KeyCode::Char('s'),
+                KeyModifiers::SUPER | KeyModifiers::SHIFT,
+            ),
+            (
+                "\x1b[122;10u",
+                KeyCode::Char('z'),
+                KeyModifiers::SUPER | KeyModifiers::SHIFT,
+            ),
+            ("\x13", KeyCode::Char('s'), KeyModifiers::CONTROL),
         ] {
             let mut parser = Parser::default();
             let events: Vec<_> = sequence.bytes().flat_map(|b| parser.push(b)).collect();
-            assert!(matches!(events.as_slice(),[Input::Command(found)] if *found==command));
+            assert!(
+                matches!(events.as_slice(), [Input::Key(found)] if *found == KeyEvent::new(code, modifiers))
+            );
         }
         let mut parser = Parser::default();
         let events: Vec<_> = b"\x1b[?1u\x1b[113;9:3u\x1b[<0;2;3M"
@@ -711,6 +744,10 @@ mod tests {
             events.as_slice(),
             [
                 Input::KeyboardSupported,
+                Input::Key(KeyEvent {
+                    kind: KeyEventKind::Release,
+                    ..
+                }),
                 Input::Pointer(MouseEvent {
                     column: 1,
                     row: 2,
@@ -727,9 +764,23 @@ mod tests {
             .iter()
             .flat_map(|byte| parser.push(*byte))
             .collect();
-        assert!(
-            matches!(events.as_slice(),[Input::Pointer(MouseEvent{kind:MouseEventKind::Up(MouseButton::Left),..}),Input::Pointer(MouseEvent{kind:MouseEventKind::Up(MouseButton::Left),..}),Input::Text(text)] if text=="A")
-        );
+        assert!(matches!(
+            events.as_slice(),
+            [
+                Input::Pointer(MouseEvent {
+                    kind: MouseEventKind::Up(MouseButton::Left),
+                    ..
+                }),
+                Input::Pointer(MouseEvent {
+                    kind: MouseEventKind::Up(MouseButton::Left),
+                    ..
+                }),
+                Input::Key(KeyEvent {
+                    code: KeyCode::Char('A'),
+                    ..
+                })
+            ]
+        ));
         let mut reply = Parser::default();
         for byte in b"\x1b[?1" {
             assert!(reply.push(*byte).is_empty());
@@ -743,7 +794,13 @@ mod tests {
         assert!(parser.push(0xe7).is_empty());
         assert!(parser.expire().is_empty());
         assert!(parser.push(0x95).is_empty());
-        assert!(matches!(parser.push(0x8c).as_slice(),[Input::Text(text)] if text=="界"));
+        assert!(matches!(
+            parser.push(0x8c).as_slice(),
+            [Input::Key(KeyEvent {
+                code: KeyCode::Char('界'),
+                ..
+            })]
+        ));
     }
 
     /// Cancelled and invalid/unterminated pastes cannot become ordinary shortcut events.

@@ -12,19 +12,38 @@ impl AppState {
         if layout.list_rows() == 0 {
             return None;
         }
+        if matches!(command, Command::Activate | Command::Newline)
+            && self.focus == Some(Control::PathCancel)
+        {
+            return self.command(Command::Cancel, layout);
+        }
         let (row, end) = match &mut self.modal {
             Some(Modal::Language { row, .. }) => (row, Choice::options().count() - 1),
             Some(Modal::SyntaxTheme { config, row }) => (row, config.themes().count() - 1),
             _ => return None,
         };
         *row = match command {
+            Command::FocusNext | Command::FocusPrevious => {
+                let backwards = command == Command::FocusPrevious;
+                if self.focus == Some(Control::PathCancel) {
+                    if backwards { end } else { 0 }
+                } else if (backwards && *row == 0) || (!backwards && *row == end) {
+                    self.focus = Some(Control::PathCancel);
+                    self.dirty = true;
+                    return None;
+                } else if backwards {
+                    *row - 1
+                } else {
+                    *row + 1
+                }
+            }
             Command::Move(Movement::Up, _) => row.saturating_sub(1),
             Command::Move(Movement::Down, _) => (*row + 1).min(end),
             Command::Move(Movement::Home | Movement::Start, _) => 0,
             Command::Move(Movement::End | Movement::Finish, _) => end,
             Command::Move(Movement::PageUp, _) => row.saturating_sub(layout.list_rows() as usize),
             Command::Move(Movement::PageDown, _) => (*row + layout.list_rows() as usize).min(end),
-            Command::Newline | Command::Activate => {
+            Command::Newline | Command::Activate | Command::SelectRow => {
                 let row = match self.focus {
                     Some(Control::LanguageRow(clicked)) if command == Command::Activate => clicked,
                     _ => *row,
@@ -63,7 +82,10 @@ impl AppState {
             return PasteTarget::SearchField(self.field_generation, self.search.field);
         }
         if self.field_open()
-            && (self.focus == Some(Control::PathField) || self.search_field_focused())
+            && (matches!(
+                self.focus,
+                Some(Control::PathField | Control::SettingsField)
+            ) || self.search_field_focused())
         {
             PasteTarget::Field(self.field_generation)
         } else if self.editor_focused() && self.ready() && self.guard_request.is_none() {
@@ -168,6 +190,16 @@ impl AppState {
         let Some(Modal::Open(picker)) = &mut self.modal else {
             return None;
         };
+        let target = match command {
+            Command::PickerParent => Some(Control::PickerUp),
+            Command::PickerPrevious => Some(Control::PickerPrevious),
+            Command::PickerNext => Some(Control::PickerNext),
+            Command::SelectRow => Some(Control::PickerList),
+            _ => None,
+        };
+        if target.is_some_and(|target| !layout.contains(target)) {
+            return None;
+        }
         match command {
             Command::Backspace if self.focus == Some(Control::PathField) => {
                 self.edit_field(FieldEdit::Backspace)
@@ -201,7 +233,12 @@ impl AppState {
                 self.focus = Some(Control::PickerList);
                 self.dirty = true;
             }
-            Command::Activate | Command::Newline => match self.focus {
+            Command::Activate
+            | Command::Newline
+            | Command::PickerParent
+            | Command::PickerPrevious
+            | Command::PickerNext
+            | Command::SelectRow => match target.or(self.focus) {
                 Some(Control::PathCancel) => return self.command(Command::Cancel, layout),
                 Some(Control::PathField) => {
                     if let Some(pending) = &mut self.field_paste {
@@ -220,8 +257,8 @@ impl AppState {
                     return self.request_picker(path, Some(Browse::First));
                 }
                 Some(Control::PickerPrevious | Control::PickerNext) => {
-                    let browse =
-                        picker.page_request(self.focus == Some(Control::PickerPrevious))?;
+                    let browse = picker
+                        .page_request(target.or(self.focus) == Some(Control::PickerPrevious))?;
                     let directory = picker.directory.clone();
                     return self.request_picker(directory, Some(browse));
                 }
@@ -245,6 +282,17 @@ impl AppState {
         let Some(Modal::Tabs(highlight)) = &mut self.modal else {
             return None;
         };
+        let requested = match command {
+            Command::SelectRow => Some(Control::TabList),
+            Command::CloseSelectedTab => Some(Control::TabListClose),
+            _ => None,
+        };
+        if requested.is_some_and(|target| {
+            !layout.contains(target)
+                || command == Command::CloseSelectedTab && self.focus != Some(target)
+        }) {
+            return None;
+        }
         match command {
             Command::Tab | Command::FocusNext | Command::FocusPrevious => {
                 self.focus = layout.next(self.focus, command == Command::FocusPrevious);
@@ -272,8 +320,11 @@ impl AppState {
                 self.focus = Some(Control::TabList);
                 self.dirty = true;
             }
-            Command::Activate | Command::Newline => {
-                let action = match self.focus {
+            Command::Activate
+            | Command::Newline
+            | Command::SelectRow
+            | Command::CloseSelectedTab => {
+                let action = match requested.or(self.focus) {
                     Some(Control::TabList | Control::TabListSwitch) => {
                         Action::Switch((*highlight)?)
                     }

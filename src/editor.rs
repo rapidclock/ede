@@ -23,7 +23,7 @@ use std::{
         mpsc::{self, Receiver, SyncSender, TrySendError},
     },
     thread::{self, JoinHandle},
-    time::Duration,
+    time::{Duration, Instant},
 };
 mod recovery;
 mod refresh;
@@ -200,6 +200,7 @@ pub(crate) enum Action {
     RetryHighlighting(TabId),
     SyntaxTheme(Arc<str>),
     ReloadHighlighting,
+    ApplySettings(crate::settings::Values, u64),
     RecoveryPage {
         generation: u64,
         cursor: Option<(u64, crate::recovery::Id)>,
@@ -305,6 +306,7 @@ pub(crate) struct Screen {
     pub syntax_theme: Arc<str>,
     pub syntax_notice: Option<Arc<str>>,
     pub syntax_epoch: u64,
+    pub settings_generation: u64,
     pub can_replace: bool,
     pub search: Arc<search::Status>,
     pub tab: Option<TabId>,
@@ -335,6 +337,7 @@ impl Default for Screen {
             syntax_theme: Arc::from("Dark"),
             syntax_notice: None,
             syntax_epoch: 0,
+            settings_generation: 0,
             can_replace: true,
             search: Arc::default(),
             tab: None,
@@ -436,6 +439,7 @@ impl Editor {
         startup: crate::stream::Startup,
         recovery: crate::recovery::Store,
         syntax_program: Option<PathBuf>,
+        syntax_config_directory: Option<PathBuf>,
     ) -> std::io::Result<Self> {
         let (sender, receiver) = mpsc::sync_channel(256);
         let (event_sender, events) = mpsc::sync_channel(16);
@@ -454,17 +458,20 @@ impl Editor {
             .name("ede-editor".into())
             .spawn(move || {
                 match StorageService::with_stop_flag(OpenOptions::default(), stopping.clone()) {
-                    Ok(service) => Coordinator::new(
-                        service,
-                        receiver,
-                        event_sender,
-                        output,
-                        stopping,
-                        active,
-                        view_cancellation,
-                    )
-                    .with_retention(recovery)
-                    .run(launch_directory, startup),
+                    Ok(service) => {
+                        let mut coordinator = Coordinator::new(
+                            service,
+                            receiver,
+                            event_sender,
+                            output,
+                            stopping,
+                            active,
+                            view_cancellation,
+                        )
+                        .with_retention(recovery);
+                        coordinator.syntax = syntax_state::State::new(syntax_config_directory);
+                        coordinator.run(launch_directory, startup);
+                    }
                     Err(error) => {
                         if let Ok(mut slot) = output.lock() {
                             *slot = Some(Screen {
@@ -745,6 +752,7 @@ struct Coordinator {
     reader_slots: Arc<AtomicUsize>,
     stream_guard: Option<After>,
     quit_ready: bool,
+    settings_generation: u64,
     export: Option<streams::Export>,
 }
 impl Coordinator {
@@ -800,6 +808,7 @@ impl Coordinator {
             reader_slots: Arc::default(),
             stream_guard: None,
             quit_ready: false,
+            settings_generation: 0,
             export: None,
         }
     }
@@ -944,6 +953,7 @@ impl Coordinator {
     /// Coalesce screen updates; two bounded layouts at most are retained across the bridge.
     fn publish(&mut self) {
         self.syntax.screen(&mut self.tab.screen);
+        self.tab.screen.settings_generation = self.settings_generation;
         self.tab.screen.can_replace = self.tab.capability == crate::search::Capability::Editable;
         self.tab.screen.exporting = self.export.is_some();
         self.tab.screen.search = Arc::new(self.search.status.clone());
@@ -1356,6 +1366,17 @@ impl Coordinator {
     }
     /// Handle one ordered user intention, leaving state intact on a failed edit.
     fn action(&mut self, action: Action) -> Result<(), Error> {
+        if let Action::ApplySettings(values, generation) = action {
+            self.settings_generation = generation;
+            if let Some(retention) = &mut self.retention {
+                retention.set_interval(Instant::now(), values.checkpoint());
+            }
+            if self.syntax.set_limits(values.syntax()) {
+                self.tab.screen.syntax_projection = None;
+                self.tab.screen.syntax_status = syntax::Status::Preparing;
+            }
+            return Ok(());
+        }
         if let Some(export) = &mut self.export {
             match &action {
                 Action::Guard(after) | Action::Discard(after, _)
@@ -1447,6 +1468,7 @@ impl Coordinator {
             }
             Action::SyntaxTheme(name) => self.syntax.theme(name),
             Action::ReloadHighlighting => self.syntax.reload(),
+            Action::ApplySettings(..) => unreachable!("settings are handled before document work"),
             Action::RecoveryPage {
                 generation,
                 cursor,
@@ -2441,6 +2463,14 @@ mod tests {
         );
         assert!(worker.tab.pending_edit.is_some());
         assert_eq!(worker.tab.undo_views.len(), 1);
+        let mut settings = crate::settings::Values::default();
+        settings.set(crate::settings::Scalar::Timeout, Some(20));
+        worker.action(Action::ApplySettings(settings, 42)).unwrap();
+        assert_eq!(worker.settings_generation, 42);
+        assert!(
+            worker.tab.pending_edit.is_some(),
+            "settings must not reconcile the caret"
+        );
         fault.0.store(false, Ordering::Release);
         worker.action(Action::Command(Command::Undo)).unwrap();
         assert_eq!(contents(&mut worker), "ab");
