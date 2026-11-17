@@ -618,6 +618,11 @@ Branch — `stage/mvp_validation`. PR target — `feat/initial_mvp`.
 
 Evidence — [Stage 10 validation record](10_mvp_validation.md#validation-record).
 
+Under review — [Proposed pre-release changes](10_mvp_validation.md#proposed-pre-release-changes)
+cover a system clipboard toggle, an empty-session welcome view, tab boundaries,
+and double-click activation in the Open picker. The terminal checks include
+the reported macOS shortcuts and SSH clipboard paths.
+
 - Validate the complete workflow on macOS/Linux and the agreed local, SSH, tmux,
   Eternal Terminal, and mosh combinations. Include reconnect/resize behavior,
   clipboard fallbacks, checkpoint interruptions, and file/storage failures.

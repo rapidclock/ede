@@ -6,21 +6,21 @@ Branch — `stage/mvp_validation`. PR target — `feat/initial_mvp`.
 
 Depends on Stages 01–09, integrated through Stage 09 at `dfacfe2`. The
 [approved MVP overview](overview.md) defines the scope and FR-01–FR-10. This
-draft specifies the validation scenarios and proposes reference environments
-and measurement procedures. Exact terminal versions and profiles are determined
-by the runs. Approval of this draft and authorization to carry it out are separate
-decisions.
+draft specifies the validation scenarios, reference environments, and proposed
+pre-release changes. Exact terminal versions and profiles are determined by
+the runs. Approval of this draft and authorization to carry it out are
+separate decisions.
 
 ## Outcome and scope
 
 A source build of ede at package version `0.0.1` can be used for ordinary editing,
 occasional editing of files larger than RAM, and live-output inspection. The
 stage closes when the acceptance criteria have recorded evidence and a user can
-build, operate, configure, and recover the editor with the README. Use the
-existing CLI, TUI, storage policies, and tests. Implementation work is limited to
-validation tooling and fixes needed to satisfy the approved contracts. Packaging,
-installers, automatic updates, release distribution, and deployment are outside
-this stage.
+build, operate, configure, and recover the editor with the README. Reuse the
+existing CLI, TUI, storage policies, and tests. Implementation work covers
+validation tooling, fixes needed to satisfy the approved contracts, and any
+pre-release proposals below that are accepted. Packaging, installers,
+automatic updates, release distribution, and deployment are outside this stage.
 
 Use prior validation records for detailed behavioral coverage, failure guards,
 and known limitations. Match each reused result to the code and environment it
@@ -28,6 +28,100 @@ actually exercised. Rerun applicable evidence when intervening changes affect
 its behavior or conditions. Run the integrated workflows, candidate build and
 native gates on the candidate revision. A Stage 01 or Stage 03 deferral of a
 manual check leaves it open for Stage 10.
+
+## Proposed pre-release changes
+
+The user reported that Copy in ede on Ubuntu left the Mac clipboard unchanged,
+both through their tmux pane and in Terminal.app over direct SSH. They proposed
+a Settings toggle to keep both clipboard workflows. They also reported that
+physical Cmd shortcuts invoked Mac or terminal actions, including a dialog to
+export terminal output on Cmd+S. The proposed clipboard details and UI scope
+below are for design review. The existing Cmd requirement already applies.
+
+### Clipboard setting and client paste
+
+Stage 03 defines a private clipboard per running ede process. Add a proposed
+**Copy to system clipboard** toggle to Settings. In `config.toml`, use the
+optional boolean `clipboard.copy_to_system` under `[clipboard]`. Omission,
+Restore Defaults, and `--safe-config` select `false`. Apply changes through the
+existing save/reload revision path and retain the last good revision on an
+invalid reload. An existing config needs no migration.
+
+- In either mode, explicit Copy and committed Cut populate ede's private
+  clipboard. `Ctrl+V` continues to paste that clipboard. The terminal's Paste
+  action supplies system clipboard text through normal terminal input. A
+  delivered Cmd+V shortcut continues to invoke ede's Paste command. If the
+  terminal handles Cmd+V itself, insert the received text once.
+- With the applied setting enabled at command dispatch and at output admission,
+  also send the captured text using one OSC 52 clipboard write. Do this only
+  after internal Copy succeeds or the Cut deletion commits. The destination is
+  the client terminal's system clipboard, including when ede runs remotely.
+  Use only the write operation. Reading system clipboard contents is outside
+  this integration.
+- Propose an 8 KiB limit on the UTF-8 byte count of the outgoing selection.
+  Check exact round trips up to the proposed limit on each supported path.
+  Leave larger selections available internally and report the reason they
+  were kept internal. Send one bounded base64 payload with terminal framing.
+  Keep spool reads off the UI thread and serialize the frame with other tty
+  output. Never emit raw selection bytes as terminal commands or write the
+  sequence to redirected document output.
+- No selection, failed Copy, and failed or cancelled Cut send no clipboard
+  write. A successful Cut whose external write fails leaves all cut text in
+  the internal clipboard. Before transmission, retire a pending write if
+  overtaken by a newer successful Copy or Cut, a change back to internal-only,
+  or terminal suspension or teardown. Re-enabling starts with future commands
+  and cannot revive an older write. Serialize accepted writes so older data
+  cannot follow a newer write.
+- Finish an admitted frame before sending unrelated output. If the write fails
+  after sending any frame bytes, recover the terminal parser with a verified
+  abort sequence before drawing again, or treat the tty as unusable under the
+  existing terminal-loss policy. Do not retry a partial payload or wait
+  indefinitely. Recoverable write failures preserve the internal clipboard and
+  committed Cut state. A lost tty follows the existing interrupted-session
+  recovery rules.
+- Report **Copied internally** or **Cut to internal clipboard** when no write
+  is sent. Include the reason when the requested write was skipped or failed.
+  When the frame has been sent, report that a system clipboard request was
+  sent. A successful tty write cannot confirm the client accepted it.
+
+Document the terminal's clipboard write permission and tmux forwarding
+requirements for setups that pass. A tmux copy-mode selection reaching the Mac
+clipboard establishes only the tmux-originated path. `set-clipboard external`
+can permit that while ignoring writes by applications in a pane. Verify
+`set-clipboard on`, the clipboard capability, and the outer terminal's
+permission as applicable in a disposable profile. Document the tested
+terminal selection or tmux copy-mode fallback where OSC 52 is unavailable.
+The editor leaves terminal and tmux settings under the user's control.
+[Stage 03 clipboard policy](03_editing_and_mouse.md#mouse-and-clipboard),
+[tmux clipboard settings](https://github.com/tmux/tmux/wiki/Clipboard),
+[iTerm2 clipboard permissions](https://iterm2.com/documentation-preferences-general.html).
+
+### Empty startup, tabs, and picker
+
+- Show a welcome view if startup resolves with zero tabs. Offer **Open File** and
+  **New Scratch** with their effective shortcuts, portable defaults Ctrl+O
+  and Ctrl+N, and mouse actions using the existing command routes. Preserve
+  startup and recovery order and restore retained scratches as usual. Keep
+  each file-open error visible in the resulting session, including when there
+  are zero tabs. Startup errors that prevent the interactive session still use
+  the existing exit diagnostic. Successful opens, recoveries, pipes, and
+  followers use their existing tab flow. A scratch is created by New Scratch
+  or an existing explicit workflow such as stdin promotion. The same welcome
+  view works after closing the last tab. This supersedes the automatic blank
+  scratch in Stages 04–05 if accepted.
+- Give each visible tab a compact visual boundary and distinguish the active
+  tab through its shape or text emphasis as well as any color. Preserve
+  modified and attention indicators, tab hit targets, and access to overflow
+  tabs at 40×8. Keep the header to its existing one row.
+- In the Open picker, a single click selects a row. Two consecutive completed
+  left clicks on the same current row within a proposed 400 ms interval invoke
+  the existing Open action once, entering a directory or opening a file. Keep
+  keyboard Enter and the Open button. Clear click history on activation, a
+  different target, a drag, focus loss, or a listing or layout change, so an
+  old click cannot activate another path.
+
+The user clarified that reStructuredText, CSV, and TSV support means syntax
+highlighting. Defer those additions until after `0.0.1` under this proposal.
 
 ## Candidate and test fixtures
 
@@ -183,6 +277,44 @@ catalog.
 
 [Stage 09 settings](09_configuration_and_keybindings.md#acceptance-criteria)
 
+### V08 — System clipboard toggle (proposed, FR-03 and FR-09)
+
+Use a disposable config to toggle, save, relaunch, reload, and restore defaults.
+Verify a changed or reset draft takes effect only after save. Test a malformed
+value and safe startup. A real PTY must emit no OSC 52 write in internal-only
+mode, on an empty selection, or after a failed Copy or Cut. In enabled mode
+decode the frame and compare the bytes with a selection containing a wide
+character and newline. Check internal-only, request-sent, and skipped or
+failed status messages. Copy from active stdin through its controlling tty.
+Cut there is rejected and emits nothing. Check that Cut on an editable tab
+publishes only after deletion commits. Simulate a rejected write before
+transmission and verify internal Paste still recovers the text. Inject failure
+after the OSC introducer and verify abort/recovery or terminal-loss handling
+before unrelated output. Exercise the
+payload limit at and above the boundary. Use controlled ordering to complete
+a Copy started while disabled after enabling the toggle. Then hold an enabled
+Copy while disabling and re-enabling. Neither held command may send a frame.
+Exercise pending-write revocation on newer Copy and suspension. Run the client
+clipboard sequence below with the actual frontend and tmux/SSH path.
+
+### V09 — Empty session, tab strip, and picker (proposed, FR-03, FR-05, FR-10)
+
+Launch with an empty state profile and no paths. Verify zero tabs, visible
+Open/New actions, and no scratch created on Quit. Repeat with failed CLI
+opens and confirm their errors in the welcome view. Relaunch with retained
+scratches and confirm their order and view are restored without an extra
+scratch. Repeat with failed CLI opens alongside successful scratch recovery.
+Verify the errors stay visible and the restored scratch is active. Open and
+create from the welcome screen with keyboard and mouse, using both defaults
+and remapped shortcuts.
+Close the last tab and repeat. At regular size and 40×8, switch tabs, inspect
+dirty/error indicators, and access tabs outside the strip. In the Open picker
+verify single-click selection, activation after a timed double-click of the
+same file or directory, and keyboard activation. Spaced clicks select only.
+A third click cannot activate again or carry a pending click into the next
+listing. Verify no accidental activation across a resize, drag, or replacement
+listing.
+
 For changed data-protection guards, add or extend the focused regression first,
 show the expected pre-fix failure, then record the passing test and the
 deliberate guard break and assertion failure. Reuse existing focused tests where
@@ -270,6 +402,27 @@ interruption. A version tested on one path establishes evidence for that path.
    focus distinctions. Record interception and the verified portable or
    Actions fallback on direct, tmux and macOS-to-Linux paths. Changing a user's
    terminal or tmux configuration is outside the editor's responsibility.
+   Include the reported Terminal.app → SSH → Ubuntu path and the reported
+   iTerm2 path through tmux, recording where the tmux server runs. Try Cmd+S
+   with a dirty fixture and check saved bytes. Apple's default Terminal.app
+   shortcut exports the terminal's text. Record such terminal actions and
+   verify Ctrl+S or a tested profile mapping saves the file in ede. If a
+   Cmd event reaches ede and fails to dispatch, reproduce and fix it.
+   [Apple Terminal keyboard shortcuts](https://support.apple.com/en-mn/guide/terminal/trmlshtcts/mac),
+   [iTerm2 profile key mappings](https://iterm2.com/documentation-preferences-profiles-keys.html).
+6. **Client clipboard (if the toggle is accepted).** Try an ordinary Copy in
+   Terminal.app over direct SSH to Ubuntu and in iTerm2 over direct SSH and
+   through the reported tmux topology. Include an iTerm2 local baseline.
+   Use distinct markers for the existing macOS clipboard and the selection
+   in ede. In internal-only mode, paste into a Mac GUI app to verify its old
+   clipboard and use Ctrl+V in ede to verify the new internal copy. With the
+   toggle enabled, verify exact pasted text in the Mac app on a supported
+   direct SSH path and a supported tmux path, including a committed Cut and
+   a selection at the documented limit. Use the terminal Paste action to
+   send a new Mac marker to ede and verify that it inserts once. Where the
+   path discards OSC 52, verify internal Paste and a terminal-selection or
+   tmux copy-mode route. Record the actual outcome before listing a path or
+   payload size as supported.
 
 A PTY that injects mouse or keyboard sequences can establish ede's decoding
 and cleanup behavior. A passing row in this matrix requires the actual frontend
@@ -390,7 +543,7 @@ versus copy where observed, and exercise the forced-copy path.
    stage deferral leave the Stage 10 check open.
 3. Update the README with locked source-build prerequisites, first-run edits,
    saves and scratch behavior, pipe/follow examples, configuration paths and
-   safe startup, portable controls, clipboard alternatives, known limitations,
+   safe startup, portable controls, clipboard modes and fallbacks, known limitations,
    and the tested terminal/version/profile/transport combinations. Link to the
    evidence here. Verify the commands in a fresh isolated checkout and profile
    on each OS and the documented terminal-specific instructions in their
@@ -415,12 +568,13 @@ versus copy where observed, and exercise the forced-copy path.
 | MVP-03 | B10-1 through B10-4 have results with measured latency, memory and disk behavior. The 1 GiB / 8 GiB baseline and larger-than-RAM runs are evidenced independently. Missed goals or exceeded budgets are fixed and rechecked or resolved by user-approved requirement changes. |
 | MVP-04 | Native locked checks, opted-in regressions, and independent review for the candidate are recorded. Required failure and controlled ordering evidence is present. |
 | MVP-05 | A fresh source build and documented workflows work as described, and Cargo metadata, the executable and README agree on `0.0.1`. The validation record states supported paths, observed limitations, and approved dispositions. |
+| MVP-06 | Record candidate evidence for each accepted pre-release proposal. Clipboard acceptance uses V08 and the client clipboard sequence, with README guidance for the toggle, default, tested paths, and fallbacks. Use the applicable V09 cases for each accepted UI change. |
 
 ## Validation record
 
 Integrated implementation and release validation are **pending**. Record the
 candidate SHA, commands or manual steps, environment, results, and logs for each
-V01–V07, T10, B10 and MVP criterion here as checks run. Keep design review
+applicable V, T10, B10 and MVP criterion here as checks run. Keep design review
 evidence and actual implementation evidence identifiable by revision. No new
 coverage deferral has been approved.
 
@@ -435,3 +589,9 @@ coverage deferral has been approved.
   limit. All 313 enabled tests passed. Ten opt-in tests were skipped. The
   passing run used normal terminal permissions after the sandbox denied access
   to the controlling tty in seven pipe tests.
+- Independent review of the proposed pre-release changes against `77157ae`
+  checked clipboard authorization, incomplete terminal writes, empty-session
+  errors, picker click ordering, and applicability of the new checks. Follow-up
+  review of the fixes found no remaining actionable findings. Formatting,
+  Clippy, and the 313 enabled macOS baseline tests passed again. Real clipboard
+  and shortcut behavior remains to be verified on the reported terminal paths.
