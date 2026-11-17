@@ -1,6 +1,6 @@
 # 001 — Initial MVP overview
 
-Status — **MVP scope and roadmap accepted. Stages 01–08 merged. Stage 09 implementation verified on macOS and Ubuntu.**
+Status — **MVP scope and roadmap accepted. Stages 01–09 merged. Stage 10 design drafted.**
 
 Project: **ede**, a predominantly Rust terminal text editor for macOS and Linux.
 
@@ -594,7 +594,7 @@ Evidence — [Stage 08 validation record](08_pipes_and_follow.md#validation-reco
 
 Design — [09_configuration_and_keybindings.md](09_configuration_and_keybindings.md). Depends on Stages 01–08.
 
-Status — Implemented and verified on macOS and Ubuntu. Draft PR targets the feature branch.
+Status — Complete. [PR #9](https://github.com/rapidclock/ede/pull/9) merged into `feat/initial_mvp` at `dfacfe2`.
 
 Branch — `stage/configuration_and_keybindings`. PR target — `feat/initial_mvp`.
 
@@ -610,7 +610,13 @@ Evidence — [Stage 09 validation record](09_configuration_and_keybindings.md#va
 
 ### 10 — Integrated MVP validation
 
-Planned file: `10_mvp_validation.md`. Depends on: 01–09.
+Design — [10_mvp_validation.md](10_mvp_validation.md). Depends on Stages 01–09.
+
+Status — Design draft. Integrated validation pending.
+
+Branch — `stage/mvp_validation`. PR target — `feat/initial_mvp`.
+
+Evidence — [Stage 10 validation record](10_mvp_validation.md#validation-record).
 
 - Validate the complete workflow on macOS/Linux and the agreed local, SSH, tmux,
   Eternal Terminal, and mosh combinations. Include reconnect/resize behavior,
