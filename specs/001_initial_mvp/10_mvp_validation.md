@@ -648,10 +648,10 @@ transport matrix remains open.
 | --- | --- |
 | T10-1 and T10-2 | **Blocked** pending iTerm2 3.7.7 frontend and physical Cmd evidence. Native PTY and isolated local tmux input and suspension passed on macOS. |
 | T10-3 | **Partial**. XTerm 379 under Xvfb on Debian copied the marker into the X11 system clipboard, resized, saved exact bytes with Ctrl+S and restored `stty -g` on Quit. The remaining base sequence is open. |
-| T10-4 | **Partial**. XTerm 379 with tmux 3.3a did not transfer the marker to the X11 clipboard with `set-clipboard on` and `xterm*:clipboard`. The isolated tmux PTY editing and suspend probe passed. The graphical sequence and clipboard fallback are open. |
+| T10-4 | **Partial**. XTerm 379 with tmux 3.3a forwarded the exact marker to X11 PRIMARY with `set-clipboard on` and `xterm*:clipboard`. CLIPBOARD retained its previous value. Internal Ctrl+V worked, native tmux copy mode retained the exact marker in its buffer, and resize, Ctrl+S, exact saved bytes and tty restoration passed. The remainder of the graphical sequence is open. |
 | T10-5 | **Partial**. OpenSSH 10.5p1 on macOS allocated an Ubuntu PTY. Exact OSC 52 bytes crossed SSH. Ctrl+S saved exact bytes and Quit restored terminal modes. Killing a separate SSH client retired its editor. A fresh 96×32 PTY retained the last saved named-file bytes and reopened the last acknowledged scratch checkpoint, then restored its original termios on exit. Mac GUI paste and the full base sequence are open. |
 | T10-6 | **Partial**. Isolated remote tmux 3.7b forwarded the OSC 52 payload with `set-clipboard on` and `xterm*:clipboard`. A fresh SSH connection reattached at 96×32, retained the unsaved marker, saved exact bytes and restored the inner tty. Mac GUI paste and remaining base and tmux actions are open. |
-| T10-7 and T10-8 | **Partial**. Upstream Mosh 1.4.0 for macOS arm64 and the staged Ubuntu Mosh 1.4.0 server ran. Full interruption/resumption and graphical frontend evidence are open. |
+| T10-7 and T10-8 | **Partial**. Mosh 1.4.0 on macOS arm64 and Ubuntu arm64 resumed after a 12 s bidirectional UDP drop in an isolated loopback relay, both directly and through isolated tmux 3.7b. The client PTY changed from 80×24 to 96×32 during the interruption. The same editor retained the unsaved marker, accepted bracketed paste, saved exact bytes and restored the inner tty. Graphical frontend and remaining base actions are open. |
 | T10-9 and T10-10 | **Blocked**. The macOS Eternal Terminal 7.1.1 binary could not load with the available Protobuf runtime. No Eternal Terminal server package was available from the configured Ubuntu repositories. |
 
 Mac GUI clipboard and the final Cmd check remain open. Computer Use denied
@@ -715,6 +715,8 @@ MVP-01 and MVP-06 have automated candidate evidence for V01–V09. Required
 frontend workflows and exact client paste remain open. MVP-02 requires the
 rest of the terminal matrix and the final macOS Cmd check. MVP-03 retains
 the resource and timing gaps above. MVP-04 has native locked checks, independent
-review and mutation evidence. The full GitHub Actions matrix is pending.
+review and mutation evidence. The implementation commit `5aae2e5` has a
+[macOS draft CI run](https://github.com/rapidclock/ede/actions/runs/44132439675/job/134212859697).
+The full GitHub Actions matrix is pending.
 MVP-05 remains open for terminal-specific instructions and the locked
 `0.0.1` release build after validation.
