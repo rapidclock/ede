@@ -13,8 +13,9 @@ use crossterm::event::{
 };
 use nix::poll::{PollFd, PollFlags, poll};
 use std::{
+    fs::File,
     io::{self, Read},
-    os::fd::AsFd,
+    os::fd::{AsFd, AsRawFd},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -32,14 +33,17 @@ pub(crate) struct Ingress {
 }
 impl Ingress {
     /// Spawn after raw mode acquisition; no second terminal reader may run concurrently.
-    pub fn new() -> io::Result<Self> {
+    pub fn new(tty: Option<File>) -> io::Result<Self> {
         let (sender, inbox) = mpsc::sync_channel(256);
         let stop = Arc::new(AtomicBool::new(false));
         let stopping = stop.clone();
         let worker = thread::Builder::new()
             .name("ede-input".into())
             .spawn(move || {
-                let result = read_terminal(&sender, &stopping);
+                let result = match tty {
+                    Some(tty) => read_terminal(tty, true, &sender, &stopping),
+                    None => read_terminal(io::stdin().lock(), false, &sender, &stopping),
+                };
                 if let Err(error) = result {
                     send(&sender, Err(error), &stopping);
                 }
@@ -96,16 +100,26 @@ fn send(
     }
 }
 /// Poll stdin and terminal geometry without consuming capability replies elsewhere.
-fn read_terminal(sender: &SyncSender<io::Result<Input>>, stop: &AtomicBool) -> io::Result<()> {
-    let stdin = io::stdin();
-    let mut input = stdin.lock();
+fn read_terminal(
+    mut input: impl Read + AsFd + AsRawFd,
+    explicit_tty: bool,
+    sender: &SyncSender<io::Result<Input>>,
+    stop: &AtomicBool,
+) -> io::Result<()> {
     let mut parser = Parser::default();
     let mut bytes = [0; 8192];
-    let mut size = crossterm::terminal::size()?;
+    let geometry = |input: &_| {
+        if explicit_tty {
+            crate::terminal::size_of(input)
+        } else {
+            crossterm::terminal::size()
+        }
+    };
+    let mut size = geometry(&input)?;
     let mut last = Instant::now();
     while !stop.load(Ordering::Acquire) {
         parser.reclaim();
-        let next = crossterm::terminal::size()?;
+        let next = geometry(&input)?;
         if next != size {
             size = next;
             if !send(sender, Ok(Input::Resize(size.0, size.1)), stop) {
@@ -120,7 +134,21 @@ fn read_terminal(sender: &SyncSender<io::Result<Input>>, stop: &AtomicBool) -> i
                 Err(error) => return Err(error.into()),
             }
         };
-        if !ready {
+        let count = if ready {
+            match input.read(&mut bytes) {
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    // A controlling-tty alias can report readiness before its slave
+                    // has bytes. Keep the independent Escape deadline running.
+                    thread::sleep(Duration::from_millis(5));
+                    None
+                }
+                result => Some(result?),
+            }
+        } else {
+            None
+        };
+        let Some(count) = count else {
             if last.elapsed() >= Duration::from_millis(40) {
                 for event in parser.expire() {
                     if !send(sender, Ok(event), stop) {
@@ -129,10 +157,6 @@ fn read_terminal(sender: &SyncSender<io::Result<Input>>, stop: &AtomicBool) -> i
                 }
             }
             continue;
-        }
-        let count = match input.read(&mut bytes) {
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-            result => result?,
         };
         if count == 0 {
             return Err(io::Error::new(

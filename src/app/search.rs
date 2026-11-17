@@ -25,6 +25,7 @@ impl Panel {
     }
     pub(crate) fn request(&self, operation: Operation) -> SearchRequest {
         SearchRequest {
+            replacement_scope: None,
             navigation: None,
             query: self.query.clone(),
             replacement: self.replacement.clone(),

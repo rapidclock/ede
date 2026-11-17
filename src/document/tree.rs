@@ -27,6 +27,30 @@ pub(super) struct Root {
     pub entry: Entry,
     pub height: u16,
 }
+impl Root {
+    /// A stream's immutable contiguous extent needs no node write on every append.
+    /// Such roots are used only for reads. Promotion installs an ordinary leaf.
+    pub(super) fn contiguous(piece: Entry) -> Self {
+        debug_assert!(matches!(piece.id, 0 | 3));
+        Self {
+            entry: Entry {
+                id: u64::MAX - piece.id,
+                ..piece
+            },
+            height: 0,
+        }
+    }
+
+    fn stream_piece(self) -> Option<Entry> {
+        match u64::MAX - self.entry.id {
+            offset @ (0 | 3) if self.height == 0 => Some(Entry {
+                id: offset,
+                ..self.entry
+            }),
+            _ => None,
+        }
+    }
+}
 /// Disk old-to-new IDs used during one atomic compaction attempt.
 pub(super) struct Remapping {
     /// Old node page ID to new page ID plus one (zero means not copied).
@@ -48,6 +72,7 @@ pub(super) struct Tree {
     generation: u64,
     cache: Arc<Mutex<Cache>>,
     pub(super) uncached: bool,
+    pub(super) stream_reader: bool,
 }
 impl Tree {
     /// Create an empty arena; each page contains a header and 24-byte entries.
@@ -61,6 +86,7 @@ impl Tree {
             generation,
             cache,
             uncached: false,
+            stream_reader: false,
         }
     }
     /// Independent reader of this already-published immutable page prefix.
@@ -73,6 +99,7 @@ impl Tree {
             generation: self.generation,
             cache: self.cache.clone(),
             uncached: self.uncached,
+            stream_reader: self.stream_reader,
         })
     }
     /// A background copy must never hold the foreground cache mutex during filesystem I/O.
@@ -132,6 +159,14 @@ impl Tree {
     }
     /// Read and validate a disk page, its aggregate weights, and height.
     fn read(&self, root: Root) -> Result<Node, Error> {
+        if self.stream_reader
+            && let Some(piece) = root.stream_piece()
+        {
+            return Ok(Node {
+                height: 0,
+                entries: (piece.bytes != 0).then_some(piece).into_iter().collect(),
+            });
+        }
         if root.entry.id >= self.pages {
             return Err(Error::CorruptStorage);
         }

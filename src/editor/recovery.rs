@@ -850,6 +850,9 @@ impl Coordinator {
                         retention.sweep = false;
                         retention.due = Instant::now() + retention.interval;
                         if let Some(sequence) = retention.quitting.take() {
+                            // Freeze promotions until the UI accepts this quit or
+                            // cancels it. A superseded acknowledgement must not stop streams.
+                            self.quit_ready = true;
                             self.event(Event::QuitReady(sequence));
                         }
                     }

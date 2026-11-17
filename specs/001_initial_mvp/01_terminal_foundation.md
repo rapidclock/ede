@@ -370,3 +370,15 @@ passes locally alongside the expanded Stage 02 suite. Formatting, Clippy with
 warnings denied, and Rust API documentation with warnings denied also pass.
 Native Linux/macOS review-fix CI results are recorded in
 [Stage 02's review record](02_document_storage.md#review-pass--2026-11-03).
+
+### SSH follow-up during Stage 08
+
+On 2026-11-15, the Ubuntu 26.10 arm64 VM became available over SSH from the
+macOS tmux client. The direct Linux shell path passed interactive stream
+display, Escape, Ctrl+S and Ctrl+Q, and Suspend followed by the shell's `fg`.
+The shell's exact `stty -g` matched both while suspended and after Quit. The
+SSH path with an additional Ubuntu tmux 3.7b session passed follower startup,
+rotation, confirmation and clean exit. The local isolated tmux and Unix PTY
+regressions ran on both systems. See the
+[Stage 08 validation record](08_pipes_and_follow.md#validation-record) for the
+tested environments and limits.

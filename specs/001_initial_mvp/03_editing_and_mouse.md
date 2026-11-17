@@ -794,3 +794,17 @@ and Linux environments. Those exclusions do not establish environment passes.
 The user's Stage 01 approval to defer unavailable manual frontend/SSH/mosh/Eternal
 Terminal checks remains recorded there. It does not automatically approve new
 Stage 03 gaps. No new deferral is claimed here; Stage 03 remains in progress.
+
+### Linux and SSH follow-up during Stage 08
+
+On 2026-11-15, Ubuntu 26.10 arm64 passed the full locked suite, including
+real PTY editing, clipboard, paste, mouse, resize and job-control checks. The
+isolated tmux 3.7b smoke passed portable editing, mouse selection, bracketed
+paste, suspend/resume and termios restoration. All three 1 GiB interactive
+file corpora passed under the 256 MiB, swap-disabled cgroup. The 64 MiB
+paste probe passed with the Linux `/usr/bin/time -v` wrapper. The macOS
+tmux client also reached the Ubuntu editor over SSH with and without a nested
+Ubuntu tmux server. See the
+[Stage 08 validation record](08_pipes_and_follow.md#validation-record) for the
+manual SSH checks. Native graphical terminal behavior and the mosh and
+Eternal Terminal paths still need their own environments.

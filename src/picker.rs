@@ -251,6 +251,7 @@ fn list(path: &Path, browse: &Browse, cancel: &Cancellation) -> io::Result<Page>
 /// View state retained when navigation or path activation fails.
 #[derive(Clone, Debug)]
 pub(crate) struct Dialog {
+    pub follow: bool,
     pub directory: PathBuf,
     pub page: Option<Page>,
     pub highlight: usize,
@@ -264,6 +265,7 @@ pub(crate) struct Dialog {
 impl Dialog {
     pub fn new(directory: PathBuf) -> Self {
         Self {
+            follow: false,
             directory,
             page: None,
             highlight: 0,

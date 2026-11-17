@@ -225,6 +225,7 @@ pub(super) struct StoreData {
     pub directory: TempDir,
     pub original_longest: u64,
     pub cloned: bool,
+    pub(super) captured: Option<super::live::Payload>,
 }
 /// Last-reference disposal transfers the complete generation to its bounded worker.
 pub(super) struct Store {
@@ -354,6 +355,7 @@ impl Store {
                     directory,
                     original_longest: 0,
                     cloned: is_clone,
+                    captured: None,
                 }),
             },
             is_clone,

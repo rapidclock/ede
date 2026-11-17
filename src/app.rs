@@ -32,6 +32,7 @@ pub(crate) enum Intent {
 pub(crate) enum PathKind {
     Save,
     GoTo,
+    Export,
 }
 /// Only one overlay owns keyboard and pointer interaction at a time.
 #[derive(Clone, Debug)]
@@ -86,6 +87,7 @@ enum PasteTarget {
     SearchField(u64, u8),
     Tab(Option<TabId>),
     Ignore,
+    ReadOnly,
 }
 /// Shell state contains only bounded prepared data; document bytes remain with storage.
 pub(crate) struct AppState {
@@ -126,6 +128,7 @@ pub(crate) struct AppState {
     field_submit: Option<u64>,
     search_submit_field: Option<u8>,
     pub field_error: Option<String>,
+    pub stream_confirmation: Option<String>,
 }
 /// Discoverable menu actions; every item shares keyboard command dispatch.
 pub(crate) const MENU: &[(Command, &str)] = &[
@@ -160,6 +163,10 @@ pub(crate) const MENU: &[(Command, &str)] = &[
     (Command::SyntaxTheme, "Syntax Theme…"),
     (Command::ReloadHighlighting, "Reload Highlighting"),
     (Command::RetryHighlighting, "Retry Highlighting"),
+    (Command::FollowFile, "Follow File…"),
+    (Command::ToggleFollow, "Pause View / Resume Follow"),
+    (Command::RetryFinish, "Retry Finish"),
+    (Command::ExportRetained, "Export Retained Copy…"),
 ];
 impl AppState {
     /// Begin with text focus and a visible asynchronous preparation state.
@@ -202,6 +209,7 @@ impl AppState {
             field_submit: None,
             search_submit_field: None,
             field_error: None,
+            stream_confirmation: None,
         }
     }
     /// Keep relative picker paths independent of the process's later environment.
@@ -242,6 +250,23 @@ impl AppState {
             }
         }
         let choice = self.screen.syntax_language;
+        if let Some(stream) = &self.screen.stream {
+            let following = if stream.following {
+                "following"
+            } else {
+                "paused"
+            };
+            label.push_str(&format!(
+                "\nRead-only retained history — {} bytes; {following}\n{}; generation {}",
+                stream.retained, stream.phase, stream.generations
+            ));
+            if let Some(boundary) = stream.boundary {
+                label.push_str(&format!("\nLatest boundary: {boundary}"));
+            }
+            if let Some(detail) = &stream.detail {
+                label.push_str(&format!("\n{}", crate::text::safe(detail)));
+            }
+        }
         let language = choice.name(self.screen.path.as_deref(), &self.screen.syntax_config);
         let mode = if choice == Choice::Auto {
             "Auto"
@@ -315,12 +340,11 @@ impl AppState {
             self.switching = None;
         }
         if self.screen.tab != screen.tab
-            || self.screen.document != screen.document
-            || (!pending
-                && self.capture.is_some_and(|capture| {
-                    capture.control == Control::Content
-                        && screen.pointer_press != Some(capture.press)
-                }))
+            || self.capture.is_some_and(|capture| {
+                capture.control == Control::Content
+                    && (self.screen.document != screen.document
+                        || (!pending && screen.pointer_press != Some(capture.press)))
+            })
         {
             self.capture = None;
         }
@@ -340,11 +364,12 @@ impl AppState {
     }
     /// Consume asynchronous guard/save events without allowing a stale save to close work.
     pub fn event(&mut self, event: Event) -> Option<Intent> {
-        if matches!(&event, Event::Guard(sequence,..)|Event::QuitTabs(sequence,..)|Event::Proceed(sequence,..)|Event::Uncertain(sequence,..)|Event::QuitReady(sequence) if self.guard_request!=Some(*sequence))
+        if matches!(&event, Event::StreamGuard(sequence,..)|Event::Guard(sequence,..)|Event::QuitTabs(sequence,..)|Event::Proceed(sequence,..)|Event::Uncertain(sequence,..)|Event::QuitReady(sequence) if self.guard_request!=Some(*sequence))
         {
             return None;
         }
         match event {
+            Event::Exported(message) => self.message(&message),
             Event::PersistenceFailed(tab, after, message) => {
                 let guarded = self.guard_request.is_some();
                 self.abort_guard();
@@ -401,10 +426,15 @@ impl AppState {
                 self.show_open_error();
             }
             Event::QuitTabs(_, tabs) => {
+                self.stream_confirmation = None;
                 self.quit_remaining = Some(tabs.into());
                 return self.next_quit_tab();
             }
-            Event::Guard(_, after, true) => {
+            Event::Guard(_, after, true) | Event::StreamGuard(_, after, _) => {
+                self.stream_confirmation = match event {
+                    Event::StreamGuard(_, _, message) => Some(message),
+                    _ => None,
+                };
                 self.guard_busy = false;
                 self.discarding = false;
                 self.guard_after = Some(after);
@@ -552,6 +582,7 @@ impl AppState {
         }))
     }
     fn abort_guard(&mut self) {
+        self.stream_confirmation = None;
         self.guard_request = None;
         self.guarded_path = None;
         self.save_dialog = None;
@@ -687,6 +718,10 @@ impl AppState {
                         tab,
                         Box::new(Action::Paste(paste)),
                     ))),
+                    PasteTarget::ReadOnly => {
+                        self.message("Document is read-only");
+                        None
+                    }
                     _ => {
                         self.message("Paste requires editor or path field focus");
                         None
@@ -769,11 +804,12 @@ impl AppState {
                 return Some(Intent::Editor(Action::CancelActiveOpen(self.switching)));
             }
             if self.screen.loading
+                && self.screen.stream.is_none()
                 && let Some(tab) = self.screen.tab
             {
                 return Some(Intent::Editor(Action::CancelOpen(tab)));
             }
-            if self.pending {
+            if self.pending || self.screen.exporting {
                 return Some(Intent::CancelWork);
             }
             self.capture = None;
@@ -861,6 +897,14 @@ impl AppState {
                         return None;
                     }
                     let path = PathBuf::from(field.as_str());
+                    if kind == PathKind::Export {
+                        self.modal = None;
+                        self.focus = Some(Control::Content);
+                        self.dirty = true;
+                        return self
+                            .path_tab
+                            .map(|tab| Intent::Editor(Action::ExportRetained(tab, path)));
+                    }
                     self.modal = None;
                     self.focus = Some(Control::Content);
                     self.dirty = true;
@@ -904,7 +948,7 @@ impl AppState {
                 && layout.area.height >= 8
             {
                 match self.focus {
-                    Some(Control::ConfirmSave) => {
+                    Some(Control::ConfirmSave) if self.stream_confirmation.is_none() => {
                         if self.guard_busy {
                             return None;
                         }
@@ -1090,7 +1134,7 @@ impl AppState {
                 Some(Intent::Editor(Action::Guard(After::Quit)))
             }
             Command::New => self.tab_change(Action::New),
-            Command::Open => {
+            Command::Open | Command::FollowFile => {
                 if self.switching.is_some() {
                     return None;
                 }
@@ -1107,9 +1151,9 @@ impl AppState {
                 self.search_submit_field = None;
                 self.opener = self.focus;
                 self.help = false;
-                self.modal = Some(Modal::Open(Box::new(picker::Dialog::new(
-                    directory.clone(),
-                ))));
+                let mut picker = picker::Dialog::new(directory.clone());
+                picker.follow = command == Command::FollowFile;
+                self.modal = Some(Modal::Open(Box::new(picker)));
                 self.focus = Some(Control::PickerList);
                 self.request_picker(directory, Some(Browse::First))
             }
@@ -1179,6 +1223,30 @@ impl AppState {
             Command::RetryHighlighting => {
                 Some(Intent::Editor(Action::RetryHighlighting(self.screen.tab?)))
             }
+            Command::ToggleFollow => self
+                .screen
+                .stream
+                .as_ref()
+                .and(self.screen.tab)
+                .map(|tab| Intent::Editor(Action::ToggleFollow(tab))),
+            Command::RetryFinish => self
+                .screen
+                .stream
+                .as_ref()
+                .filter(|status| status.retry)
+                .and(self.screen.tab)
+                .map(|tab| Intent::Editor(Action::RetryFinish(tab))),
+            Command::ExportRetained => {
+                if self
+                    .screen
+                    .stream
+                    .as_ref()
+                    .is_some_and(|status| status.stopped)
+                {
+                    self.path(PathKind::Export);
+                }
+                None
+            }
             Command::Recovery => self.open_recovery(),
             Command::RetryRefresh => {
                 self.modal = None;
@@ -1186,6 +1254,10 @@ impl AppState {
                 Some(Intent::Editor(Action::RetryRefresh(self.screen.tab?)))
             }
             Command::Save if self.ready() && self.screen.tab.is_some() => {
+                if self.screen.stream.is_some() {
+                    self.message("Document is read-only");
+                    return None;
+                }
                 Some(Intent::Editor(Action::Save(None)))
             }
             Command::GoTo if self.ready() => {
@@ -1193,6 +1265,10 @@ impl AppState {
                 None
             }
             Command::SaveAs if self.ready() && self.screen.tab.is_some() => {
+                if self.screen.stream.is_some() {
+                    self.message("Document is read-only");
+                    return None;
+                }
                 self.path(PathKind::Save);
                 None
             }
@@ -1815,6 +1891,40 @@ mod tests {
             Some(Modal::Confirm(After::Quit, Some(JobId(2))))
         ));
     }
+
+    /// A tab list click survives the active document finishing its background open.
+    #[test]
+    fn tab_list_click_survives_active_document_installation() {
+        let mut app = AppState::new();
+        app.screen.tab = Some(TabId(1));
+        let selected = TabId(5);
+        app.modal = Some(Modal::Tabs(Some(selected)));
+        let area = Rect::new(0, 0, 80, 24);
+        let layout = LayoutSnapshot::for_app(area, &app, 1);
+        let (column, row) = (0..24)
+            .flat_map(|row| (0..80).map(move |column| (column, row)))
+            .find(|(column, row)| layout.hit(*column, *row) == Some(Control::TabListSwitch))
+            .unwrap();
+        let mouse = |kind| {
+            Input::Pointer(MouseEvent {
+                kind,
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+        app.input(mouse(MouseEventKind::Down(MouseButton::Left)), &layout);
+        let mut loaded = app.screen.clone();
+        loaded.document = Some(crate::document::DocumentId(1));
+        loaded.loading = false;
+        app.update(loaded, false);
+        assert_eq!(layout.signature, LayoutSnapshot::signature(&app));
+        app.sync_layout(&layout);
+        assert!(matches!(
+            app.input(mouse(MouseEventKind::Up(MouseButton::Left)), &layout),
+            Some(Intent::Editor(Action::Switch(tab))) if tab == selected
+        ));
+    }
     /// Ingress rejection remains visible if an earlier paste finishes before the next frame.
     #[test]
     fn paste_rejection_survives_a_worker_update() {
@@ -1944,7 +2054,9 @@ mod tests {
                 .is_none()
         );
         assert!(app.capture.is_none());
+        app.mouse_capture = true;
         app.input(pointer(MouseEventKind::Down(MouseButton::Left)), &layout);
+        assert!(app.capture.is_some());
         app.input(Input::Resize(40, 8), &layout);
         assert!(
             app.input(pointer(MouseEventKind::Up(MouseButton::Left)), &layout)
