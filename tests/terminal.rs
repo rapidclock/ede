@@ -721,15 +721,32 @@ fn piped_input_displays_incrementally_and_becomes_editable_at_eof() {
 }
 
 fn piped_editor() -> (PtyChild, File) {
+    piped_editor_with_options(&[], None)
+}
+
+/// Keep producer bytes on a separate descriptor from keyboard input.
+fn piped_editor_with_options(args: &[&str], config: Option<&std::path::Path>) -> (PtyChild, File) {
     use nix::fcntl::{FcntlArg, FdFlag, fcntl};
     let (reader, writer) = nix::unistd::pipe().unwrap();
     for fd in [&reader, &writer] {
         fcntl(fd, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC)).unwrap();
     }
-    (redirected_editor(Stdio::from(reader)), File::from(writer))
+    (
+        redirected_editor_with_options(Stdio::from(reader), args, config),
+        File::from(writer),
+    )
 }
 
 fn redirected_editor(input: Stdio) -> PtyChild {
+    redirected_editor_with_options(input, &[], None)
+}
+
+/// Pass ede's native arguments through the shell wrapper without interpolation.
+fn redirected_editor_with_options(
+    input: Stdio,
+    args: &[&str],
+    config: Option<&std::path::Path>,
+) -> PtyChild {
     let mut command = Command::new("/bin/sh");
     // Drop the wrapper's pipe reader after launching EDE. Keep only its tty open
     // so Darwin allows the parent test to inspect termios after EDE exits.
@@ -737,7 +754,7 @@ fn redirected_editor(input: Stdio) -> PtyChild {
         "-c",
         r#"
 exec 3<&0 0</dev/tty
-"$1" <&3 3<&- &
+"$@" <&3 3<&- &
 pid=$!
 printf 'EDE_PID:%s\n' "$pid"
 exec 3<&-
@@ -750,9 +767,68 @@ exit "$result"
         "ede-pipe-test",
         env!("CARGO_BIN_EXE_ede"),
     ]);
+    command.args(args);
+    if let Some(config) = config {
+        command.env("XDG_CONFIG_HOME", config);
+    }
     let mut process = PtyChild::spawn_with_input(&mut command, Some(input));
     process.keep_alive = true;
     process
+}
+
+/// K06: Safe startup preserves stdin promotion and the normal recovery checkpoint.
+#[test]
+fn safe_config_stdin_becomes_recoverable_scratch() {
+    let (mut process, mut producer) = piped_editor_with_options(&["--safe-config", "--"], None);
+    producer.write_all(b"safe stdin input").unwrap();
+    process.expect_body("safe stdin input", TIMEOUT);
+    drop(producer);
+    process.expect_status("Editable scratch");
+    process.send(b"!");
+    process.expect_body("safe stdin input!", TIMEOUT);
+    let state = process._state_root.as_ref().unwrap().path().join("state");
+    process.send(b"\x11");
+    assert!(process.wait().success());
+    process.assert_restored();
+
+    let mut reopened =
+        PtyChild::editor_with_state(Some("xterm-256color"), ["--safe-config"], Some(&state));
+    reopened.expect_body("safe stdin input!", TIMEOUT);
+    reopened.send(b"\x11");
+    assert!(reopened.wait().success());
+    reopened.assert_restored();
+}
+
+/// K07: a live reload reaches a stdin scratch even when the producer closes concurrently.
+#[test]
+fn settings_checkpoint_interval_reaches_promoted_stdin() {
+    let root = tempfile::tempdir().unwrap();
+    let config = root.path().join("ede/config.toml");
+    std::fs::create_dir(config.parent().unwrap()).unwrap();
+    let configure = |seconds| {
+        std::fs::write(
+            &config,
+            format!("[recovery]\ncheckpoint_interval_seconds = {seconds}"),
+        )
+        .unwrap()
+    };
+    configure(30);
+    let (mut process, mut producer) = piped_editor_with_options(&[], Some(root.path()));
+    producer.write_all(b"cadence applies to stdin").unwrap();
+    process.expect_body("cadence applies to stdin", TIMEOUT);
+    process.expect_status("User config");
+    configure(1);
+    syntax_action(&mut process, 36);
+    let started = Instant::now();
+    drop(producer);
+    process.expect_status("Editable scratch");
+    process.send(b"!");
+    process.expect_body("cadence applies to stdin!", TIMEOUT);
+    process.expect_status("Scratch checkpoint retained");
+    assert!(started.elapsed() < Duration::from_secs(4));
+    process.send(b"\x11");
+    assert!(process.wait().success());
+    process.assert_restored();
 }
 
 #[test]
@@ -966,6 +1042,342 @@ fn pathname_follow_keeps_old_text_and_separates_rotated_text() {
     process.send(b"\x11");
     process.expect("discard retained stream history");
     process.send(b"\x1b[Z\r");
+    assert!(process.wait().success());
+    process.assert_restored();
+}
+
+/// K06: A following tab is still read-only and retains its Quit confirmation.
+#[test]
+fn safe_config_follow_uses_ordinary_stream_guards() {
+    let directory = tempfile::tempdir().unwrap();
+    let source = directory.path().join("history.log");
+    let bytes = b"retained history\n";
+    std::fs::write(&source, bytes).unwrap();
+    let mut process = PtyChild::editor_with_args(
+        Some("xterm-256color"),
+        [
+            std::ffi::OsStr::new("--safe-config"),
+            std::ffi::OsStr::new("--follow"),
+            source.as_os_str(),
+        ],
+    );
+    process.expect_body("retained history", TIMEOUT);
+    process.send(b"X");
+    process.expect_status("Document is read-only");
+    process.send(b"\x11");
+    process.expect("discard retained stream history");
+    process.send(b"\x1b");
+    process.expect_absent("discard retained stream history");
+    process.send(b"\x11");
+    process.expect("discard retained stream history");
+    process.send(b"\x1b[Z\r");
+    assert!(process.wait().success());
+    process.assert_restored();
+    assert_eq!(std::fs::read(source).unwrap(), bytes);
+}
+
+/// K06: with --, a leading dash is part of the filename even in safe mode.
+#[test]
+fn safe_config_opens_literal_dash_prefixed_path() {
+    let mut source = tempfile::NamedTempFile::with_prefix_in("-ede-dash-", ".").unwrap();
+    source.write_all(b"dash path contents").unwrap();
+    let mut process = PtyChild::editor_with_args(
+        Some("xterm-256color"),
+        [
+            std::ffi::OsStr::new("--safe-config"),
+            std::ffi::OsStr::new("--"),
+            source.path().file_name().unwrap(),
+        ],
+    );
+    process.expect_body("dash path contents", TIMEOUT);
+    process.send(b"\x11");
+    assert!(process.wait().success());
+    process.assert_restored();
+    assert_eq!(std::fs::read(source.path()).unwrap(), b"dash path contents");
+}
+
+/// K02: apply bindings at dispatch and preserve document-save and dirty-Quit guards.
+#[test]
+fn general_config_changes_save_quit_and_search_focus_routes() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("ede");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::write(
+        root.join("config.toml"),
+        "[keybindings.global]\nsave = ['F9']\nquit = ['Ctrl+B']\n\
+         [keybindings.editor]\nfocus_search = ['F10']\nmove_right = ['Alt+Right']\nselect_right = ['F12']\n\
+         [keybindings.search]\nfocus_editor = ['F11']\nfield_backspace = ['Ctrl+D']\n",
+    )
+    .unwrap();
+    let source = directory.path().join("source.txt");
+    std::fs::write(&source, b"original").unwrap();
+    let mut process = PtyChild::editor_with_options(
+        Some("xterm-256color"),
+        [&source],
+        None,
+        Some(directory.path()),
+        None,
+    );
+    process.expect_status("User config");
+    process.expect_status("Ready");
+    process.expect_body("original", TIMEOUT);
+    process.send(b"\x06oriX\x04g");
+    process.expect(">Find: orig");
+    process.send(b"\x1b[23~");
+    process.send(b"X");
+    process.expect_body("Xoriginal", TIMEOUT);
+    process.send(b"\x1b[21~");
+    process.expect(">Find: orig");
+    process.send(b"\x1b");
+    process.expect_absent("Find: orig");
+    process.send(b"\x1b[1;3C\x1b[24~R");
+    process.expect_body("XoRiginal", TIMEOUT);
+    process.send(b"\x13");
+    assert_eq!(std::fs::read(&source).unwrap(), b"original");
+    process.send(b"\x1b[20~");
+    process.expect_status("Saved");
+    assert_eq!(std::fs::read(&source).unwrap(), b"XoRiginal");
+    process.send(b"Y\x11\x02");
+    process.expect("Save your changes before continuing?");
+    process.send(b"\x1b[Z\r");
+    assert!(process.wait().success());
+    process.assert_restored();
+    assert_eq!(std::fs::read(source).unwrap(), b"XoRiginal");
+}
+
+/// K01/K06: an invalid reload retains the last map, and a bad startup stays recoverable.
+#[test]
+fn invalid_general_config_preserves_previous_revision_and_default_quit() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("ede");
+    std::fs::create_dir(&root).unwrap();
+    let config = root.join("config.toml");
+    std::fs::write(&config, "[keybindings.global]\nquit = ['Ctrl+B']").unwrap();
+    let source = directory.path().join("untouched.txt");
+    std::fs::write(&source, "original").unwrap();
+    let start = || {
+        PtyChild::editor_with_options(
+            Some("xterm-256color"),
+            [&source],
+            None,
+            Some(directory.path()),
+            None,
+        )
+    };
+    let mut running = start();
+    running.expect_status("User config");
+    running.expect_status("Ready");
+    std::fs::write(&config, "[keybindings.global]\nquit = ['Cmd+Q']").unwrap();
+    syntax_action(&mut running, 36);
+    running.expect_status("Settings error");
+    running.resize(20, 4);
+    running.expect("Ctrl+B Quit");
+    running.send(b"\x02");
+    assert!(running.wait().success());
+    running.assert_restored();
+
+    let mut fallback = start();
+    fallback.expect_status("Settings error");
+    fallback.expect_status("Ready");
+    syntax_action(&mut fallback, 11); // Pause mouse capture.
+    fallback.send(b"X");
+    fallback.expect_body("Xoriginal", TIMEOUT);
+    fallback.send(b"\x11");
+    fallback.expect("Save your changes before continuing?");
+    fallback.send(b"\x1b[Z\r");
+    assert!(fallback.wait().success());
+    fallback.assert_restored();
+    assert_eq!(
+        std::fs::read_to_string(&config).unwrap(),
+        "[keybindings.global]\nquit = ['Cmd+Q']"
+    );
+    assert_eq!(std::fs::read_to_string(source).unwrap(), "original");
+}
+
+/// K07: an offscreen byte limit applies to the exact text and a reload rechecks eligibility.
+#[test]
+fn general_highlighting_limits_recheck_offscreen_crlf_lines() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("ede");
+    std::fs::create_dir(&root).unwrap();
+    let config = root.join("config.toml");
+    let source = directory.path().join("limits.rs");
+    let content = format!(
+        "fn example() {{}}\r\n{}{}\r\n",
+        "\r\n".repeat(40),
+        "x".repeat(32)
+    );
+    std::fs::write(&source, format!("\u{feff}{content}")).unwrap();
+    let write_limits = |line, document| {
+        std::fs::write(
+            &config,
+            format!("[highlighting]\nmax_line_bytes = {line}\nmax_document_bytes = {document}\n"),
+        )
+        .unwrap();
+    };
+    write_limits(31, content.len());
+    let mut process = PtyChild::editor_with_options(
+        Some("xterm-256color"),
+        [&source],
+        None,
+        Some(directory.path()),
+        None,
+    );
+    process.expect_status("Plain syntax");
+    write_limits(32, content.len());
+    syntax_action(&mut process, 36);
+    syntax_color(&mut process, 1, 0, vt100::Color::Idx(14));
+    write_limits(0, content.len());
+    syntax_action(&mut process, 36);
+    process.expect_status("Settings error");
+    syntax_color(&mut process, 1, 0, vt100::Color::Idx(14));
+    std::fs::write(
+        root.join("highlighting.toml"),
+        "default_theme = 'Aqua'\n[themes.Aqua]\nbase = 'dark'\n[themes.Aqua.colors]\nkeyword = '#1188DD'\n",
+    ).unwrap();
+    syntax_action(&mut process, 29);
+    syntax_color(&mut process, 1, 0, vt100::Color::Rgb(0x11, 0x88, 0xdd));
+    process.expect_status("Settings error");
+    write_limits(32, content.len() - 1);
+    syntax_action(&mut process, 36);
+    process.expect_status("Plain syntax");
+    process.send(b"\x11");
+    assert!(process.wait().success());
+    process.assert_restored();
+}
+
+/// K04/K05: edit a scalar with the keyboard at the minimum size and persist it.
+#[test]
+fn settings_keyboard_save_round_trips_at_minimum_size() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("ede");
+    std::fs::create_dir(&root).unwrap();
+    let config = root.join("config.toml");
+    std::fs::write(
+        &config,
+        "# Keep this comment\n[keybindings.global]\nsettings = ['F9'] # keyboard opener\n",
+    )
+    .unwrap();
+    let start = || {
+        PtyChild::editor_with_options(
+            Some("xterm-256color"),
+            std::iter::empty::<&str>(),
+            None,
+            Some(directory.path()),
+            None,
+        )
+    };
+    let mut process = start();
+    process.expect_status("User config");
+    process.resize(40, 8);
+    process.send(b"\x1b[20~");
+    process.expect("Checkpoint interval (s) 5");
+    process.send(b"\r");
+    process.expect("[Accept]");
+    process.send(b"\x7f2\r");
+    process.expect("Checkpoint interval (s) 2");
+    process.send(b"\t\r");
+    process.expect("Save Settings");
+    process.send(b"\r");
+    process.expect_status("Settings saved");
+    process.send(b"\x1b");
+    process.expect_absent("Checkpoint interval");
+    process.send(b"\x11");
+    assert!(process.wait().success());
+    process.assert_restored();
+
+    let output = std::fs::read_to_string(&config).unwrap();
+    assert!(output.contains("checkpoint_interval_seconds = 2"));
+    assert!(output.contains("# Keep this comment"));
+    assert!(output.contains("settings = ['F9'] # keyboard opener"));
+    let mut restarted = start();
+    restarted.expect_status("User config");
+    restarted.send(b"\x1b[20~");
+    restarted.expect("Checkpoint interval (s) 2");
+    restarted.send(b"\t\r");
+    restarted.expect(">Save Settings<");
+    restarted.send(b"\t\t\r");
+    restarted.expect("Checkpoint interval (s) 5");
+    assert!(
+        std::fs::read_to_string(&config)
+            .unwrap()
+            .contains("checkpoint_interval_seconds = 2")
+    );
+    restarted.send(b"\t\r");
+    restarted.expect(">Save Settings<");
+    restarted.send(b"\r");
+    restarted.expect_status("Settings saved");
+    restarted.send(b"\x1b");
+    restarted.expect_absent("Checkpoint interval");
+    restarted.send(b"\x11");
+    assert!(restarted.wait().success());
+    restarted.assert_restored();
+    let output = std::fs::read_to_string(&config).unwrap();
+    assert!(!output.contains("checkpoint_interval_seconds ="));
+    assert!(!output.contains("settings ="));
+    assert!(output.contains("# keyboard opener"));
+}
+
+/// K04: mouse entry, captured Enter, resize/cancel, typed replacement and discard protection.
+#[test]
+fn settings_capture_and_dirty_confirmation_at_minimum_size() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("ede");
+    std::fs::create_dir(&root).unwrap();
+    let config = root.join("config.toml");
+    let original = "[keybindings.global]\nsettings = ['F9']\n";
+    std::fs::write(&config, original).unwrap();
+    let mut process = PtyChild::editor_with_options(
+        Some("xterm-256color"),
+        std::iter::empty::<&str>(),
+        None,
+        Some(directory.path()),
+        None,
+    );
+    process.expect_status("User config");
+    process.resize(40, 8);
+    process.send(b"\x1b[20~");
+    process.expect("Checkpoint interval (s)");
+    process.send(&b"\x1b[B".repeat(4));
+    process.expect("controls.activate");
+    process.send(b"\x1b[<0;5;6M\x1b[<0;5;6m"); // Edit.
+    process.expect("Default 1/1 Enter");
+    process.send(b"\t\t\t\r");
+    process.expect("Type the replacement chord");
+    process.send(b"\x1b[<0;5;6M\x1b[<0;5;6m"); // Capture.
+    process.expect("Press a shortcut to preview");
+    process.send(b"\r\r\r");
+    process.expect("Captured Enter");
+    process.expect(">Discard<");
+    process.send(b"\x1b");
+    process.expect("Type the replacement chord");
+    process.send(b"\x1b[<0;5;6M\x1b[<0;5;6m");
+    process.expect("Press a shortcut to preview");
+    process.resize(20, 4);
+    process.expect("Escape exit capture");
+    process.send(b"\x1b");
+    process.expect_absent("exit capture");
+    process.resize(40, 8);
+    process.expect("Type the replacement chord");
+    process.send(b"\x1b[200~F10\x1b[201~\r");
+    process.expect("Override 1/1 F10");
+    process.send(b"\x1b");
+    process.expect("controls.activate");
+    process.send(b"\x1b");
+    process.expect(">Keep Editing<");
+    process.resize(20, 4);
+    process.expect("Escape Cancel");
+    process.send(b"\t\r");
+    process.resize(40, 8);
+    process.expect(">Keep Editing<");
+    process.send(b"\r");
+    process.expect("controls.activate");
+    process.send(b"\x1b");
+    process.expect(">Keep Editing<");
+    process.send(b"\t\r");
+    process.expect_absent("Keep Editing");
+    assert_eq!(std::fs::read_to_string(config).unwrap(), original);
+    process.send(b"\x11");
     assert!(process.wait().success());
     process.assert_restored();
 }
@@ -1564,8 +1976,16 @@ fn mouse_tabs_overflow_and_stale_release() {
 /// A real interactive shell owns job control: suspend returns cooked mode and fg resumes safely.
 #[test]
 fn suspend_and_resume_under_job_control() {
+    let config = tempfile::tempdir().unwrap();
+    let root = config.path().join("ede");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::write(
+        root.join("config.toml"),
+        "[keybindings.global]\nquit = ['Ctrl+B']",
+    )
+    .unwrap();
     let mut shell = Command::new("/bin/sh");
-    shell.arg("-i");
+    shell.arg("-i").env("XDG_CONFIG_HOME", config.path());
     let mut process = PtyChild::spawn(shell);
     process.expect_raw("EDE_TEST_PROMPT>");
     // Shells can select their own cooked settings; capture exactly what the application inherits.
@@ -1578,7 +1998,8 @@ fn suspend_and_resume_under_job_control() {
         )
         .as_bytes(),
     );
-    process.expect("Ready");
+    process.expect_status("User config");
+    process.expect_status("Ready");
     let foreground = process.editor_pid();
     process.reset_output();
     process.send(b"\x1bOP");
@@ -1600,7 +2021,9 @@ fn suspend_and_resume_under_job_control() {
     process.send(b"fg\n");
     process.expect("Cmd aliases require");
     process.reset_output();
-    process.send(b"\x11");
+    process.send(b"\x1b");
+    process.expect_absent("Cmd aliases require");
+    process.send(b"\x02");
     process.expect_raw("EDE_TEST_PROMPT>");
     process.assert_restored();
     process.send(b"exit\n");
@@ -2548,6 +2971,66 @@ fn syntax_color(process: &mut PtyChild, line: u16, column: u16, color: vt100::Co
         );
         thread::sleep(Duration::from_millis(5));
     }
+}
+
+/// K06: Safe startup keeps bundled syntax, reports the config path and rejects reload.
+#[test]
+fn safe_config_uses_bundled_theme_and_queries() {
+    // Keep the escaped path on one rendered Help line on both platforms.
+    let directory = tempfile::tempdir_in("/tmp").unwrap();
+    let root = directory.path().join("cfg-\x1b");
+    let config = root.join("ede");
+    let queries = config.join("queries/rust/highlights.scm");
+    std::fs::create_dir_all(queries.parent().unwrap()).unwrap();
+    let highlighting = config.join("highlighting.toml");
+    let general = config.join("config.toml");
+    let theme = concat!(
+        "default_theme = 'Custom'\n[themes.Custom]\nbase = 'dark'\n",
+        "[themes.Custom.colors]\nkeyword = '#AA1234'\n"
+    );
+    let query = "(primitive_type) @number";
+    let invalid_general = "[keybindings.global\nsave";
+    std::fs::write(&highlighting, theme).unwrap();
+    std::fs::write(&queries, query).unwrap();
+    std::fs::write(&general, invalid_general).unwrap();
+    let source = directory.path().join("source.rs");
+    let bytes = b"fn example() { let a: u32 = 42; }\n";
+    std::fs::write(&source, bytes).unwrap();
+    let mut process = PtyChild::editor_with_options(
+        Some("xterm-256color"),
+        [std::ffi::OsStr::new("--safe-config"), source.as_os_str()],
+        None,
+        Some(&root),
+        None,
+    );
+    process.expect_body("fn example()", TIMEOUT);
+    process.expect_status("Safe config");
+    syntax_color(&mut process, 1, 0, vt100::Color::Idx(14));
+    syntax_color(&mut process, 1, 22, vt100::Color::Idx(11));
+    syntax_action(&mut process, 11); // Disable mouse capture.
+    process.send(b"\x1bOP");
+    process.expect(r"cfg-\u{1b}/ede/config.toml");
+    process.send(b"\x1b");
+    process.expect_absent("Up/Down scroll help");
+    process.send(&[b"\x1bOQ".as_slice(), &b"\x1b[B".repeat(29)].concat());
+    process.expect("Reload Highlighting (disabled)");
+    process.send(b"\r\x1b[B");
+    process.expect(">Retry Highlighting<");
+    process.send(b"\x1b");
+    process.expect_absent("Retry Highlighting");
+    syntax_color(&mut process, 1, 0, vt100::Color::Idx(14));
+    syntax_color(&mut process, 1, 22, vt100::Color::Idx(11));
+    process.send(b"X");
+    process.expect_body("Xfn example()", TIMEOUT);
+    process.send(b"\x11");
+    process.expect("Save your changes before continuing?");
+    process.send(b"\x1b[Z\r"); // Discard only via the visible confirmation.
+    assert!(process.wait().success());
+    process.assert_restored();
+    assert_eq!(std::fs::read(source).unwrap(), bytes);
+    assert_eq!(std::fs::read_to_string(highlighting).unwrap(), theme);
+    assert_eq!(std::fs::read_to_string(queries).unwrap(), query);
+    assert_eq!(std::fs::read_to_string(general).unwrap(), invalid_general);
 }
 
 /// Custom colors and query captures can address headings and list markers independently.

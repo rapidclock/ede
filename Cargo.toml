@@ -1,6 +1,6 @@
 [package]
 name = "ede"
-version = "0.0.1-dev.8"
+version = "0.0.1-dev.9"
 edition = "2024"
 rust-version = "1.99.1"
 description = "A terminal text editor for macOS and Linux"
@@ -34,6 +34,7 @@ tree-sitter-toml-ng = "=0.7.0"
 tree-sitter-typescript = "=0.23.2"
 tree-sitter-xml = "=0.7.0"
 tree-sitter-yaml = "=0.7.2"
+toml_edit = { version = "0.25.19", default-features = false, features = ["parse", "display"] }
 
 [dev-dependencies]
 nix = { version = "0.31.3", default-features = false, features = ["signal", "fs"] }

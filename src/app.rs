@@ -5,15 +5,19 @@ use crate::{
     editor::{Action, After, Event, PointerGesture, SaveResult, Screen, TabId},
     input::Input,
     picker::{self, Browse},
+    settings::{self, Context},
     status::{Severity, StatusMessage},
     syntax::Choice,
     ui::{Control, LayoutSnapshot},
 };
-use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{
+    KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use std::{collections::VecDeque, path::PathBuf, sync::Arc, time::Duration};
 mod dialogs;
 pub(crate) mod recovery;
 pub(crate) mod search;
+pub(crate) mod settings_ui;
 
 /// Effects performed by the runtime, never by drawing or hit-testing.
 #[derive(Clone, Debug)]
@@ -58,6 +62,7 @@ pub(crate) enum Modal {
     PersistenceError(String),
     Recovery(Box<recovery::Dialog>),
     DiscardRecovery(Box<recovery::Dialog>, crate::recovery::Id),
+    Settings,
 }
 /// Captured pointer target and its geometry; text capture never activates crossed controls.
 #[derive(Clone, Copy)]
@@ -100,7 +105,14 @@ pub(crate) struct AppState {
     pub dirty: bool,
     pub screen: Screen,
     pub(crate) syntax_epoch: u64,
+    pub(crate) config_location: crate::settings::Location,
+    pub(crate) settings: settings::Service,
+    pub(crate) settings_ui: Option<Box<settings_ui::Draft>>,
+    pub(crate) settings_generation: u64,
+    pub(crate) settings_save_state: Option<settings::SaveState>,
+    pub(crate) settings_saved: bool,
     pub mouse_capture: bool,
+    pub enhanced_keyboard: bool,
     pub pending: bool,
     opener: Option<Control>,
     capture: Option<Capture>,
@@ -131,42 +143,44 @@ pub(crate) struct AppState {
     pub stream_confirmation: Option<String>,
 }
 /// Discoverable menu actions; every item shares keyboard command dispatch.
-pub(crate) const MENU: &[(Command, &str)] = &[
-    (Command::New, "New                 Ctrl+N / Cmd+N"),
-    (Command::Open, "Open                Ctrl+O / Cmd+O"),
-    (Command::Save, "Save                Ctrl+S / Cmd+S"),
-    (Command::SaveAs, "Save As             F4 / Cmd+Shift+S"),
-    (Command::Undo, "Undo                Ctrl+Z / Cmd+Z"),
-    (Command::Redo, "Redo                Ctrl+Y / Cmd+Shift+Z"),
-    (Command::Cut, "Cut                 Ctrl+X / Cmd+X"),
-    (Command::Copy, "Copy                Ctrl+C / Cmd+C"),
-    (Command::Paste, "Internal paste      Ctrl+V / Cmd+V"),
-    (Command::SelectAll, "Select all          Ctrl+A / Cmd+A"),
-    (Command::GoTo, "Go to line:cell      Ctrl+G"),
-    (Command::MouseCapture, "Toggle mouse capture"),
-    (Command::Help, "Help                F1"),
-    (Command::Suspend, "Suspend"),
-    (Command::Quit, "Quit                Ctrl+Q / Cmd+Q"),
-    (Command::Tabs, "Tabs                F7 / F8 switch"),
-    (Command::CloseTab, "Close tab           Ctrl+W / Cmd+W"),
-    (Command::TabDetails, "Tab details"),
-    (Command::Recovery, "Recovery"),
-    (Command::RetryRefresh, "Retry refresh"),
-    (Command::Find, "Find                Ctrl+F / Cmd+F"),
-    (Command::Replace, "Replace             Ctrl+H"),
-    (Command::FindNext, "Find next           F3"),
-    (Command::FindPrevious, "Find previous       Shift+F3"),
-    (Command::ReplaceNext, "Replace next"),
-    (Command::ReplaceAll, "Replace all"),
-    (Command::CancelSearch, "Cancel search"),
-    (Command::Language, "Language…"),
-    (Command::SyntaxTheme, "Syntax Theme…"),
-    (Command::ReloadHighlighting, "Reload Highlighting"),
-    (Command::RetryHighlighting, "Retry Highlighting"),
-    (Command::FollowFile, "Follow File…"),
-    (Command::ToggleFollow, "Pause View / Resume Follow"),
-    (Command::RetryFinish, "Retry Finish"),
-    (Command::ExportRetained, "Export Retained Copy…"),
+pub(crate) const MENU: &[Command] = &[
+    Command::New,
+    Command::Open,
+    Command::Save,
+    Command::SaveAs,
+    Command::Undo,
+    Command::Redo,
+    Command::Cut,
+    Command::Copy,
+    Command::Paste,
+    Command::SelectAll,
+    Command::GoTo,
+    Command::MouseCapture,
+    Command::Help,
+    Command::Suspend,
+    Command::Quit,
+    Command::Tabs,
+    Command::CloseTab,
+    Command::TabDetails,
+    Command::Recovery,
+    Command::RetryRefresh,
+    Command::Find,
+    Command::Replace,
+    Command::FindNext,
+    Command::FindPrevious,
+    Command::ReplaceNext,
+    Command::ReplaceAll,
+    Command::CancelSearch,
+    Command::Language,
+    Command::SyntaxTheme,
+    Command::ReloadHighlighting,
+    Command::RetryHighlighting,
+    Command::FollowFile,
+    Command::ToggleFollow,
+    Command::RetryFinish,
+    Command::ExportRetained,
+    Command::Settings,
+    Command::ReloadSettings,
 ];
 impl AppState {
     /// Begin with text focus and a visible asynchronous preparation state.
@@ -181,7 +195,14 @@ impl AppState {
             dirty: true,
             screen: Screen::default(),
             syntax_epoch: 0,
+            config_location: crate::settings::Location::default(),
+            settings: settings::Service::default(),
+            settings_ui: None,
+            settings_generation: 0,
+            settings_save_state: None,
+            settings_saved: false,
             mouse_capture: true,
+            enhanced_keyboard: false,
             pending: false,
             opener: None,
             capture: None,
@@ -274,10 +295,22 @@ impl AppState {
             "Manual"
         };
         label.push_str(&format!("\nLanguage: {language} ({mode})"));
-        label.push_str(&format!(
-            "\nHighlighting: {}",
-            self.screen.syntax_status.message()
-        ));
+        let limits = self.settings.applied.values.syntax();
+        let defaults = settings::SyntaxLimits::default();
+        use crate::syntax::{Fallback, Status};
+        let syntax = match self.screen.syntax_status {
+            Status::Fallback(Fallback::Size) if limits.document != defaults.document => {
+                format!("document exceeds {} bytes", limits.document)
+            }
+            Status::Fallback(Fallback::Line) if limits.line != defaults.line => {
+                format!("a line exceeds {} bytes", limits.line)
+            }
+            Status::Fallback(Fallback::Timeout) if limits.timeout != defaults.timeout => {
+                format!("analysis exceeded {} ms", limits.timeout.as_millis())
+            }
+            status => status.message().to_owned(),
+        };
+        label.push_str(&format!("\nHighlighting: {syntax}"));
         if let Some(error) = &self.screen.syntax_notice {
             label.push_str(&format!(
                 "\nHighlighting configuration: {}",
@@ -288,7 +321,13 @@ impl AppState {
     }
 
     fn field_open(&self) -> bool {
-        matches!(self.modal, Some(Modal::Path(..) | Modal::Open(_))) || self.search_field_focused()
+        matches!(self.modal, Some(Modal::Path(..) | Modal::Open(_)))
+            || self.search_field_focused()
+            || matches!(self.modal, Some(Modal::Settings))
+                && self
+                    .settings_ui
+                    .as_ref()
+                    .is_some_and(|draft| draft.editing())
     }
     /// Preserve valid focus and invalidate capture after geometry or overlay changes.
     pub fn sync_layout(&mut self, layout: &LayoutSnapshot) {
@@ -327,6 +366,10 @@ impl AppState {
     }
     /// Install the latest prepared viewport; an Arc shares drawing and pointer geometry.
     pub fn update(&mut self, mut screen: Screen, pending: bool) {
+        if screen.settings_generation != self.settings_generation {
+            screen.syntax_projection = None;
+            screen.syntax_status = crate::syntax::Status::Preparing;
+        }
         if self.syntax_epoch != screen.syntax_epoch {
             screen.syntax_projection = None;
             if screen.syntax_status == crate::syntax::Status::Ready {
@@ -376,6 +419,7 @@ impl AppState {
                 self.guard_return = None;
                 self.save_error_tab = Some(tab);
                 self.persistence_retry = after;
+                self.help = false;
                 self.modal = Some(Modal::PersistenceError(message));
                 self.focus = Some(Control::RecoveryErrorCancel);
                 self.capture = None;
@@ -654,7 +698,35 @@ impl AppState {
     }
     /// Route one input to the owning modal, control, or text surface.
     pub fn input(&mut self, input: Input, layout: &LayoutSnapshot) -> Option<Intent> {
+        if self.settings.starting {
+            match input {
+                Input::Key(KeyEvent {
+                    code: KeyCode::Esc,
+                    kind: KeyEventKind::Press,
+                    ..
+                }) => {
+                    self.settings.bypass();
+                    self.capture = None;
+                    self.dirty = true;
+                }
+                Input::Pointer(mouse) => return self.pointer(mouse, layout),
+                Input::PasteStarted(cancel) => {
+                    cancel.cancel();
+                    self.paste = Some((cancel, PasteTarget::Ignore));
+                }
+                Input::Paste(_) | Input::Notice(_) | Input::PasteRejected(_) => {
+                    self.paste = None;
+                }
+                Input::Resize(..) | Input::FocusLost | Input::FocusGained => {
+                    self.capture = None;
+                    self.dirty = true;
+                }
+                _ => {}
+            }
+            return None;
+        }
         match input {
+            Input::Key(key) => self.key(key, layout),
             Input::Command(command) => self.command(command, layout),
             Input::Text(text) => {
                 if self.search_field_focused() {
@@ -760,8 +832,127 @@ impl AppState {
             }
         }
     }
+
+    /// Determine the owning surface after decoding, just before command dispatch.
+    pub(crate) fn key_context(&self) -> Context {
+        match self.modal {
+            Some(Modal::Open(_)) => Context::Picker,
+            Some(Modal::Settings) => Context::Settings,
+            Some(_) => Context::Dialog,
+            None if self.help || self.guard_request.is_some() => Context::Dialog,
+            None if self.search.open && matches!(self.focus, Some(Control::Search(_))) => {
+                Context::Search
+            }
+            None if self.focus == Some(Control::Content) => Context::Editor,
+            None => Context::Controls,
+        }
+    }
+
+    fn key(&mut self, key: KeyEvent, layout: &LayoutSnapshot) -> Option<Intent> {
+        let context = self.key_context();
+        let command = self.settings.applied.map.command(context, key);
+        if context == Context::Settings {
+            return self.settings_key(key, command, layout);
+        }
+        if !context.has_global() && layout.overlay.is_none() && command != Some(Command::Cancel) {
+            return None;
+        }
+        if let Some(command) = command {
+            // Existing handlers retain the per-surface focus and capability checks.
+            let routed = match (context, command) {
+                (Context::Search, Command::FocusNext) => Command::Tab,
+                (Context::Search, Command::FocusPrevious) => Command::PreviousControl,
+                (_, Command::FieldBackspace) => Command::Backspace,
+                _ => command,
+            };
+            self.input(Input::Command(routed), layout)
+        } else {
+            self.input(Input::Text(crate::input::text(key)?.to_string()), layout)
+        }
+    }
+
+    /// Reconcile the completed file operation, then enqueue its editor values before later input.
+    pub(crate) fn poll_settings(&mut self, editor: Option<&mut crate::editor::Editor>) {
+        if let Some(update) = self.settings.poll(&self.config_location) {
+            self.settings_updated(update);
+            self.dirty = true;
+        }
+        let generation = self.settings_generation.wrapping_add(1);
+        if let Some(values) = self.settings.ready_values()
+            && editor.is_none_or(|bridge| bridge.submit(Action::ApplySettings(values, generation)))
+            && let Some(update) = self.settings.apply_ready()
+        {
+            self.settings_generation = generation;
+            self.capture = None;
+            self.screen.syntax_projection = None;
+            self.settings_updated(update);
+            self.dirty = true;
+        }
+        let save_state = self.settings.save_state();
+        if self.settings_save_state != save_state {
+            self.settings_save_state = save_state;
+            self.dirty = true;
+        }
+    }
+
     /// Handle named commands once for keyboard/menu/buttons, preserving modal ownership.
     fn command(&mut self, mut command: Command, layout: &LayoutSnapshot) -> Option<Intent> {
+        if self.settings.starting && command == Command::Cancel {
+            self.settings.bypass();
+            self.capture = None;
+            self.dirty = true;
+            return None;
+        }
+        if self.help
+            && self.modal.is_none()
+            && !matches!(
+                command,
+                Command::Cancel
+                    | Command::Move(..)
+                    | Command::Activate
+                    | Command::Newline
+                    | Command::Tab
+                    | Command::FocusNext
+                    | Command::FocusPrevious
+                    | Command::Quit
+                    | Command::Suspend
+            )
+        {
+            return None;
+        }
+        if matches!(self.modal, Some(Modal::Settings)) {
+            return self.settings_command(command, layout);
+        }
+        if matches!(
+            command,
+            Command::DialogSave
+                | Command::DialogDiscard
+                | Command::DialogRetry
+                | Command::ConfirmReplaceAll
+        ) || command == Command::RetryRefresh
+            && matches!(self.modal, Some(Modal::Details(_) | Modal::TabDetails))
+        {
+            let target = match (&self.modal, command) {
+                (Some(Modal::Confirm(..)), Command::DialogSave) => Control::ConfirmSave,
+                (Some(Modal::Confirm(..) | Modal::DiscardRecovery(..)), Command::DialogDiscard) => {
+                    Control::ConfirmDiscard
+                }
+                (Some(Modal::PersistenceError(_)), Command::DialogRetry) => {
+                    Control::RecoveryErrorRetry
+                }
+                (
+                    Some(Modal::Details(_) | Modal::TabDetails),
+                    Command::DialogRetry | Command::RetryRefresh,
+                ) => Control::RetryRefresh,
+                (Some(Modal::ReplaceAll(_)), Command::ConfirmReplaceAll) => Control::Search(15),
+                _ => return None,
+            };
+            return if self.focus == Some(target) && layout.contains(target) {
+                self.command(Command::Activate, layout)
+            } else {
+                None
+            };
+        }
         if let Some(result) = self.search_command(command, layout) {
             return result;
         }
@@ -840,7 +1031,7 @@ impl AppState {
                 if matches!(command, Command::Move(Movement::Up | Movement::PageUp, _)) {
                     self.help_scroll.saturating_sub(1)
                 } else {
-                    self.help_scroll.saturating_add(1).min(80)
+                    self.help_scroll.saturating_add(1).min(2048)
                 };
             self.dirty = true;
             return None;
@@ -1085,8 +1276,8 @@ impl AppState {
                     self.dirty = true;
                     return None;
                 }
-                Command::Newline | Command::Activate => {
-                    command = MENU[*index].0;
+                Command::Newline | Command::Activate | Command::SelectRow => {
+                    command = MENU[*index];
                 }
                 Command::FocusNext | Command::FocusPrevious | Command::Tab => {
                     *index = (*index
@@ -1099,14 +1290,24 @@ impl AppState {
                     self.dirty = true;
                     return None;
                 }
-                _ => {}
+                _ => return None,
+            }
+            if matches!(
+                command,
+                Command::ReloadHighlighting | Command::ReloadSettings
+            ) && self.config_location.user_directory().is_none()
+            {
+                return None;
             }
             let from_menu = self.modal.take();
             if matches!(command, Command::CloseTab | Command::Quit) && self.switching.is_none() {
                 self.guard_return = from_menu;
                 self.guard_focus = self.focus;
             }
-            self.focus = if matches!(command, Command::Language | Command::SyntaxTheme) {
+            self.focus = if matches!(
+                command,
+                Command::Language | Command::SyntaxTheme | Command::Settings
+            ) {
                 self.opener.take().or(Some(Control::Content))
             } else {
                 Some(Control::Content)
@@ -1117,6 +1318,16 @@ impl AppState {
             return None;
         }
         match command {
+            Command::Settings => {
+                self.open_settings();
+                None
+            }
+            Command::ReloadSettings => {
+                if self.config_location.user_directory().is_some() {
+                    self.settings.reload();
+                }
+                None
+            }
             Command::Find
             | Command::Replace
             | Command::FindNext
@@ -1219,7 +1430,11 @@ impl AppState {
                 self.dirty = true;
                 None
             }
-            Command::ReloadHighlighting => Some(Intent::Editor(Action::ReloadHighlighting)),
+            Command::ReloadHighlighting => self
+                .config_location
+                .user_directory()
+                .is_some()
+                .then_some(Intent::Editor(Action::ReloadHighlighting)),
             Command::RetryHighlighting => {
                 Some(Intent::Editor(Action::RetryHighlighting(self.screen.tab?)))
             }
@@ -1277,11 +1492,17 @@ impl AppState {
             Command::MouseCapture => {
                 self.mouse_capture = !self.mouse_capture;
                 self.capture = None;
-                self.message(if self.mouse_capture {
-                    "Mouse capture enabled"
+                let message = if self.mouse_capture {
+                    "Mouse capture enabled".to_owned()
                 } else {
-                    "Mouse capture paused; F2 to re-enable"
-                });
+                    let key = self
+                        .settings
+                        .applied
+                        .map
+                        .portable_hint(Context::Global, Command::Menu);
+                    format!("Mouse capture paused. {key} opens Actions.")
+                };
+                self.message(&message);
                 Some(Intent::MouseCapture(self.mouse_capture))
             }
             Command::Menu => {
@@ -1307,7 +1528,7 @@ impl AppState {
                 self.dirty = true;
                 None
             }
-            Command::FocusNext | Command::FocusPrevious => {
+            Command::FocusNext | Command::FocusPrevious | Command::FocusSearch => {
                 self.focus = layout.next(self.focus, command == Command::FocusPrevious);
                 self.dirty = true;
                 None
@@ -1341,6 +1562,20 @@ impl AppState {
     /// Press captures the text/control surface; dragging cannot activate other controls.
     fn pointer(&mut self, mouse: MouseEvent, layout: &LayoutSnapshot) -> Option<Intent> {
         if !self.mouse_capture {
+            return None;
+        }
+        if matches!(self.modal, Some(Modal::Settings))
+            && layout.overlay.is_some()
+            && matches!(
+                mouse.kind,
+                MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+            )
+        {
+            self.settings_adjacent(if mouse.kind == MouseEventKind::ScrollUp {
+                -3
+            } else {
+                3
+            });
             return None;
         }
         if self.search.open
@@ -1477,7 +1712,14 @@ impl AppState {
                         // Keyboard focus may have changed while the button was held.
                         // Activate the clicked control, not another focused button.
                         self.focus = Some(capture.control);
-                        if let Control::Tab(tab) = capture.control {
+                        if let Control::SettingsButton(button) = capture.control {
+                            self.settings_button(button, layout);
+                        } else if let Control::MenuItem(clicked) = capture.control
+                            && let Some(Modal::Menu(index)) = &mut self.modal
+                        {
+                            *index = clicked;
+                            return self.command(Command::Activate, layout);
+                        } else if let Control::Tab(tab) = capture.control {
                             if self.guard_request.is_none() {
                                 return self.tab_change(Action::Switch(tab));
                             }
@@ -1559,7 +1801,11 @@ impl AppState {
                 .search_submit_field
                 .take()
                 .map(Control::Search)
-                .or(Some(Control::PathField));
+                .or(Some(if matches!(self.modal, Some(Modal::Settings)) {
+                    Control::SettingsField
+                } else {
+                    Control::PathField
+                }));
             return self.command(Command::Newline, layout);
         }
         if now.saturating_sub(self.last_drag) < Duration::from_millis(50) {
@@ -1679,6 +1925,10 @@ impl AppState {
             match &mut self.modal {
                 Some(Modal::Path(_, field)) => field,
                 Some(Modal::Open(picker)) => &mut picker.field,
+                Some(Modal::Settings) => match &mut self.settings_ui {
+                    Some(draft) if draft.editing() => &mut draft.field,
+                    _ => return false,
+                },
                 _ => return false,
             }
         };
@@ -1716,7 +1966,21 @@ mod tests {
         let area = Rect::new(0, 0, 40, 8);
         let menu_layout = LayoutSnapshot::for_app(area, &app, 1);
         app.input(Input::Command(Command::Menu), &menu_layout);
-        app.input(Input::Command(Command::Language), &menu_layout);
+        let language = MENU
+            .iter()
+            .position(|command| *command == Command::Language)
+            .unwrap();
+        for _ in 0..language {
+            app.input(
+                Input::Command(Command::Move(Movement::Down, false)),
+                &menu_layout,
+            );
+        }
+        let menu_layout = LayoutSnapshot::for_app(area, &app, 2);
+        app.input(
+            Input::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            &menu_layout,
+        );
         let mut layout = LayoutSnapshot::for_app(area, &app, 2);
         for row in 1..Choice::options().count() {
             app.input(
@@ -2062,5 +2326,138 @@ mod tests {
             app.input(pointer(MouseEventKind::Up(MouseButton::Left)), &layout)
                 .is_none()
         );
+    }
+}
+
+#[cfg(test)]
+mod settings_guard_tests {
+    use super::*;
+    use ratatui::layout::Rect;
+
+    #[test]
+    fn unavailable_dialog_command_cannot_dispatch_into_covered_document() {
+        let mut app = AppState::new();
+        app.screen.document = Some(crate::document::DocumentId(1));
+        app.screen.tab = Some(TabId(1));
+        app.screen.loading = false;
+        app.settings
+            .applied
+            .map
+            .set_override(
+                Context::Dialog,
+                "retry_refresh",
+                vec!["F9".parse().unwrap()],
+            )
+            .unwrap();
+        app.settings.applied.map.revalidate().unwrap();
+        let area = Rect::new(0, 0, 80, 24);
+        let layout = LayoutSnapshot::for_app(area, &app, 1);
+        app.command(Command::Menu, &layout);
+        let layout = LayoutSnapshot::for_app(area, &app, 2);
+        assert!(
+            app.input(
+                Input::Key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)),
+                &layout
+            )
+            .is_none(),
+            "a local command unavailable in Actions must not reach the document",
+        );
+        assert!(matches!(app.modal, Some(Modal::Menu(0))));
+        app.command(Command::Cancel, &layout);
+        let layout = LayoutSnapshot::for_app(area, &app, 3);
+        app.command(Command::Help, &layout);
+        let layout = LayoutSnapshot::for_app(area, &app, 4);
+        app.input(
+            Input::Key(KeyEvent::new(KeyCode::F(4), KeyModifiers::NONE)),
+            &layout,
+        );
+        assert!(
+            app.help && app.modal.is_none(),
+            "Help must consume its disabled Save As"
+        );
+        assert!(
+            app.input(
+                Input::Key(KeyEvent::new(KeyCode::F(9), KeyModifiers::NONE)),
+                &layout
+            )
+            .is_none()
+        );
+        assert!(
+            app.help && app.modal.is_none(),
+            "Help must consume its disabled Retry refresh"
+        );
+    }
+
+    #[test]
+    fn remapped_discard_requires_visible_focused_confirmation() {
+        let mut app = AppState::new();
+        app.settings
+            .applied
+            .map
+            .set_override(Context::Dialog, "discard", vec!["F9".parse().unwrap()])
+            .unwrap();
+        app.settings.applied.map.revalidate().unwrap();
+        let key = KeyEvent::new(KeyCode::F(9), KeyModifiers::NONE);
+        let area = Rect::new(0, 0, 40, 8);
+        let layout = LayoutSnapshot::for_app(area, &app, 1);
+        assert!(
+            app.input(Input::Key(key), &layout).is_none(),
+            "a workspace miss must not discard"
+        );
+        app.expect_guard_for(1, After::Quit);
+        app.event(Event::Guard(1, After::Quit, true));
+        assert_eq!(app.focus, Some(Control::ConfirmCancel));
+        let visible = LayoutSnapshot::for_app(area, &app, 2);
+        assert!(
+            app.input(Input::Key(key), &visible).is_none(),
+            "Discard requires the Discard control to own focus"
+        );
+        app.focus = Some(Control::ConfirmDiscard);
+        let obscured = LayoutSnapshot::for_app(Rect::new(0, 0, 39, 8), &app, 3);
+        assert!(
+            app.input(Input::Key(key), &obscured).is_none(),
+            "a hidden Discard target must stay inactive"
+        );
+        assert!(matches!(
+            app.input(Input::Key(key), &visible),
+            Some(Intent::Editor(Action::Discard(After::Quit, None)))
+        ));
+    }
+
+    #[test]
+    fn startup_preview_accepts_only_default_bypass_and_clears_received_paste() {
+        let mut app = AppState::new();
+        app.screen.preview = Some("first text while settings load".into());
+        app.settings.starting = true;
+        let area = Rect::new(0, 0, 80, 24);
+        let layout = LayoutSnapshot::for_app(area, &app, 1);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|frame| crate::ui::render(frame, &app, &layout))
+            .unwrap();
+        let row = |y| -> String {
+            (0..80)
+                .map(|x| terminal.backend().buffer()[(x, y)].symbol())
+                .collect()
+        };
+        assert!(row(1).contains("first text while settings load"));
+        assert!(row(23).contains("Use defaults for this session"));
+        assert!(app.input(Input::Command(Command::Quit), &layout).is_none());
+        assert!(
+            app.input(Input::Text("must stay out".into()), &layout)
+                .is_none()
+        );
+        let paste = Cancellation::default();
+        app.input(Input::PasteStarted(paste.clone()), &layout);
+        assert!(paste.is_cancelled());
+        app.input(Input::Notice("Paste cancelled".into()), &layout);
+        assert!(app.paste.is_none());
+        app.input(
+            Input::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            &layout,
+        );
+        assert!(!app.settings.starting);
+        assert!(app.settings.base.is_none());
     }
 }

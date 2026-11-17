@@ -12,6 +12,7 @@ mod picker;
 mod recovery;
 mod runtime;
 pub mod search;
+mod settings;
 mod spool;
 pub mod status;
 mod stream;
@@ -109,6 +110,17 @@ pub fn run_launch(
     follow: Option<PathBuf>,
     executable: Option<PathBuf>,
 ) -> Result<Exit, Failure> {
+    run_launch_with_config(paths, follow, executable, false)
+}
+
+/// Run the CLI, optionally disabling user configuration for the session.
+#[doc(hidden)]
+pub fn run_launch_with_config(
+    paths: Vec<PathBuf>,
+    follow: Option<PathBuf>,
+    executable: Option<PathBuf>,
+    safe: bool,
+) -> Result<Exit, Failure> {
     use nix::sys::stat::{SFlag, fstat};
     let stdin = io::stdin();
     let terminal_input = stdin.is_terminal();
@@ -157,6 +169,7 @@ pub fn run_launch(
         stream::Startup { paths, source },
         executable,
         terminal,
+        safe,
     )
 }
 
@@ -197,6 +210,7 @@ fn run_session(
         },
         executable,
         UnixTerminal::default(),
+        false,
     )
 }
 
@@ -205,6 +219,7 @@ fn run_validated(
     startup: stream::Startup,
     executable: Option<PathBuf>,
     terminal: UnixTerminal,
+    safe: bool,
 ) -> Result<Exit, Failure> {
     let launch_directory = std::env::current_dir()?;
     let recovery = recovery::Store::open(recovery::Options::environment()?)?;
@@ -217,10 +232,13 @@ fn run_validated(
             session,
             &signals,
             inbox,
-            launch_directory,
-            startup,
-            recovery,
-            executable,
+            runtime::Launch {
+                directory: launch_directory,
+                documents: startup,
+                recovery,
+                syntax_program: executable,
+                config: settings::Location::discover(safe),
+            },
         )
     })
 }

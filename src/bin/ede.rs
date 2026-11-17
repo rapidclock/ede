@@ -8,7 +8,7 @@ use std::{env, panic, path::PathBuf, process::ExitCode};
 /// Parse native path arguments and report usage errors before acquiring the terminal.
 fn main() -> ExitCode {
     // Retain only enough arguments to recognize flags and reject an overlong list.
-    let args: Vec<_> = env::args_os().skip(1).take(ede::TAB_LIMIT + 2).collect();
+    let args: Vec<_> = env::args_os().skip(1).take(ede::TAB_LIMIT + 3).collect();
     match args.as_slice() {
         [arg] if arg == "--ede-syntax-worker" => {
             let result = allocator::enable().and_then(|()| {
@@ -26,7 +26,7 @@ fn main() -> ExitCode {
         }
         [arg] if arg == "--help" || arg == "-h" => {
             println!(
-                "ede {}\n\nUsage: ede [--] [FILE ...]\n       producer | ede [--] [FILE ...]\n       ede [FILE ...] < INPUT\n       ede --follow FILE\n       ede --help | --version\n\nOpen UTF-8 files in tabs. Piped stdin needs a foreground tty and becomes\nan editable scratch at valid EOF. --follow requires terminal stdin and\nopens a read-only file follower. Interactive output needs a terminal.\nF1: Help    F2: Actions    Ctrl+Q: Quit",
+                "ede {}\n\nUsage: ede [--safe-config] [--] [FILE ...]\n       producer | ede [--safe-config] [--] [FILE ...]\n       ede [--safe-config] [--] [FILE ...] < INPUT\n       ede [--safe-config] --follow FILE\n       ede --help | --version\n\nOpen UTF-8 files in tabs. Piped stdin needs a foreground tty and becomes\nan editable scratch at valid EOF. --follow requires terminal stdin and\nopens a read-only file follower. Interactive output needs a terminal.\n--safe-config uses bundled configuration for the session.\nF1: Help    F2: Actions    Ctrl+Q: Quit",
                 env!("CARGO_PKG_VERSION")
             );
             return ExitCode::SUCCESS;
@@ -37,6 +37,8 @@ fn main() -> ExitCode {
         }
         _ => {}
     }
+    let safe = args.first().is_some_and(|arg| arg == "--safe-config");
+    let args = &args[usize::from(safe)..];
     let separated = args.first().is_some_and(|arg| arg == "--");
     let follow = args.first().is_some_and(|arg| arg == "--follow");
     let paths = &args[usize::from(separated)..];
@@ -65,7 +67,7 @@ fn main() -> ExitCode {
     } else {
         (paths.iter().map(PathBuf::from).collect(), None)
     };
-    match ede::run_launch(paths, follow, env::current_exe().ok()) {
+    match ede::run_launch_with_config(paths, follow, env::current_exe().ok(), safe) {
         Ok(exit) => ExitCode::from(exit.code),
         Err(error) => {
             eprintln!("ede: {error}");

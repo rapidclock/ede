@@ -47,8 +47,8 @@ impl Panel {
                     "Current document"
                 }
             ),
-            5 => "Previous match (Shift+F3)".into(),
-            6 => "Next match (F3)".into(),
+            5 => "Previous match".into(),
+            6 => "Next match".into(),
             7 => "Replace next".into(),
             8 => "Replace all…".into(),
             9 => "Cancel search".into(),
@@ -227,17 +227,28 @@ impl AppState {
             self.dirty = true;
             return Some(Some(Intent::Editor(Action::InvalidateSearch)));
         }
-        if matches!(command, Command::FocusNext | Command::FocusPrevious) {
-            if matches!(self.focus, Some(Control::Search(_))) {
-                self.focus = Some(Control::Content);
-                self.dirty = true;
-            } else {
-                self.search_focus(self.search.field);
-            }
+        if command == Command::FocusEditor && matches!(self.focus, Some(Control::Search(_))) {
+            self.focus = Some(Control::Content);
+            self.dirty = true;
+            return Some(None);
+        }
+        if command == Command::FocusSearch && self.focus == Some(Control::Content) {
+            self.search_focus(self.search.field);
             return Some(None);
         }
         let Some(Control::Search(index)) = self.focus else {
             return None;
+        };
+        let direct = match command {
+            Command::ToggleMatchCase => Some(2),
+            Command::ToggleWholeWord => Some(3),
+            Command::ToggleSearchScope => Some(4),
+            Command::CloseSearch => Some(10),
+            Command::InsertQueryTab => Some(11),
+            Command::InsertQueryLf => Some(12),
+            Command::InsertQueryCrlf => Some(13),
+            Command::SearchDetails => Some(14),
+            _ => None,
         };
         if matches!(command, Command::Tab | Command::PreviousControl) {
             if self.field_paste.is_some() {
@@ -261,15 +272,21 @@ impl AppState {
             self.edit_field(FieldEdit::Backspace);
             return Some(Some(self.search_field_changed()));
         }
-        if !matches!(command, Command::Activate | Command::Newline) {
-            return Some(None);
+        if direct.is_none() && !matches!(command, Command::Activate | Command::Newline) {
+            return None;
         }
         if layout.area.width < 40 || layout.area.height < 8 {
             return Some(None);
         }
         if let Some(pending) = &mut self.field_paste {
-            pending.submit = true;
-            self.search_submit_field = Some(self.search.field);
+            if direct.is_none() {
+                pending.submit = true;
+                self.search_submit_field = Some(self.search.field);
+            }
+            return Some(None);
+        }
+        let index = direct.unwrap_or(index);
+        if direct.is_some() && !self.search.controls().contains(&index) {
             return Some(None);
         }
         Some(match index {
@@ -360,9 +377,9 @@ mod tests {
         assert_eq!(app.focus, Some(Control::Search(1)));
         app.command(Command::PreviousControl, &layout(&app));
         assert_eq!(app.focus, Some(Control::Search(0)));
-        app.command(Command::FocusNext, &layout(&app));
+        app.command(Command::FocusEditor, &layout(&app));
         assert_eq!(app.focus, Some(Control::Content));
-        app.command(Command::FocusPrevious, &layout(&app));
+        app.command(Command::FocusSearch, &layout(&app));
         assert_eq!(app.focus, Some(Control::Search(0)));
     }
 

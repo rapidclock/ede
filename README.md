@@ -1,8 +1,8 @@
 # ede
 
 A Rust terminal text editor for macOS and Linux, built in reviewed stages.
-Current version **0.0.1-dev.8**. This version adds streamed stdin and live file
-following. See the
+Current version **0.0.1-dev.9**. This version adds configurable shortcuts,
+scratch checkpoint timing, and highlighting limits. See the
 [MVP overview](specs/001_initial_mvp/overview.md),
 [Stage 6 validation record](specs/001_initial_mvp/06_search_and_replace.md#validation-record),
 and [Stage 7 validation record](specs/001_initial_mvp/07_syntax_highlighting.md#validation-record).
@@ -21,11 +21,18 @@ cargo run --locked -- -- -filename.txt
 producer | cargo run --locked
 cargo run --locked < path/to/input.txt
 cargo run --locked -- --follow path/to/current.log
+cargo run --locked -- --safe-config path/to/file.txt
 ```
 
 Run in a terminal with a usable `TERM`, at least 40 columns by 8 rows. Smaller
 windows preserve work and show a resize prompt; return to a supported size to
 answer unsaved-change prompts. `--help` and `--version` work without a terminal.
+
+Start with `--safe-config` to use bundled configuration for the session. The
+option comes before file arguments, `--`, or `--follow`. Safe mode skips local
+highlighting overrides and query files and disables Reload Highlighting. Press
+F1 to see the expected config path. Editing and scratch recovery work as usual.
+See the [Stage 9 validation record](specs/001_initial_mvp/09_configuration_and_keybindings.md#validation-record).
 
 Pipe, FIFO, and regular-file stdin open a read-only **Stdin** tab ahead of any
 named files. Use a foreground controlling terminal and leave stdout attached to
@@ -152,6 +159,245 @@ adds one undo step within the 256 MiB history budget. If the previous text excee
 that budget, refresh resets history and reports it. Missing or invalid sources
 leave the last good text intact and retry with backoff. Actions → Retry refresh
 and Tab details provide an immediate retry.
+
+## Configuration and keybindings
+
+ede looks for `config.toml` under `$XDG_CONFIG_HOME/ede` when
+`XDG_CONFIG_HOME` is absolute, or under `$HOME/.config/ede` when HOME is
+absolute. A remote session uses the environment of the host running ede.
+Configuration is optional. `highlighting.toml` and `queries/` in the same
+directory still control custom themes, language rules, and queries.
+
+```toml
+[recovery]
+checkpoint_interval_seconds = 5
+
+[highlighting]
+max_document_bytes = 20971520
+max_line_bytes = 65536
+parse_timeout_ms = 250
+
+[keybindings.global]
+save = ["Ctrl+S", "F9", "Cmd+S"]
+reload_settings = []
+
+[keybindings.picker]
+activate = ["Enter", "Ctrl+O"]
+```
+
+The checkpoint interval accepts 1–3,600 seconds. Highlighting accepts 1–20,971,520
+logical document bytes, 1–65,536 bytes per logical line, and 1–250 ms per
+analysis. The example shows the scalar defaults. BOM bytes are excluded from
+logical text, and a CRLF's CR does not count toward its line limit.
+
+Every binding list replaces that command's defaults in its context. Leave the
+entry out to inherit defaults or set it to `[]` to unbind it. Each entry accepts
+up to eight chords. Unrecognized fields, conflicting chords and settings larger
+than 64 KiB are rejected together. Workspace contexts are `editor`, `controls`
+and `search`. They share eligible `global` bindings. The `picker`, `dialog`
+and `settings` contexts own input while they are on top. Keep portable routes
+to Actions and Quit, and through each surface's focus, Activate and Cancel.
+
+Modifiers are Ctrl, Alt, Shift and Cmd in canonical display order. Modifier and
+key names are ASCII case-insensitive. `Super` is accepted as `Cmd`. Supported
+keys are modified ASCII letters, digits and Space, plus Escape, Enter, Tab,
+Backspace, Delete, Left, Right, Up, Down, Home, End, PageUp, PageDown, and F1–F12.
+Plain and Shift-only text keys remain available for typing. Some enhanced keys
+depend on terminal delivery. Legacy Ctrl+I is Tab, Ctrl+J and Ctrl+M are Enter,
+and byte 08 is Ctrl+H. A Backspace key must send DEL to work as Backspace on the
+legacy path. See [Cmd delivery](#cmd-delivery).
+
+Open **Actions → Settings** to browse the draft. Use the arrow keys or **Prev**
+and **Next** to select an entry. **Edit** opens the selected scalar or binding.
+Add or replace a chord by typing it or opening **Capture**. The preview starts
+with **Discard** focused. A mouse click on **Back** leaves capture. Keyboard
+users can press a different key and discard the preview. At smaller sizes the
+shown Cancel shortcut leaves obscured capture. **Options** contains **Save
+Settings**, **Reload Settings**, **Restore defaults**, and **Config info**.
+Restore defaults changes the draft. Save applies it to the running editor.
+
+Settings saves preserve unrelated TOML and comments. If the file changes
+externally, reload it before saving a new draft. Any noncooperating writer can
+race the final filesystem check and rename of an existing file. A save reported
+as uncertain requires a reload to see what reached disk. **Use defaults for
+this session** or Escape bypasses a slow initial load. A rejected initial file
+uses defaults and keeps a diagnostic. A rejected reload retains the previous
+settings. Safe mode disables saving and reloading.
+
+### Command IDs and default shortcuts
+
+The following rows list stable IDs within each context. An em dash indicates
+that a command starts unbound and is available when its surface permits it.
+
+<!-- keymap-defaults:start -->
+| Context | Command ID | Defaults |
+| --- | --- | --- |
+| `global` | `actions` | F2 |
+| `global` | `cancel_search` | — |
+| `global` | `close_tab` | Ctrl+W / Cmd+W |
+| `global` | `export_retained` | — |
+| `global` | `find` | Ctrl+F / Cmd+F |
+| `global` | `find_next` | F3 |
+| `global` | `find_previous` | Shift+F3 |
+| `global` | `follow_file` | — |
+| `global` | `go_to` | Ctrl+G |
+| `global` | `help` | F1 |
+| `global` | `language` | — |
+| `global` | `mouse_capture` | — |
+| `global` | `new` | Ctrl+N / Cmd+N |
+| `global` | `next_tab` | F8 |
+| `global` | `open` | Ctrl+O / Cmd+O |
+| `global` | `previous_tab` | F7 |
+| `global` | `quit` | Ctrl+Q / Cmd+Q |
+| `global` | `recovery` | — |
+| `global` | `reload_highlighting` | — |
+| `global` | `reload_settings` | — |
+| `global` | `replace` | Ctrl+H / Shift+Cmd+H |
+| `global` | `replace_all` | — |
+| `global` | `replace_next` | — |
+| `global` | `retry_finish` | — |
+| `global` | `retry_highlighting` | — |
+| `global` | `retry_refresh` | — |
+| `global` | `save` | Ctrl+S / Cmd+S |
+| `global` | `save_as` | Shift+Cmd+S / F4 |
+| `global` | `settings` | — |
+| `global` | `suspend` | — |
+| `global` | `syntax_theme` | — |
+| `global` | `tab_details` | — |
+| `global` | `tabs` | — |
+| `global` | `toggle_follow` | — |
+| `editor` | `backspace` | Backspace |
+| `editor` | `cancel` | Escape |
+| `editor` | `copy` | Ctrl+C / Cmd+C |
+| `editor` | `cut` | Ctrl+X / Cmd+X |
+| `editor` | `delete` | Delete |
+| `editor` | `focus_next` | — |
+| `editor` | `focus_previous` | Shift+Tab / Shift+F6 |
+| `editor` | `focus_search` | F6 |
+| `editor` | `insert_newline` | Enter |
+| `editor` | `insert_tab` | Tab |
+| `editor` | `internal_paste` | Ctrl+V / Cmd+V |
+| `editor` | `move_document_end` | Ctrl+End |
+| `editor` | `move_document_start` | Ctrl+Home |
+| `editor` | `move_down` | Down |
+| `editor` | `move_end` | End |
+| `editor` | `move_home` | Home |
+| `editor` | `move_left` | Left |
+| `editor` | `move_page_down` | PageDown |
+| `editor` | `move_page_up` | PageUp |
+| `editor` | `move_right` | Right |
+| `editor` | `move_up` | Up |
+| `editor` | `redo` | Ctrl+Y / Shift+Cmd+Z |
+| `editor` | `select_all` | Ctrl+A / Cmd+A |
+| `editor` | `select_document_end` | Ctrl+Shift+End |
+| `editor` | `select_document_start` | Ctrl+Shift+Home |
+| `editor` | `select_down` | Shift+Down |
+| `editor` | `select_end` | Shift+End |
+| `editor` | `select_home` | Shift+Home |
+| `editor` | `select_left` | Shift+Left |
+| `editor` | `select_page_down` | Shift+PageDown |
+| `editor` | `select_page_up` | Shift+PageUp |
+| `editor` | `select_right` | Shift+Right |
+| `editor` | `select_up` | Shift+Up |
+| `editor` | `undo` | Ctrl+Z / Cmd+Z |
+| `controls` | `activate` | Enter |
+| `controls` | `cancel` | Escape |
+| `controls` | `focus_next` | Tab / F6 |
+| `controls` | `focus_previous` | Shift+Tab / Shift+F6 |
+| `search` | `activate` | Enter |
+| `search` | `cancel` | Escape |
+| `search` | `close_search` | — |
+| `search` | `field_backspace` | Backspace |
+| `search` | `focus_editor` | F6 / Shift+F6 |
+| `search` | `focus_next` | Tab |
+| `search` | `focus_previous` | Shift+Tab |
+| `search` | `insert_query_crlf` | — |
+| `search` | `insert_query_lf` | — |
+| `search` | `insert_query_tab` | — |
+| `search` | `search_details` | — |
+| `search` | `toggle_match_case` | — |
+| `search` | `toggle_search_scope` | — |
+| `search` | `toggle_whole_word` | — |
+| `picker` | `activate` | Enter |
+| `picker` | `cancel` | Escape |
+| `picker` | `field_backspace` | Backspace |
+| `picker` | `focus_next` | Tab / F6 |
+| `picker` | `focus_previous` | Shift+Tab / Shift+F6 |
+| `picker` | `move_document_end` | Ctrl+End / Ctrl+Shift+End |
+| `picker` | `move_document_start` | Ctrl+Home / Ctrl+Shift+Home |
+| `picker` | `move_down` | Down / Shift+Down |
+| `picker` | `move_end` | End / Shift+End |
+| `picker` | `move_home` | Home / Shift+Home |
+| `picker` | `move_left` | Left / Shift+Left |
+| `picker` | `move_page_down` | PageDown / Shift+PageDown |
+| `picker` | `move_page_up` | PageUp / Shift+PageUp |
+| `picker` | `move_right` | Right / Shift+Right |
+| `picker` | `move_up` | Up / Shift+Up |
+| `picker` | `picker_next` | — |
+| `picker` | `picker_parent` | — |
+| `picker` | `picker_previous` | — |
+| `picker` | `select_row` | — |
+| `dialog` | `activate` | Enter |
+| `dialog` | `cancel` | Escape |
+| `dialog` | `close_selected_tab` | — |
+| `dialog` | `confirm_replace_all` | — |
+| `dialog` | `discard` | — |
+| `dialog` | `field_backspace` | Backspace |
+| `dialog` | `focus_next` | Tab / F6 |
+| `dialog` | `focus_previous` | Shift+Tab / Shift+F6 |
+| `dialog` | `move_document_end` | Ctrl+End / Ctrl+Shift+End |
+| `dialog` | `move_document_start` | Ctrl+Home / Ctrl+Shift+Home |
+| `dialog` | `move_down` | Down / Shift+Down |
+| `dialog` | `move_end` | End / Shift+End |
+| `dialog` | `move_home` | Home / Shift+Home |
+| `dialog` | `move_left` | Left / Shift+Left |
+| `dialog` | `move_page_down` | PageDown / Shift+PageDown |
+| `dialog` | `move_page_up` | PageUp / Shift+PageUp |
+| `dialog` | `move_right` | Right / Shift+Right |
+| `dialog` | `move_up` | Up / Shift+Up |
+| `dialog` | `recovery_discard` | — |
+| `dialog` | `recovery_next` | — |
+| `dialog` | `recovery_open` | — |
+| `dialog` | `recovery_previous` | — |
+| `dialog` | `recovery_retry` | — |
+| `dialog` | `retry` | — |
+| `dialog` | `retry_refresh` | — |
+| `dialog` | `save` | — |
+| `dialog` | `save_as` | F4 / Shift+Cmd+S |
+| `dialog` | `select_row` | — |
+| `settings` | `accept_setting` | — |
+| `settings` | `activate` | Enter |
+| `settings` | `add_shortcut` | — |
+| `settings` | `cancel` | Escape |
+| `settings` | `cancel_save` | — |
+| `settings` | `capture_shortcut` | — |
+| `settings` | `discard_capture` | — |
+| `settings` | `discard_draft` | — |
+| `settings` | `edit_setting` | — |
+| `settings` | `field_backspace` | Backspace |
+| `settings` | `focus_next` | Tab / F6 |
+| `settings` | `focus_previous` | Shift+Tab / Shift+F6 |
+| `settings` | `keep_editing` | — |
+| `settings` | `move_document_end` | Ctrl+End / Ctrl+Shift+End |
+| `settings` | `move_document_start` | Ctrl+Home / Ctrl+Shift+Home |
+| `settings` | `move_down` | Down / Shift+Down |
+| `settings` | `move_end` | End / Shift+End |
+| `settings` | `move_home` | Home / Shift+Home |
+| `settings` | `move_left` | Left / Shift+Left |
+| `settings` | `move_page_down` | PageDown / Shift+PageDown |
+| `settings` | `move_page_up` | PageUp / Shift+PageUp |
+| `settings` | `move_right` | Right / Shift+Right |
+| `settings` | `move_up` | Up / Shift+Up |
+| `settings` | `reload_settings` | — |
+| `settings` | `remove_shortcut` | — |
+| `settings` | `replace_shortcut` | — |
+| `settings` | `restore_defaults` | — |
+| `settings` | `save_settings` | — |
+| `settings` | `select_row` | — |
+| `settings` | `settings_info` | — |
+| `settings` | `settings_options` | — |
+| `settings` | `use_defaults` | — |
+<!-- keymap-defaults:end -->
 
 ## Syntax highlighting
 

@@ -8,7 +8,6 @@ mod wire;
 mod worker;
 
 pub(crate) use config::{Config, Foreground, Palette};
-pub(crate) use limits::DOCUMENT as DOCUMENT_LIMIT;
 pub(crate) use projection::{Projection, Styled, ViewKey};
 pub use wire::serve;
 pub(crate) use worker::{
@@ -292,6 +291,7 @@ pub(crate) fn project_snapshot_for_test(
     limits::transfer(
         snapshot,
         &crate::document::Cancellation::default(),
+        crate::settings::SyntaxLimits::default(),
         &mut source,
     )
     .unwrap();

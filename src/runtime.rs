@@ -127,15 +127,21 @@ impl Host for TerminalHost<'_> {
     }
 }
 
+/// Resources and preferences captured at the validated launch boundary.
+pub(crate) struct Launch {
+    pub directory: PathBuf,
+    pub documents: crate::stream::Startup,
+    pub recovery: crate::recovery::Store,
+    pub syntax_program: Option<PathBuf>,
+    pub config: crate::settings::Location,
+}
+
 /// Run with explicitly acquired modes; Ratatui initialization helpers are not used.
 pub(crate) fn run(
     session: &mut TerminalSession<UnixTerminal>,
     signals: &Signals,
     inbox: StatusInbox,
-    launch_directory: PathBuf,
-    startup: crate::stream::Startup,
-    recovery: crate::recovery::Store,
-    syntax_program: Option<PathBuf>,
+    launch: Launch,
 ) -> io::Result<Exit> {
     let (width, height) = session.driver().size()?;
     // The event loop owns resize/layout changes. A fixed viewport prevents Ratatui
@@ -155,13 +161,25 @@ pub(crate) fn run(
         started: Instant::now(),
         ingress,
     };
-    let mut editor = Editor::new(launch_directory.clone(), startup, recovery, syntax_program)?;
+    let mut editor = Editor::new(
+        launch.directory.clone(),
+        launch.documents,
+        launch.recovery,
+        launch.syntax_program,
+        launch
+            .config
+            .user_directory()
+            .map(std::path::Path::to_owned),
+    )?;
     let highlighting = editor.highlighting_process();
     let mut app = AppState::new();
-    app.set_launch_directory(launch_directory);
+    app.set_launch_directory(launch.directory);
+    app.config_location = launch.config;
+    app.settings.startup(&app.config_location);
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        event_loop_impl(&mut host, inbox, Some(&mut editor), Some(&picker), app)
+        event_loop_impl(&mut host, inbox, Some(&mut editor), Some(&picker), &mut app)
     }));
+    let settings_exit = app.settings.exit(&app.config_location);
     host.ingress.stop();
     let streamed = editor.streamed();
     let worker = editor.shutdown();
@@ -183,6 +201,9 @@ pub(crate) fn run(
             let _ = worker.join();
         }
     }
+    if let Some(message) = settings_exit.or_else(|| app.settings.exit(&app.config_location)) {
+        eprintln!("ede: {message}");
+    }
     match result {
         Ok(result) => {
             restoration?;
@@ -198,7 +219,7 @@ fn event_loop_impl(
     inbox: StatusInbox,
     mut editor: Option<&mut Editor>,
     picker: Option<&crate::picker::Picker>,
-    mut app: AppState,
+    app: &mut AppState,
 ) -> io::Result<Exit> {
     let mut area = host.area()?;
     let mut layout = LayoutSnapshot::new(area, app.help, 0);
@@ -232,7 +253,7 @@ fn event_loop_impl(
                 if drag_scroll && !pending {
                     drag_scroll = false;
                     if let Some(intent) = app.drag_hit(&layout)
-                        && effect(intent, host, &mut app, Some(bridge), picker)?
+                        && effect(intent, host, app, Some(bridge), picker)?
                     {
                         return Ok(Exit { code: 0 });
                     }
@@ -248,7 +269,7 @@ fn event_loop_impl(
                     bridge.revoke_search_navigation();
                 }
                 if let Some(intent) = intent
-                    && effect(intent, host, &mut app, Some(bridge), picker)?
+                    && effect(intent, host, app, Some(bridge), picker)?
                 {
                     return Ok(Exit { code: 0 });
                 }
@@ -256,15 +277,16 @@ fn event_loop_impl(
         }
         if let Some(reply) = picker.and_then(crate::picker::Picker::poll)
             && let Some(intent) = app.picker_reply(reply)
-            && effect(intent, host, &mut app, editor.as_deref_mut(), picker)?
+            && effect(intent, host, app, editor.as_deref_mut(), picker)?
         {
             return Ok(Exit { code: 0 });
         }
+        app.poll_settings(editor.as_deref_mut());
         if let Some(signal) = host.termination() {
             return Ok(Exit { code: 128 + signal });
         }
         if host.suspend_requested() {
-            suspend(host, &mut app, editor.as_deref())?;
+            suspend(host, app, editor.as_deref())?;
             area = host.area()?;
             rendered_generation = None;
         }
@@ -281,16 +303,16 @@ fn event_loop_impl(
             };
             app.notify(message);
         }
-        reconcile_layout(area, &mut app, &mut layout);
+        reconcile_layout(area, app, &mut layout);
         if let Some(intent) = app.tick(host.now(), &layout) {
             drag_scroll = true;
-            if effect(intent, host, &mut app, editor.as_deref_mut(), picker)? {
+            if effect(intent, host, app, editor.as_deref_mut(), picker)? {
                 return Ok(Exit { code: 0 });
             }
         }
         // A timer can submit a pasted path and close its dialog. Reconcile that
         // change before drawing or reading another key, just like input effects.
-        reconcile_layout(area, &mut app, &mut layout);
+        reconcile_layout(area, app, &mut layout);
         let geometry = (area.width, layout.content_height(), layout.generation);
         if requested_geometry != Some(geometry) {
             if let Some(bridge) = editor.as_deref_mut() {
@@ -307,13 +329,7 @@ fn event_loop_impl(
         if rendered_generation.is_none()
             || (app.dirty && elapsed.is_none_or(|elapsed| elapsed >= FRAME_INTERVAL))
         {
-            draw(
-                host,
-                &mut app,
-                &layout,
-                &mut rendered_generation,
-                &mut last_draw,
-            )?;
+            draw(host, app, &layout, &mut rendered_generation, &mut last_draw)?;
         }
         let timeout = if app.dirty {
             FRAME_INTERVAL
@@ -335,6 +351,8 @@ fn event_loop_impl(
         if matches!(input, Input::KeyboardSupported) {
             if host.now() <= Duration::from_millis(500) {
                 host.keyboard()?;
+                app.enhanced_keyboard = true;
+                app.dirty = true;
             }
             continue;
         }
@@ -342,13 +360,7 @@ fn event_loop_impl(
         if matches!(input, Input::Pointer(_))
             && (app.dirty || rendered_generation != Some(layout.generation))
         {
-            draw(
-                host,
-                &mut app,
-                &layout,
-                &mut rendered_generation,
-                &mut last_draw,
-            )?;
+            draw(host, app, &layout, &mut rendered_generation, &mut last_draw)?;
         }
         if let Input::Resize(width, height) = input {
             area = Rect::new(0, 0, width, height);
@@ -363,7 +375,7 @@ fn event_loop_impl(
         }
         if let Some(intent) = intent {
             let suspended = matches!(intent, Intent::Suspend);
-            if effect(intent, host, &mut app, editor.as_deref_mut(), picker)? {
+            if effect(intent, host, app, editor.as_deref_mut(), picker)? {
                 return Ok(Exit { code: 0 });
             }
             if suspended {
@@ -487,7 +499,7 @@ fn effect(
 #[cfg(test)]
 /// Exercise the scheduler independently of real storage or worker timing.
 fn event_loop(host: &mut impl Host, inbox: StatusInbox) -> io::Result<Exit> {
-    event_loop_impl(host, inbox, None, None, AppState::new())
+    event_loop_impl(host, inbox, None, None, &mut AppState::new())
 }
 
 /// Draw and update scheduler bookkeeping in one place, including forced pointer-layout frames.
