@@ -1,6 +1,6 @@
 # 001 — Initial MVP overview
 
-Status — **MVP scope and roadmap accepted. Stages 01–08 merged. Stage 09 design drafted for approval.**
+Status — **MVP scope and roadmap accepted. Stages 01–08 merged. Stage 09 implementation verified on macOS and Ubuntu.**
 
 Project: **ede**, a predominantly Rust terminal text editor for macOS and Linux.
 
@@ -393,7 +393,7 @@ storage. Avoid assuming that an open file descriptor or memory map freezes data.
 | Scratch persistence | Resolved in Stage 05: machine-local state, independent live owners, recovery of retired owners, fresh restored history, and scratch-only recovery; power-loss guarantees remain outside scope |
 | Live content | Stage 08 defines terminal separation, pathname following and rotation, retention quotas, and producer-error handling |
 | Search | Stage 06 uses bounded ripgrep literal matching, Unicode simple case folding, optional whole-word matching, and per-document atomic replacement; design and implementation authorized |
-| Configuration and keybindings | Stage 09 proposes the settings schema, contextual keymap, persistent remapping UI, and safe startup mode for approval |
+| Configuration and keybindings | Stage 09 defines the settings schema, contextual keymap, persistent remapping UI, and safe startup mode |
 | Performance | Benchmark corpus and CPU/storage details for the agreed 1 GiB / 8 GiB RAM baseline; measurement methods, memory budgets, and validation of agreed latency/highlighting defaults |
 | Dependencies | Libraries, grammar versions, compiler/toolchain baseline, and configuration locations |
 
@@ -594,7 +594,7 @@ Evidence — [Stage 08 validation record](08_pipes_and_follow.md#validation-reco
 
 Design — [09_configuration_and_keybindings.md](09_configuration_and_keybindings.md). Depends on Stages 01–08.
 
-Status — Design draft for approval.
+Status — Implemented and verified on macOS and Ubuntu. Draft PR targets the feature branch.
 
 Branch — `stage/configuration_and_keybindings`. PR target — `feat/initial_mvp`.
 

@@ -3,7 +3,7 @@
 use std::{
     io::{self, Read, Write},
     os::fd::{AsFd, AsRawFd},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Child, ChildStdin, ChildStdout, Command, Stdio},
     sync::{
         Arc, Mutex,
@@ -14,6 +14,7 @@ use std::{
 };
 
 use crate::document::{Cancellation, Permit, Snapshot};
+use crate::settings::SyntaxLimits;
 
 use super::{
     Config, Fallback, Language, ViewKey,
@@ -216,6 +217,7 @@ impl Session {
         language: &Language,
         rules: &Rules,
         cancel: &Cancellation,
+        limits: SyntaxLimits,
     ) -> Result<(), Fallback> {
         let budget = Budget::new(cancel, TRANSFER, Fallback::Transfer);
         let mut output = budget.io(&mut self.input);
@@ -227,7 +229,7 @@ impl Session {
         if let Err(error) = header {
             return Err(self.failure(&budget, Some(error)));
         }
-        let transfer = limits::transfer(&snapshot, cancel, &mut output);
+        let transfer = limits::transfer(&snapshot, cancel, limits, &mut output);
         drop(snapshot);
         match transfer {
             Err(Fallback::Worker) => return Err(self.failure(&budget, None)),
@@ -247,12 +249,14 @@ impl Session {
         &mut self,
         runs: &[GlyphRun],
         cancel: &Cancellation,
+        timeout: Duration,
     ) -> Result<Vec<projection::Styled>, Fallback> {
         self.projection = self.projection.checked_add(1).ok_or(Fallback::Output)?;
-        let budget = Budget::new(cancel, wire::ANALYSIS, Fallback::Timeout);
+        let budget = Budget::new(cancel, timeout, Fallback::Timeout);
         let mut output = budget.io(&mut self.input);
         let dispatch = output
             .write_all(&[wire::PROJECT])
+            .and_then(|()| wire::send_number(&mut output, timeout.as_millis() as u32))
             .and_then(|()| wire::send_number(&mut output, self.projection))
             .and_then(|()| wire::send_runs(&mut output, runs));
         if let Err(error) = dispatch {
@@ -282,6 +286,7 @@ impl Session {
 
 /// The worker owns these values during transfer and projection, with one bounded release point.
 pub(crate) struct Work {
+    pub(crate) limits: SyntaxLimits,
     pub(crate) key: ViewKey,
     pub(crate) language: &'static Language,
     pub(crate) config: Arc<Config>,
@@ -308,9 +313,15 @@ impl Work {
             None => Session::ready(&self.control, &self.cancel)?,
         };
         if let Some(snapshot) = self.snapshot {
-            session.open(snapshot, self.language, &self.config.rules, &self.cancel)?;
+            session.open(
+                snapshot,
+                self.language,
+                &self.config.rules,
+                &self.cancel,
+                self.limits,
+            )?;
         }
-        let ranges = session.project(&runs, &self.cancel)?;
+        let ranges = session.project(&runs, &self.cancel, self.limits.timeout)?;
         drop(runs);
         self.permit
             .shrink(ranges.capacity() * std::mem::size_of::<projection::Styled>() + 2048);
@@ -326,8 +337,8 @@ impl Work {
 }
 
 /// Load candidate source files off both owner loops.
-pub(crate) fn read_config() -> Result<Config, String> {
-    Config::load(config::directory().as_deref()).map_err(|error| short_notice(&error.to_string()))
+pub(crate) fn read_config(directory: &Path) -> Result<Config, String> {
+    Config::load(directory).map_err(|error| short_notice(&error.to_string()))
 }
 
 fn short_notice(message: &str) -> String {
@@ -503,7 +514,7 @@ mod tests {
         let start = Instant::now();
         let cancel = Cancellation::default();
         assert_eq!(
-            process.project(&[], &cancel).unwrap_err(),
+            process.project(&[], &cancel, wire::ANALYSIS).unwrap_err(),
             Fallback::Timeout
         );
         assert!(start.elapsed() < Duration::from_secs(2));
@@ -525,7 +536,7 @@ mod tests {
         control.resume();
         assert_eq!(control.epoch(), epoch);
         assert_eq!(
-            process.project(&[], &cancel).unwrap_err(),
+            process.project(&[], &cancel, wire::ANALYSIS).unwrap_err(),
             Fallback::Cancelled
         );
     }

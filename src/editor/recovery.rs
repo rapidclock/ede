@@ -98,6 +98,15 @@ pub(super) struct Retention {
 }
 
 impl Retention {
+    /// Recompute an idle deadline from the start of its existing schedule.
+    pub(super) fn set_interval(&mut self, now: Instant, interval: Duration) {
+        if interval != self.interval && !self.sweep {
+            self.due = self.due - self.interval + interval;
+            self.sweep = now >= self.due;
+        }
+        self.interval = interval;
+    }
+
     pub(super) fn checkpointing(&self, tab: TabId) -> bool {
         self.pending.as_ref().is_some_and(|(_, pending)| matches!(pending, Pending::Checkpoint { tab: current, .. } if *current == tab))
     }
@@ -983,6 +992,69 @@ pub(super) mod tests {
             assert!(Instant::now() < deadline, "checkpoint did not settle");
             thread::sleep(Duration::from_millis(1));
         }
+    }
+
+    /// K07: preserve the schedule origin and an in-flight sweep across interval changes.
+    #[test]
+    fn checkpoint_interval_updates_an_existing_schedule_without_interrupting_held_quit() {
+        use crate::settings::{Scalar, Values};
+        let root = tempfile::tempdir().unwrap();
+        let (faults, observed, release) = gate();
+        let (mut worker, events) = coordinator(root.path(), Some(faults));
+        worker.action(Action::Insert("before".into())).unwrap();
+        let now = Instant::now();
+        let origin = now - Duration::from_secs(5);
+        let retention = worker.retention.as_mut().unwrap();
+        retention.due = origin + retention.interval;
+        retention.set_interval(now, Duration::from_secs(8));
+        assert_eq!(retention.due, origin + Duration::from_secs(8));
+        retention.set_interval(now + Duration::from_secs(1), Duration::from_secs(8));
+        assert_eq!(
+            retention.due,
+            origin + Duration::from_secs(8),
+            "unrelated updates cannot postpone it"
+        );
+        retention.set_interval(now, Duration::from_secs(4));
+        let due = retention.due;
+        assert!(retention.sweep);
+        worker.poll_retention().unwrap();
+        observed.recv_timeout(Duration::from_secs(5)).unwrap();
+
+        let mut updated = Values::default();
+        updated.set(Scalar::Checkpoint, Some(12));
+        worker.action(Action::ApplySettings(updated, 7)).unwrap();
+        assert_eq!(worker.retention.as_ref().unwrap().due, due);
+        worker.action(Action::Insert(" after".into())).unwrap();
+        worker.begin_retained_quit(88);
+        assert!(
+            !events
+                .try_iter()
+                .any(|event| matches!(event, Event::QuitReady(88)))
+        );
+        release.send(()).unwrap();
+        poll_until(&mut worker, |worker| {
+            worker.retention.as_ref().unwrap().quitting.is_none()
+        });
+        let retention = worker.retention.as_ref().unwrap();
+        assert_eq!(retention.interval, Duration::from_secs(12));
+        assert!(retention.due > Instant::now() + Duration::from_secs(10));
+        assert!(
+            events
+                .try_iter()
+                .any(|event| matches!(event, Event::QuitReady(88)))
+        );
+        shutdown(worker);
+        let store = recovery::Store::open(recovery::Options {
+            root: root.path().join("state"),
+            reserve_bytes: 0,
+            ..recovery::Options::default()
+        })
+        .unwrap();
+        let entries = store.page(None).unwrap();
+        assert_eq!(
+            std::fs::read(store.object_path(&entries[0])).unwrap(),
+            b"before after"
+        );
     }
 
     /// R02: persistence of A cannot acknowledge a newer edit B as retained.

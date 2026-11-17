@@ -1,9 +1,10 @@
 //! Rendering, focus order, and pointer targets derive from the same immutable geometry.
 use crate::text::Span;
 use crate::{
-    app::{AppState, MENU, Modal, PathKind},
-    command::{BINDINGS, Command},
+    app::{AppState, MENU, Modal, PathKind, settings_ui},
+    command::Command,
     editor::{After, TabId, TabSummary},
+    settings::Context,
     syntax::{Choice, Foreground, Status as SyntaxStatus, ViewKey},
     text::safe,
 };
@@ -18,6 +19,9 @@ use unicode_width::UnicodeWidthStr;
 /// Stable visible control; text byte positions live in the prepared document view.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Control {
+    SettingsButton(settings_ui::Button),
+    SettingsField,
+    UseDefaults,
     Search(u8),
     Content,
     Menu,
@@ -65,6 +69,8 @@ impl Control {
     /// Resolve buttons/menu items to the shared command handler.
     pub fn command(self) -> Option<Command> {
         match self {
+            Self::SettingsButton(_) | Self::SettingsField => None,
+            Self::UseDefaults => Some(Command::Cancel),
             Self::Search(0 | 1) => None,
             Self::Search(_) => Some(Command::Activate),
             Self::Content
@@ -83,13 +89,16 @@ impl Control {
             Self::Quit | Self::HelpQuit => Some(Command::Quit),
             Self::HelpSuspend => Some(Command::Suspend),
             Self::HelpClose | Self::PathCancel | Self::DetailsClose => Some(Command::Cancel),
-            Self::MenuItem(index) => Some(MENU[index].0),
+            Self::MenuItem(_) => Some(Command::Activate),
             _ => Some(Command::Activate),
         }
     }
     /// Compact display labels fit the minimum 40×8 geometry.
     fn label(self) -> &'static str {
         match self {
+            Self::SettingsButton(button) => button.label(),
+            Self::SettingsField => "",
+            Self::UseDefaults => "Use defaults for this session",
             Self::Search(_) => "",
             Self::Content
             | Self::PathField
@@ -122,7 +131,7 @@ impl Control {
             Self::Quit | Self::HelpQuit => "Quit",
             Self::HelpSuspend => "Suspend",
             Self::HelpClose | Self::DetailsClose => "Close",
-            Self::MenuItem(index) => MENU[index].1,
+            Self::MenuItem(index) => MENU[index].label(),
             Self::PathSubmit => "OK",
             Self::PathCancel | Self::ConfirmCancel => "Cancel",
             Self::ConfirmSave => "Save",
@@ -151,6 +160,10 @@ pub(crate) struct Signature {
     search: Option<(bool, usize)>,
     stream: bool,
     stream_confirmation: bool,
+    settings_epoch: u64,
+    settings_page: u64,
+    settings_starting: bool,
+    settings_save_state: Option<crate::settings::SaveState>,
 }
 /// Immutable frame geometry; hidden surfaces have no hit targets.
 #[derive(Clone, Debug)]
@@ -222,6 +235,7 @@ impl LayoutSnapshot {
             Some(Modal::Tabs(tab)) => (7, tab.map_or(0, |tab| tab.0)),
             Some(Modal::Recovery(dialog)) => (8, dialog.revision),
             Some(Modal::DiscardRecovery(dialog, _)) => (9, dialog.revision),
+            Some(Modal::Settings) => (15, 0),
         };
         let (picker_revision, picker_request) = match &app.modal {
             Some(Modal::Open(dialog)) => (dialog.revision, dialog.generation),
@@ -245,12 +259,27 @@ impl LayoutSnapshot {
                 .then_some((app.search.replace, app.search.row)),
             stream: app.screen.stream.is_some(),
             stream_confirmation: app.stream_confirmation.is_some(),
+            settings_epoch: app.settings_generation,
+            settings_page: app.settings_ui.as_ref().map_or(0, |draft| draft.generation),
+            settings_starting: app.settings.starting,
+            settings_save_state: app.settings_save_state,
         }
     }
     /// Modal targets replace all underlying controls, including at tiny sizes.
     pub fn for_app(area: Rect, app: &AppState, generation: u64) -> Self {
         let mut result = Self::new(area, app.help, generation);
         result.signature = Self::signature(app);
+        if app.settings.starting {
+            result.targets.clear();
+            result.overlay = None;
+            if area.width >= 40 && area.height >= 8 {
+                result.add(
+                    Control::UseDefaults,
+                    Rect::new(area.x, area.bottom() - 1, area.width.min(34), 1),
+                );
+            }
+            return result;
+        }
         if area.width < 40 || area.height < 8 {
             return result;
         }
@@ -293,6 +322,36 @@ impl LayoutSnapshot {
         result.overlay = Some(overlay);
         let y = overlay.bottom() - 2;
         match &app.modal {
+            Some(Modal::Settings) => {
+                if let Some(draft) = &app.settings_ui {
+                    if draft.editing() {
+                        result.add(
+                            Control::SettingsField,
+                            Rect::new(overlay.x + 1, overlay.y + 2, overlay.width - 2, 1),
+                        );
+                    }
+                    for (row, buttons) in draft.buttons(
+                        app.settings_save_state,
+                        app.config_location.user_directory().is_some(),
+                        app.settings.base.is_some(),
+                    ) {
+                        let row = if draft.info() {
+                            overlay.height - 3
+                        } else {
+                            row
+                        };
+                        let mut x = overlay.x + 1;
+                        for button in buttons {
+                            let width = button.label().width() as u16 + 2;
+                            result.add(
+                                Control::SettingsButton(button),
+                                Rect::new(x, overlay.y + 1 + row, width, 1),
+                            );
+                            x += width + 1;
+                        }
+                    }
+                }
+            }
             Some(Modal::ReplaceAll(_)) => {
                 result.add(Control::Search(15), Rect::new(overlay.x + 2, y, 16, 1));
                 result.add(Control::Search(16), Rect::new(overlay.x + 20, y, 10, 1));
@@ -612,7 +671,31 @@ fn tab_text(tab: &TabSummary, active: bool) -> String {
 pub(crate) fn render(frame: &mut Frame<'_>, app: &AppState, layout: &LayoutSnapshot) {
     let area = layout.area;
     if area.width < 40 || area.height < 8 {
-        frame.render_widget(Paragraph::new("Resize to 40x8 | Ctrl+Q quit"), area);
+        let context = app.key_context();
+        let (context, command) = if context.has_global() {
+            (Context::Global, Command::Quit)
+        } else {
+            (context, Command::Cancel)
+        };
+        let hint = app.settings.applied.map.portable_hint(context, command);
+        let text = if app.settings.starting {
+            "Escape uses defaults".to_owned()
+        } else if matches!(app.modal, Some(Modal::Settings))
+            && app
+                .settings_ui
+                .as_ref()
+                .is_some_and(|draft| draft.capturing())
+        {
+            format!("{hint} exit capture")
+        } else {
+            format!("{hint} {}", command.label())
+        };
+        let message = if area.height > 1 {
+            format!("Resize to 40x8\n{text}")
+        } else {
+            format!("{text} | Resize to 40x8")
+        };
+        frame.render_widget(Paragraph::new(message), area);
         return;
     }
     if app.screen.tab.is_none() {
@@ -788,7 +871,12 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &AppState, layout: &LayoutSnaps
     };
     let footer = app.receiving_paste_status().unwrap_or_else(|| {
         if app.guard_waiting() {
-            return "Waiting for tab state or save | Escape cancels".into();
+            let cancel = app
+                .settings
+                .applied
+                .map
+                .portable_hint(Context::Dialog, Command::Cancel);
+            return format!("Waiting for tab state or save | {cancel} cancels");
         }
         let syntax = match (
             matches!(app.screen.syntax_status, SyntaxStatus::Fallback(_)),
@@ -799,8 +887,21 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &AppState, layout: &LayoutSnaps
             (false, true) => "Syntax config error | ",
             (false, false) => "",
         };
+        let config = if app.config_location.safe() {
+            "Safe config | "
+        } else if app.settings_save_state == Some(crate::settings::SaveState::Finishing) {
+            "Finishing save | "
+        } else if app.settings.diagnostic.is_some() {
+            "Settings error | "
+        } else if app.settings_saved {
+            "Settings saved | "
+        } else if app.settings.user_config {
+            "User config | "
+        } else {
+            ""
+        };
         format!(
-            "{syntax}{}{} | {}{}{}",
+            "{config}{syntax}{}{} | {}{}{}",
             severity,
             app.status.text(),
             coordinates,
@@ -855,15 +956,28 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &AppState, layout: &LayoutSnaps
         );
     }
     if let Some(overlay) = layout.overlay {
+        if matches!(app.modal, Some(Modal::Settings)) {
+            render_settings(frame, app, layout, overlay);
+            return;
+        }
         frame.render_widget(Clear, overlay);
+        let activate = app
+            .settings
+            .applied
+            .map
+            .portable_hint(Context::Dialog, Command::Activate);
+        let language_title = format!(" Language — {activate} to apply ");
+        let theme_title = format!(" Syntax Theme — {activate} to apply ");
+        let tabs_title = format!(" Tabs — {activate} to switch ");
         let title = match &app.modal {
+            Some(Modal::Settings) => unreachable!(),
             Some(Modal::ReplaceAll(_)) => " Replace all — confirm scope ",
             Some(Modal::Menu(_)) => " Actions (wheel/arrows) ",
-            Some(Modal::Language { .. }) => " Language — Enter to apply ",
-            Some(Modal::SyntaxTheme { .. }) => " Syntax Theme — Enter to apply ",
+            Some(Modal::Language { .. }) => &language_title,
+            Some(Modal::SyntaxTheme { .. }) => &theme_title,
             Some(Modal::Open(dialog)) if dialog.follow => " Follow file ",
             Some(Modal::Open(_)) => " Open file ",
-            Some(Modal::Tabs(_)) => " Tabs — Enter to switch ",
+            Some(Modal::Tabs(_)) => &tabs_title,
             Some(Modal::Recovery(_)) => " Recovery — retained scratches ",
             Some(Modal::DiscardRecovery(..)) => " Discard retained scratch? ",
             Some(Modal::Path(PathKind::Save, _)) => " Save As (new path) ",
@@ -887,6 +1001,7 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &AppState, layout: &LayoutSnaps
             overlay.height - 3,
         );
         let text = match &app.modal {
+            Some(Modal::Settings) => unreachable!(),
             Some(Modal::ReplaceAll(request)) => format!(
                 "{}\nFind: {}\nReplace: {}\nMatch case: {} | Whole word: {}\nOne undo step per changed document; no disk save.",
                 if request.all {
@@ -952,22 +1067,61 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &AppState, layout: &LayoutSnaps
                 safe(text)
             }
             None => {
+                let map = &app.settings.applied.map;
+                let up = map.portable_hint(
+                    Context::Dialog,
+                    Command::Move(crate::command::Movement::Up, false),
+                );
+                let down = map.portable_hint(
+                    Context::Dialog,
+                    Command::Move(crate::command::Movement::Down, false),
+                );
+                let cancel = map.portable_hint(Context::Dialog, Command::Cancel);
+                let actions = map.portable_hint(Context::Global, Command::Menu);
                 let mut lines = vec![
-                    "Up/Down scroll help; Escape closes".to_owned(),
-                    "Arrows/Home/End/Page: move; Shift selects".into(),
-                    "Ctrl+Home/End: document start/end".into(),
-                    "Cmd aliases require terminal delivery.".into(),
-                    "Terminal Cmd+V: external clipboard text".into(),
-                    "Ctrl+V / delivered Cmd+V: internal paste".into(),
-                    "F2: toggle capture for native selection.".into(),
+                    format!("{up}/{down} scroll help; {cancel} closes"),
+                    if app.enhanced_keyboard {
+                        "Enhanced keys negotiated. Cmd needs terminal delivery.".into()
+                    } else {
+                        "Cmd aliases require terminal delivery.".into()
+                    },
+                    "Terminal paste inserts text through bracketed paste.".into(),
+                    format!("{actions} opens Actions and the mouse capture toggle."),
                     "Selection modifiers vary; tmux: copy mode.".into(),
                     "Tabs: > active, * modified, ! save attention".into(),
                     "Tabs: … waiting, ↓ loading, ⇡ queued save, ↑ saving".into(),
-                    "F2 → Language…: choose a language for this tab".into(),
-                    "F2 → Syntax Theme…, Reload Highlighting, Retry Highlighting".into(),
+                    "Actions contains Language, Syntax Theme and Settings.".into(),
                 ];
-                lines.extend(BINDINGS.iter().map(|binding| {
-                    format!("{:<15} {}", binding.shortcut, binding.command.label())
+                if app.config_location.safe() {
+                    lines.splice(
+                        1..1,
+                        [
+                            "Safe config uses bundled settings. Reload disabled.".into(),
+                            app.config_location.display_file().map_or_else(
+                                || "Configuration path unavailable".into(),
+                                |path| format!("Expected config file {path}"),
+                            ),
+                        ],
+                    );
+                } else if app.config_location.user_directory().is_none() {
+                    lines.insert(
+                        1,
+                        "Config unavailable. Use an absolute XDG_CONFIG_HOME or HOME.".into(),
+                    );
+                }
+                lines.extend(app.settings.applied.map.rows.iter().map(|row| {
+                    let keys = row
+                        .keys()
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join(" / ");
+                    format!(
+                        "{} • {} • {}",
+                        row.identifier(),
+                        row.command.label(),
+                        if keys.is_empty() { "Unbound" } else { &keys }
+                    )
                 }));
                 lines.join("\n")
             }
@@ -1187,7 +1341,23 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &AppState, layout: &LayoutSnaps
                     )
                 )
             } else {
-                app.search.label(index)
+                let label = app.search.label(index);
+                let command = match index {
+                    5 => Some(Command::FindPrevious),
+                    6 => Some(Command::FindNext),
+                    7 => Some(Command::ReplaceNext),
+                    8 => Some(Command::ReplaceAll),
+                    9 => Some(Command::CancelSearch),
+                    _ => None,
+                };
+                let keys = command
+                    .map(|command| app.settings.applied.map.shortcuts(Context::Global, command))
+                    .unwrap_or_default();
+                if keys.is_empty() {
+                    label
+                } else {
+                    format!("{label} ({keys})")
+                }
             };
             let focused = app.focus == Some(target.control);
             let style = if focused {
@@ -1216,15 +1386,37 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &AppState, layout: &LayoutSnaps
         }
         let focused = app.focus == Some(target.control)
             || matches!((app.modal.as_ref(),target.control),(Some(Modal::Menu(index)),Control::MenuItem(item)) if *index==item);
-        let title = if matches!(target.control, Control::MenuItem(index) if MENU[index].0 == Command::MouseCapture)
-        {
-            if app.mouse_capture {
-                "Mouse capture: enabled (toggle)"
-            } else {
-                "Mouse capture: paused (toggle)"
+        let title = match target.control {
+            Control::MenuItem(index) if MENU[index] == Command::MouseCapture => {
+                if app.mouse_capture {
+                    "Mouse capture: enabled (toggle)".to_owned()
+                } else {
+                    "Mouse capture: paused (toggle)".to_owned()
+                }
             }
-        } else {
-            target.control.label()
+            Control::MenuItem(index)
+                if matches!(
+                    MENU[index],
+                    Command::ReloadHighlighting | Command::ReloadSettings
+                ) && app.config_location.user_directory().is_none() =>
+            {
+                format!("{} (disabled)", MENU[index].label())
+            }
+            Control::MenuItem(index) => {
+                let command = MENU[index];
+                let keys = app.settings.applied.map.shortcuts(Context::Global, command);
+                let keys = if keys.is_empty() {
+                    app.settings.applied.map.shortcuts(Context::Editor, command)
+                } else {
+                    keys
+                };
+                if keys.is_empty() {
+                    command.label().to_owned()
+                } else {
+                    format!("{:<19} {keys}", command.label())
+                }
+            }
+            control => control.label().to_owned(),
         };
         let label = if focused {
             format!(">{title}<")
@@ -1242,6 +1434,63 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &AppState, layout: &LayoutSnaps
     }
 }
 /// Display the right end of an editable field using the prepared hit geometry.
+fn render_settings(frame: &mut Frame<'_>, app: &AppState, layout: &LayoutSnapshot, overlay: Rect) {
+    let Some(draft) = &app.settings_ui else {
+        return;
+    };
+    frame.render_widget(Clear, overlay);
+    frame.render_widget(
+        Block::default().title(" Settings ").borders(Borders::ALL),
+        overlay,
+    );
+    for (row, text) in draft.lines(&app.settings, &app.config_location) {
+        let height = if draft.info() {
+            overlay.height.saturating_sub(3)
+        } else {
+            1
+        };
+        frame.render_widget(
+            Paragraph::new(text)
+                .wrap(Wrap { trim: false })
+                .scroll((draft.info_scroll, 0)),
+            Rect::new(
+                overlay.x + 1,
+                overlay.y + 1 + row,
+                overlay.width - 2,
+                height,
+            ),
+        );
+    }
+    for target in &layout.targets {
+        let focus = app.focus == Some(target.control);
+        let style = if focus {
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        match target.control {
+            Control::SettingsButton(button) => {
+                let (open, close) = if focus { ('>', '<') } else { ('[', ']') };
+                frame.render_widget(
+                    Paragraph::new(format!("{open}{}{close}", button.label())).style(style),
+                    target.area,
+                );
+            }
+            Control::SettingsField => {
+                let text = tail_cells(&safe(&draft.field), target.area.width);
+                if focus {
+                    let column = (text.width() as u16).min(target.area.width.saturating_sub(1));
+                    frame.set_cursor_position((target.area.x + column, target.area.y));
+                }
+                frame.render_widget(Paragraph::new(text).style(style), target.area);
+            }
+            _ => {}
+        }
+    }
+}
+
 fn render_field(frame: &mut Frame<'_>, app: &AppState, field: &str, area: Rect) {
     let field = safe(field);
     let width = field.width();
@@ -1393,6 +1642,22 @@ mod tests {
     use super::*;
     use crate::editor::After;
     use ratatui::{Terminal, backend::TestBackend};
+
+    #[test]
+    fn help_explains_unavailable_configuration_directory() {
+        let mut app = AppState::new();
+        app.help = true;
+        let layout = LayoutSnapshot::for_app(Rect::new(0, 0, 80, 24), &app, 1);
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| render(frame, &app, &layout)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let message = "Config unavailable. Use an absolute XDG_CONFIG_HOME or HOME.";
+        assert!((0..24).any(|y| {
+            let line: String = (0..80).map(|x| buffer[(x, y)].symbol()).collect();
+            line.contains(message)
+        }));
+    }
+
     /// Compact ASCII spans paint only the selected cells, preserving their individual hit positions.
     #[test]
     fn ascii_span_selection_is_cell_exact() {

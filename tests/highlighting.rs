@@ -26,6 +26,7 @@ fn request(language: u8, text: &str, rules: &[(u8, &str)]) -> Vec<u8> {
     push(&mut input, text.len() as u32);
     input.extend_from_slice(text.as_bytes());
     input.push(b'P');
+    push(&mut input, 250);
     push(&mut input, 1);
     let mut runs: Vec<(u32, u32, u32)> = Vec::new();
     for (offset, scalar) in text.char_indices() {

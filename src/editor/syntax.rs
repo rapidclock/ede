@@ -1,6 +1,7 @@
 //! Active-tab syntax coordination. Storage leases and child I/O stay off the foreground path.
 
 use std::{
+    path::PathBuf,
     sync::Arc,
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -22,6 +23,7 @@ struct Identity {
     language: &'static Language,
     attempt: u64,
     rules: u64,
+    limits: u64,
 }
 
 /// A tab's fallback is separate from its screen and may survive view and revision changes.
@@ -38,6 +40,7 @@ impl Failure {
             && identity.document == request.document
             && identity.attempt == request.attempt
             && identity.rules == request.rules
+            && identity.limits == request.limits
             && (!self.reason.revision_specific() || identity.revision == request.revision))
             .then_some(self.reason)
     }
@@ -71,9 +74,12 @@ pub(super) struct State {
     running: Option<Running>,
     parked: Option<(Identity, Session)>,
     retiring: Option<JoinHandle<()>>,
+    directory: Option<PathBuf>,
     config: Arc<Config>,
     theme: Option<Arc<str>>,
     rules: u64,
+    limits: crate::settings::SyntaxLimits,
+    limit_generation: u64,
     requested: u64,
     started: u64,
     loader: Option<ConfigTask>,
@@ -84,12 +90,34 @@ pub(super) struct State {
 }
 
 impl State {
+    /// A missing read root uses bundled configuration and never starts a loader.
+    pub(super) fn new(directory: Option<PathBuf>) -> Self {
+        Self {
+            directory,
+            ..Self::default()
+        }
+    }
+
+    /// Revoke stale jobs without changing user language or palette selections.
+    pub(super) fn set_limits(&mut self, limits: crate::settings::SyntaxLimits) -> bool {
+        if self.limits == limits {
+            return false;
+        }
+        self.limits = limits;
+        self.limit_generation = self.limit_generation.wrapping_add(1);
+        self.cancel();
+        true
+    }
+
     /// Read the current immutable configuration for active or parked tab choices.
     pub(super) fn config(&self) -> Arc<Config> {
         self.config.clone()
     }
     /// Retain only the newest reload request and cancel superseded compilation.
     pub(super) fn reload(&mut self) {
+        if self.directory.is_none() {
+            return;
+        }
         self.requested = self.requested.wrapping_add(1);
         self.candidate = None;
         if let Some(task) = &self.loader {
@@ -191,6 +219,7 @@ impl State {
                 language: editor.tab.syntax_effective?,
                 attempt: editor.tab.syntax_attempt,
                 rules: self.rules,
+                limits: self.limit_generation,
             })
         })();
         screen.syntax_epoch = epoch;
@@ -277,7 +306,7 @@ impl State {
                 .tab
                 .info
                 .as_ref()
-                .is_some_and(|info| info.len > crate::syntax::DOCUMENT_LIMIT)
+                .is_some_and(|info| info.len > self.limits.document)
             {
                 self.failed(editor, id, Fallback::Size);
             } else if snapshot.is_some() || self.parked.is_some() {
@@ -367,6 +396,7 @@ impl State {
         };
         let cancel = Cancellation::default();
         let work = Work {
+            limits: self.limits,
             key,
             language: identity.language,
             config: self.config.clone(),
@@ -443,11 +473,14 @@ impl State {
                 }
             }
         }
-        if self.loader.is_none() && self.started != self.requested {
+        if self.loader.is_none()
+            && self.started != self.requested
+            && let Some(directory) = self.directory.clone()
+        {
             self.started = self.requested;
             let task = thread::Builder::new()
                 .name("ede-syntax-config".into())
-                .spawn(|| crate::syntax::read_config().map(Arc::new));
+                .spawn(move || crate::syntax::read_config(&directory).map(Arc::new));
             changed |= self.load_task(self.started, false, Cancellation::default(), task);
         } else if self.loader.is_none()
             && self.running.is_none()
@@ -504,7 +537,9 @@ impl State {
         }
         if let Some(task) = self.loader.take() {
             task.cancel.cancel();
-            let _ = task.task.join();
+            if task.validation || task.task.is_finished() {
+                let _ = task.task.join();
+            }
         }
     }
 }
@@ -513,7 +548,7 @@ impl State {
 mod tests {
     use super::*;
     use crate::{document::OpenOptions, editor::Action, syntax::Choice};
-    use std::{path::PathBuf, sync::mpsc};
+    use std::sync::mpsc;
 
     #[test]
     fn old_viewport_error_cannot_latch_on_resized_view() {
@@ -536,6 +571,7 @@ mod tests {
             language,
             attempt: editor.tab.syntax_attempt,
             rules: 0,
+            limits: 0,
         };
         let view = ViewKey::new(
             identity.tab,
@@ -570,8 +606,77 @@ mod tests {
     }
 
     #[test]
+    fn stricter_limits_revoke_a_held_timeout_and_relaxing_retries_the_revision() {
+        let mut editor = crate::editor::tests::coordinator(OpenOptions::default());
+        Arc::get_mut(&mut editor.view_cancel).unwrap().syntax =
+            Arc::new(ProcessControl::new(Some(PathBuf::from("/bin/false"))));
+        editor
+            .action(Action::Insert("fn example() {}".into()))
+            .unwrap();
+        let language = Choice::options()
+            .find_map(|choice| match choice {
+                Choice::Syntax(language) if language.id == "rust" => Some(language),
+                _ => None,
+            })
+            .unwrap();
+        editor.tab.screen.syntax_language = Choice::Syntax(language);
+        editor.tab.resolve_syntax(&Config::default());
+        let identity = Identity {
+            tab: editor.tab.screen.tab.unwrap(),
+            document: editor.tab.screen.document.unwrap(),
+            revision: editor.tab.info.as_ref().unwrap().revision,
+            language,
+            attempt: editor.tab.syntax_attempt,
+            rules: 0,
+            limits: 0,
+        };
+        let view = ViewKey::new(
+            identity.tab,
+            identity.document,
+            editor.tab.screen.view.as_ref().unwrap(),
+        );
+        let (release, held) = mpsc::sync_channel(0);
+        let task = thread::spawn(move || {
+            held.recv_timeout(Duration::from_secs(3)).unwrap();
+            Err(Fallback::Timeout)
+        });
+        let mut state = State {
+            identity: Some(identity),
+            running: Some(Running {
+                identity,
+                view,
+                cancel: Cancellation::default(),
+                task,
+            }),
+            ..State::default()
+        };
+        let limits = crate::settings::SyntaxLimits {
+            document: 1,
+            ..Default::default()
+        };
+        assert!(state.set_limits(limits));
+        assert!(state.running.as_ref().unwrap().cancel.is_cancelled());
+        release.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !state.running.as_ref().unwrap().task.is_finished() {
+            assert!(Instant::now() < deadline);
+            thread::yield_now();
+        }
+        state.poll(&mut editor);
+        assert_eq!(
+            editor.tab.screen.syntax_status,
+            Status::Fallback(Fallback::Size)
+        );
+        assert_eq!(editor.tab.screen.syntax_language, Choice::Syntax(language));
+        assert!(state.set_limits(Default::default()));
+        state.poll(&mut editor);
+        assert_eq!(editor.tab.screen.syntax_status, Status::Preparing);
+    }
+
+    #[test]
     fn superseded_reload_cannot_publish_after_new_request() {
-        let mut state = State::default();
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = State::new(Some(directory.path().to_owned()));
         let matching = state.config.clone();
         let stale = Arc::new(Config::default());
         let (release, wait) = mpsc::sync_channel(0);

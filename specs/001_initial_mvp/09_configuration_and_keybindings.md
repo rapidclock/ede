@@ -1,6 +1,6 @@
 # 09 — Configuration and keybinding UI
 
-Status — Design draft for approval. Requirements come from the accepted [MVP overview](overview.md#fr-09--configuration-and-keybinding-remapping). Interfaces and policies below are proposed for Stage 09.
+Status — Implemented and verified locally on macOS and Ubuntu. The stage is in a draft PR. Requirements come from the accepted [MVP overview](overview.md#fr-09--configuration-and-keybinding-remapping).
 
 Branch — `stage/configuration_and_keybindings`. PR target — `feat/initial_mvp`.
 Baseline — Stage 08 merged at `a258b85`.
@@ -102,10 +102,10 @@ ordinary interactive session with default settings. Document the flag in
 `--help`. In safe mode use bundled settings and bundled highlighting throughout
 the session. Skip reads and writes of user configuration, including query files,
 and visibly disable configuration save and reload. Normal editing, guarding
-and scratch recovery remain available. Show the expected configuration
-location, when available, so the user can fix or move a broken file externally
-and relaunch. Safe startup and the failed-load default path must work without
-mouse capture or enhanced keys.
+and scratch recovery remain available. F1 Help shows the expected configuration
+location when available so the user can fix or move a broken file externally and
+relaunch. Safe startup and the failed-load default path must work without mouse
+capture or enhanced keys.
 
 ## Commands and key resolution
 
@@ -303,8 +303,9 @@ identify the step and context if a candidate removes the route.
   and bytes with the draft base. Report a changed or newly created file,
   present **Reload Settings**, and preserve the draft until the user chooses
   what to discard. Only create the config directory and file for explicit save.
-  Use a private same-directory temporary file, preserve existing regular-file
-  permission bits and use mode 0600 for a new file. Reject final symlinks,
+  Stage the replacement in a private 0700 directory inside the selected
+  configuration directory. Preserve existing regular-file permission bits and
+  use mode 0600 for a new file. Reject final symlinks,
   nonregular files, and multiply-linked files for UI writes. Stage, sync and
   publish the complete file atomically, using no-clobber publication when the
   file was absent. Remove unpublished temporary files on failure.
@@ -333,6 +334,8 @@ identify the step and context if a candidate removes the route.
   file/scratch Close and Quit confirmations. A stalled config worker must not
   delay tty restoration or process exit. If a worker remains stuck after the
   grant, the file may contain the old or complete new revision on relaunch.
+  Process exit while filesystem I/O is stalled can leave an unpublished private
+  staging directory.
 
 ## Applying a settings revision
 
@@ -383,9 +386,62 @@ verify changed guards with deliberate mutations in isolated copies per
 
 ## Validation record
 
-- Independent design review against `a258b85` checked command coverage and
-  routing, key capture, small-terminal recovery, and settings publication.
-  Follow-up review verified the revised design and found no material blockers.
-- Local documentation checks passed for whitespace, internal links, the TOML
-  example, and acceptance IDs K01–K08.
-- Implementation and runtime validation pending.
+- Independent design review against `a258b85` covered command ownership, capture
+  transitions, tiny-terminal recovery, and publication. Separate implementation
+  reviews against `c4bfcb0` covered input and Settings, filesystem publication,
+  and runtime application. Follow-up checks found no material issues after fixes
+  to focused confirmation, native path display, staging, and shutdown ordering.
+- **K01 — Loading.** Unit and reducer checks cover XDG/HOME precedence, strict
+  ranges and schema, printable diagnostics, missing files, FIFOs, symlinks, UTF-8
+  and the exact file-size boundary. A held startup read cannot publish either a
+  stale revision or a stale diagnostic after bypass. First text, the bypass
+  control and paste cancellation were checked in the renderer/reducer. CLI tests
+  cover flags and early errors. The Stage 07 config reload PTY passed.
+- **K02 — Keymaps.** The README's command IDs, contexts, and defaults are checked
+  against the actual catalog. Tests cover normalized collisions, inherited and
+  empty lists, swaps, disjoint contexts, and portable recovery. Real PTYs remap
+  Save, Quit, Settings, both search focus actions, field Backspace, movement,
+  and selection. Reducer checks guard focused and visible Discard, error
+  recovery Save As, and Actions and Help suppressing covered document commands.
+- **K03 — Terminal.** Real PTY regressions cover portable keys, translated and
+  enhanced delivery, repeats and releases, absent capability replies, IXON,
+  clipboard and bracketed paste, split input, and exact tty restoration. Job
+  control preserves a remapped Quit after suspend and resume. Isolated tmux 3.8
+  passed on macOS. An SSH PTY into Ubuntu delivered Ctrl+S, F9, the CSI-u sequence
+  for Cmd+Shift+S, Escape and remapped Ctrl+B. Saved bytes were checked after
+  exit. Stage 10 owns the full physical keyboard, emulator, and transport matrix.
+- **K04 — Settings.** Real 40×8 PTYs exercise keyboard scalar edit, save and
+  relaunch, restoration of defaults, mouse entry, captured Enter, typed
+  replacement via bracketed paste, resize during capture, and dirty confirmation.
+  Reducer checks cover captured Escape and release, held presses, and preservation
+  of a typed field across asynchronous reload. Picker, search, scratch and stream
+  regressions passed.
+- **K05 — Publication.** Real files and barriers cover stale base, same-inode
+  edits, replacement, chmod, new hard links, symlinks, replaced directories,
+  creation during publication, contention, cancellation and shutdown on both
+  sides of the grant, and reload ordered after save. Tests verify private
+  staging, late source changes, comments, modes, serialized round-trip, and
+  uncertainty after a simulated directory-sync failure. Isolated mutations of
+  the final destination check, grant, obsolete-read check, no-clobber publish,
+  and staged-source guard failed their intended assertions. Independent review
+  also verified a deliberate break in the focused Discard guard.
+- **K06 — Safe startup.** Real PTYs cover rejected initial settings, last-good
+  reload fallback, guarded keyboard Quit with mouse capture paused, bundled
+  syntax and no user reload, and safe startup with an ordinary file, literal
+  dash-prefixed file, pipe, and Follow. Config and source bytes were checked.
+  Exposing the user config root in safe mode in an isolated copy failed the
+  read-root assertion.
+- **K07 — Runtime updates.** Controlled scheduler and checkpoint-worker tests
+  cover a shorter and longer schedule, unchanged deadlines, an in-flight sweep
+  and the exact final Quit checkpoint. A pipe PTY reloads the cadence during
+  stdin promotion. Syntax tests cover whole-document and offscreen CRLF line
+  equality, limits above the boundary, bad general reload, independent custom
+  theme reload, worker deadlines, and stale timeout rejection. The settings
+  envelope also passes during a held caret read fault.
+- **K08 — Local verification.** Rust 1.99.1 on macOS 27.2 arm64 and Ubuntu
+  26.10 aarch64 passed `cargo fmt --all -- --check`,
+  `cargo clippy --workspace --all-targets --locked -- -D warnings`, and
+  `cargo test --workspace --locked` under a 256-descriptor soft limit. The
+  default suite passed 313 tests on macOS and 315 on Ubuntu, with 10 opt-in
+  tests skipped on each. The macOS tmux smoke test ran separately. The Ubuntu
+  suite ran in tmux pane `%0` from a checksum-verified isolated source snapshot.

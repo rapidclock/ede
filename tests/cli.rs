@@ -35,6 +35,7 @@ fn informational_flags_and_argument_errors() {
             let help = String::from_utf8(output.stdout).unwrap();
             assert!(help.contains("--follow FILE"));
             assert!(help.contains("producer | ede"));
+            assert!(help.contains("--safe-config"));
         }
     }
     for args in [
@@ -44,6 +45,11 @@ fn informational_flags_and_argument_errors() {
         vec!["--follow"],
         vec!["--follow", "first", "second"],
         vec!["first", "--follow", "second"],
+        vec!["file", "--safe-config"],
+        vec!["--safe-config", "--safe-config"],
+        vec!["--safe-config", "--help"],
+        vec!["--safe-config", "--follow"],
+        vec!["--safe-config", "--follow", "first", "second"],
     ] {
         let output = command().args(args).output().unwrap();
         assert_eq!(output.status.code(), Some(2));
@@ -55,7 +61,14 @@ fn informational_flags_and_argument_errors() {
 /// A pipe takes one startup slot and cannot be combined with direct following.
 #[test]
 fn incompatible_stream_startup_leaves_input_unread() {
-    for args in [vec!["file"; 64], vec!["--follow", "file"]] {
+    let mut safe_paths = vec!["--safe-config"];
+    safe_paths.extend(["file"; 64]);
+    for args in [
+        vec!["file"; 64],
+        vec!["--follow", "file"],
+        safe_paths,
+        vec!["--safe-config", "--follow", "file"],
+    ] {
         let (read, write_end) = pipe().unwrap();
         write(&write_end, b"retain me").unwrap();
         drop(write_end);
@@ -155,6 +168,10 @@ fn file_paths_are_accepted_without_consuming_redirected_input() {
         vec!["--".into(), "-first".into(), "-second".into()],
         vec![OsString::from_vec(b"source-\xff".to_vec())],
         vec!["--".into()],
+        vec!["--safe-config".into()],
+        vec!["--safe-config".into(), "file.txt".into()],
+        vec!["--safe-config".into(), "--".into(), "-first".into()],
+        vec!["--safe-config".into(), "--".into(), "--safe-config".into()],
     ] {
         let output = command().args(args).output().unwrap();
         assert_eq!(output.status.code(), Some(1));

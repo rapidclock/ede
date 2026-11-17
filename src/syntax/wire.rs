@@ -75,12 +75,19 @@ pub fn serve(
                 send(&mut output, READY)?;
             }
             PROJECT => {
-                let deadline = Instant::now() + ANALYSIS;
+                let timeout = Duration::from_millis(u64::from(number(&mut input)?));
+                if timeout.is_zero() || timeout > ANALYSIS {
+                    return Err(invalid());
+                }
+                let deadline = Instant::now() + timeout;
                 let sequence = number(&mut input)?;
                 let Ok(runs) = read_runs(&mut input) else {
                     return Err(invalid());
                 };
                 let result = (|| {
+                    if Instant::now() >= deadline {
+                        return Err(Fallback::Timeout);
+                    }
                     if let Some((source, language, rules)) = document.take() {
                         if runs
                             .last()
@@ -317,6 +324,40 @@ pub(super) fn read_error(input: &mut impl Read) -> io::Result<(&'static str, Str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn worker_enforces_supplied_deadline_during_dispatch() {
+        let mut start = Vec::new();
+        start.extend_from_slice(&[OPEN, language_code(Some(&LANGUAGES[0]))]);
+        send_rules(&mut start, &Rules::default()).unwrap();
+        send_string(&mut start, "").unwrap();
+        start.push(PROJECT);
+        send_number(&mut start, 1).unwrap();
+
+        // Block the child at descriptor reception after its configured deadline starts.
+        let delayed = std::io::repeat(0).take(8);
+        let delayed = Delayed(Some(delayed));
+        let mut out = Vec::new();
+        serve(start.as_slice().chain(delayed), &mut out, || (0, 0)).unwrap();
+        assert_eq!(out, [READY, READY, TIMEOUT]);
+    }
+
+    struct Delayed<R>(Option<R>);
+
+    impl<R: Read> Read for Delayed<R> {
+        fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+            if let Some(reader) = &mut self.0 {
+                std::thread::sleep(Duration::from_millis(10));
+                reader.read(bytes).inspect(|&count| {
+                    if count == 0 {
+                        self.0 = None;
+                    }
+                })
+            } else {
+                Ok(0)
+            }
+        }
+    }
 
     #[test]
     fn duplicate_viewport_reply_with_same_ranges_cannot_be_relabelled() {

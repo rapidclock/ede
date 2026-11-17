@@ -159,10 +159,7 @@ impl Config {
     }
 
     /// Read all candidate sources under one byte cap. Missing paths use defaults.
-    pub(super) fn load(root: Option<&Path>) -> io::Result<Self> {
-        let Some(root) = root else {
-            return Ok(Self::default());
-        };
+    pub(super) fn load(root: &Path) -> io::Result<Self> {
         let mut remaining = SOURCE_LIMIT;
         let path = root.join("highlighting.toml");
         let mut config = match read(&path, &mut remaining)? {
@@ -262,19 +259,6 @@ impl Config {
             }),
         })
     }
-}
-
-/// Compute the config directory once from absolute XDG_CONFIG_HOME or HOME.
-pub(super) fn directory() -> Option<PathBuf> {
-    std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .filter(|path| path.is_absolute())
-        .or_else(|| {
-            std::env::var_os("HOME")
-                .map(|home| PathBuf::from(home).join(".config"))
-                .filter(|path| path.is_absolute())
-        })
-        .map(|path| path.join("ede"))
 }
 
 /// Load only regular bounded files so a FIFO or device cannot block reload indefinitely.

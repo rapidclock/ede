@@ -1,12 +1,14 @@
 //! Byte-based whole-document eligibility using immutable logical text.
 
 use super::Fallback;
-use crate::document::{ByteOffset, Cancellation, Snapshot};
+use crate::{
+    document::{ByteOffset, Cancellation, Snapshot},
+    settings::SyntaxLimits,
+};
 use std::io::{self, Write};
 
 /// Eligible length and line width include equality.
 pub(crate) const DOCUMENT: u64 = 20 * 1024 * 1024;
-const LINE: usize = 64 * 1024;
 // Storage reserves twice the input plus two 64 KiB pages. This leaves room
 // for running projection scratch and both published result copies under 1 MiB.
 const WINDOW: usize = 48 * 1024;
@@ -20,14 +22,14 @@ struct Lines {
 
 impl Lines {
     /// Check complete lines and allow one provisional CR at the partial line end.
-    fn push(&mut self, mut chunk: &[u8]) -> bool {
+    fn push(&mut self, mut chunk: &[u8], limit: usize) -> bool {
         while let Some(lf) = memchr::memchr(b'\n', chunk) {
             let cr = if lf == 0 {
                 self.last_cr
             } else {
                 chunk[lf - 1] == b'\r'
             };
-            if self.len + lf - usize::from(cr) > LINE {
+            if self.len + lf - usize::from(cr) > limit {
                 return false;
             }
             self.len = 0;
@@ -38,12 +40,12 @@ impl Lines {
             self.last_cr = *last == b'\r';
         }
         self.len += chunk.len();
-        self.len - usize::from(self.last_cr) <= LINE
+        self.len - usize::from(self.last_cr) <= limit
     }
 
     /// A trailing CR at EOF counts as an ordinary byte.
-    fn finish(&self) -> bool {
-        self.len <= LINE
+    fn finish(&self, limit: usize) -> bool {
+        self.len <= limit
     }
 }
 
@@ -51,9 +53,10 @@ impl Lines {
 pub(super) fn transfer(
     snapshot: &Snapshot,
     cancel: &Cancellation,
+    limits: SyntaxLimits,
     writer: &mut impl Write,
 ) -> Result<(), Fallback> {
-    if snapshot.len() > DOCUMENT {
+    if snapshot.len() > limits.document {
         return Err(Fallback::Size);
     }
     let mut check = Lines::default();
@@ -67,7 +70,7 @@ pub(super) fn transfer(
                 _ => Fallback::Read,
             })?;
         let bytes = window.text().as_bytes();
-        if !check.push(bytes) {
+        if !check.push(bytes, limits.line) {
             return Err(Fallback::Line);
         }
         writer.write_all(bytes).map_err(|error| {
@@ -82,7 +85,10 @@ pub(super) fn transfer(
         };
         at = next;
     }
-    check.finish().then_some(()).ok_or(Fallback::Line)
+    check
+        .finish(limits.line)
+        .then_some(())
+        .ok_or(Fallback::Line)
 }
 
 #[cfg(test)]
@@ -91,24 +97,25 @@ mod tests {
 
     #[test]
     fn logical_limits_count_bytes_and_only_crlf_excludes_cr() {
-        for size in [LINE - 1, LINE, LINE + 1] {
+        let limit = SyntaxLimits::default().line;
+        for size in [limit - 1, limit, limit + 1] {
             let bytes = "é".repeat(size / 2) + &"x".repeat(size % 2);
             let mut lines = Lines::default();
-            let accepted = lines.push(bytes.as_bytes()) && lines.finish();
-            assert_eq!(accepted, size <= LINE);
+            let accepted = lines.push(bytes.as_bytes(), limit) && lines.finish(limit);
+            assert_eq!(accepted, size <= limit);
         }
-        let at_limit = vec![b'a'; LINE];
+        let at_limit = vec![b'a'; limit];
         let mut lines = Lines::default();
-        assert!(lines.push(&at_limit));
-        assert!(lines.push(b"\r"));
-        assert!(!lines.finish(), "standalone CR at EOF counts");
-        assert!(lines.push(b"\nnext\r\n"));
-        assert!(lines.finish(), "CRLF may straddle a window");
+        assert!(lines.push(&at_limit, limit));
+        assert!(lines.push(b"\r", limit));
+        assert!(!lines.finish(limit), "standalone CR at EOF counts");
+        assert!(lines.push(b"\nnext\r\n", limit));
+        assert!(lines.finish(limit), "CRLF may straddle a window");
         let mut lines = Lines::default();
-        assert!(lines.push(b"short\r"));
-        assert!(lines.push(b"\n"));
-        assert!(lines.push(&at_limit));
-        assert!(lines.push(b"\r"));
-        assert!(!lines.push(b"x"), "nonterminal CR counts");
+        assert!(lines.push(b"short\r", limit));
+        assert!(lines.push(b"\n", limit));
+        assert!(lines.push(&at_limit, limit));
+        assert!(lines.push(b"\r", limit));
+        assert!(!lines.push(b"x", limit), "nonterminal CR counts");
     }
 }
