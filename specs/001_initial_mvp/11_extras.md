@@ -72,8 +72,8 @@ probe also passed when run explicitly.
 | ID | Evidence and remaining acceptance |
 | --- | --- |
 | E11-1 | **Partial.** The Ubuntu Wayland guest passed bidirectional Unicode and multi-MiB clipboard tests with real graphical apps, exact byte comparison, one-step Undo, and repeated reads after normal ede exit. Xvfb exercised X11 ownership, peer rejection, empty selection, Unicode/CRLF and incremental reads. Injected backend tests exercised empty and invalid text. Direct Apple Terminal and iTerm2 automation, the stock Ubuntu Xorg desktop, and the UTM sharing baseline remain open. |
-| E11-2 | **Partial.** Real PTYs exercised OSC 52 framing, the 8,192-byte limit, retained 8,193-byte legacy System copies, terminal-owned bracketed paste, tty backpressure and signal restoration. A separate macOS tmux 3.8 session exercised retained Copy/Paste and suspension. Actual GUI client delivery and physical shortcut handling in both Mac terminals, and Windows Terminal with WSL and Notepad, remain open. |
-| E11-3 | **Partial.** Controlled tests exercised failed-write ordering, stale reads, superseding Copy, revocation after handoff and at storage commit, injected deletion failure, suspension waiting for a helper, and opt-out reload. The tests checked retained bytes, revision, selection and undo. PTYs confirmed cross-tab Cut and Paste with one Undo under the explicit opt-out and safe configuration. The real desktop locality cases and a full-disk native transfer still need validation. |
+| E11-2 | **Partial.** Real PTYs exercised OSC 52 framing, the 8,192-byte limit, retained 8,193-byte legacy System copies, terminal-owned bracketed paste, tty backpressure and signal restoration. Direct SSH and SSH with remote tmux 3.7b both produced the exact expected frame and saved exact retained bytes in another tab. A separate macOS tmux 3.8 session exercised retained Copy/Paste and suspension. Actual GUI client delivery and physical shortcut handling in both Mac terminals, and Windows Terminal with WSL and Notepad, remain open. |
+| E11-3 | **Partial.** Controlled tests exercised failed-write ordering, stale reads, superseding Copy, revocation after handoff and at storage commit, injected deletion failure, suspension waiting for a helper, and opt-out reload. The tests checked retained bytes, revision, selection and undo. PTYs confirmed cross-tab Cut and Paste with one Undo under the explicit opt-out and safe configuration. SSH still used the terminal route with matching guest display variables inherited. The alternate local-seat case and a full-disk native transfer still need validation. |
 | E11-4 | **Partial.** Real PTYs covered outside clicks over Quit, Settings and a tab close at the supported floor and regular size, popup border and crossing drags, and preservation of the active view. The full pointer case matrix remains open. |
 | E11-5 | **Partial.** PTYs and reducer tests covered direct entry, F5 and keymap inheritance conflicts, numeric keyboard and mouse edits at 40×8, direct Save of pending input, invalid Save and Exit, resizing with pending input, Restore Defaults, capture and its discard guard. Stage 09 persistence and configuration regressions passed. The full combined-draft and publication acceptance matrix remains open. |
 | E11-6 | **Partial.** PTYs covered per-tab × and dividers, inactive dirty close with Cancel and Save, the named inactive scratch Save As at 40×8, preserved active caret and disk bytes, and overflow, active and last-tab close paths. The remaining rendered width and overlapping inactive stream/save cases need explicit checks. |
@@ -92,6 +92,14 @@ original bytes. A 3,538,949-byte selection copied to the guest desktop and a
 also restored the original large document. Two desktop reads after normal
 ede exit both matched the original small marker. The Mac locked before the
 separate host–guest sharing baseline was run.
+
+**SSH evidence.** macOS OpenSSH used a real `xterm-256color` PTY to Ubuntu
+26.10. The remote command inherited the guest's Wayland and X11 display
+variables. For the second run, an isolated tmux 3.7b server used
+`set-clipboard on` and `xterm*:clipboard`. In both cases the observed frame
+contained the exact multiline Unicode marker. A delivered Ctrl+V pasted the
+retained marker into a second tab, and the saved file matched it byte for
+byte. This verified forwarding to the PTY and editor behavior.
 
 **Guard mutations.** In isolated copies, removing the storage cancellation
 authority, retained-copy cancellation check, terminal frame generation
