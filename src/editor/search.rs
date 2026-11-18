@@ -193,6 +193,7 @@ pub(super) fn revokes_navigation(action: &Action) -> bool {
             | Action::RetryRefresh(_)
             | Action::Command(Command::Copy)
             | Action::Clipboard { cut: false, .. }
+            | Action::NativeCopy { cut: false, .. }
             | Action::RecoveryPage { .. }
     )
 }
@@ -202,6 +203,8 @@ pub(super) fn clears_anchor(action: &Action) -> bool {
         Action::Insert(_)
             | Action::Paste(_)
             | Action::Clipboard { cut: true, .. }
+            | Action::NativeCopy { cut: true, .. }
+            | Action::NativePaste { .. }
             | Action::Hit { .. }
             | Action::GoTo { .. }
             | Action::ClearSelection
@@ -229,6 +232,8 @@ pub(super) fn mutates(action: &Action) -> bool {
         Action::Insert(_)
             | Action::Paste(_)
             | Action::Clipboard { cut: true, .. }
+            | Action::NativeCopy { cut: true, .. }
+            | Action::NativePaste { .. }
             | Action::Command(
                 Command::Cut
                     | Command::Paste

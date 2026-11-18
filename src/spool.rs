@@ -1,7 +1,7 @@
 //! Private disk-backed clipboard/paste bytes with bounded streaming readers.
 use std::{
     fs::File,
-    io::{self, Read, Write},
+    io::{self, Read, Seek, Write},
     os::unix::fs::FileExt,
 };
 
@@ -40,6 +40,14 @@ impl Spool {
             spool: self,
             offset: 0,
         }
+    }
+
+    /// Feed one native helper from the immutable staging file.
+    /// Other users of the spool use positional reads and keep their own cursors.
+    pub fn input_file(&self) -> io::Result<File> {
+        let mut file = self.file.try_clone()?;
+        file.rewind()?;
+        Ok(file)
     }
 }
 /// Independent forward-only file cursor; resident memory does not scale with the payload.
