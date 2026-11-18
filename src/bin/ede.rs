@@ -10,6 +10,14 @@ fn main() -> ExitCode {
     // Retain only enough arguments to recognize flags and reject an overlong list.
     let args: Vec<_> = env::args_os().skip(1).take(ede::TAB_LIMIT + 3).collect();
     match args.as_slice() {
+        #[cfg(target_os = "macos")]
+        [arg] if arg == "--ede-pasteboard-read" || arg == "--ede-pasteboard-write" => {
+            return ExitCode::from(ede::macos_worker(arg == "--ede-pasteboard-write"));
+        }
+        #[cfg(target_os = "linux")]
+        [arg] if arg == "--ede-x11-clipboard-read" || arg == "--ede-x11-clipboard-write" => {
+            return ExitCode::from(ede::x11_worker(arg == "--ede-x11-clipboard-write"));
+        }
         [arg] if arg == "--ede-syntax-worker" => {
             let result = allocator::enable().and_then(|()| {
                 ede::syntax_worker(

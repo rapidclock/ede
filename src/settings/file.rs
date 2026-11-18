@@ -160,7 +160,7 @@ fn parse(text: &str) -> io::Result<Revision> {
                     .and_then(ClipboardMode::parse)
                     .ok_or_else(|| invalid("clipboard.mode: expected internal, system, or both"))?,
                 "copy_to_system" => match value.as_bool() {
-                    Some(true) => ClipboardMode::Both,
+                    Some(true) => ClipboardMode::Automatic,
                     Some(false) => ClipboardMode::Internal,
                     None => return Err(invalid("clipboard.copy_to_system: expected boolean")),
                 },
@@ -645,15 +645,48 @@ mod tests {
         parse("[recovery]\ncheckpoint_interval_seconds = 11\n").unwrap()
     }
 
+    /// Explicit workspace bindings only suppress the inherited Settings shortcut.
+    #[test]
+    fn inherited_settings_shortcut_yields_to_workspace_overrides() {
+        use crate::command::Command;
+        assert_eq!(
+            parse("")
+                .unwrap()
+                .map
+                .shortcuts(Context::Global, Command::Settings),
+            "F5"
+        );
+        let mut config = parse("[keybindings.editor]\nselect_all = ['F5']").unwrap();
+        assert_eq!(config.map.shortcuts(Context::Global, Command::Settings), "");
+        config
+            .map
+            .rows
+            .iter_mut()
+            .find(|row| row.command == Command::SelectAll)
+            .unwrap()
+            .override_keys = None;
+        config.map.revalidate().unwrap();
+        assert_eq!(
+            config.map.shortcuts(Context::Global, Command::Settings),
+            "F5"
+        );
+        let disjoint = parse("[keybindings.settings]\nreload_settings = ['F5']").unwrap();
+        assert_eq!(
+            disjoint.map.shortcuts(Context::Global, Command::Settings),
+            "F5"
+        );
+        assert!(parse("[keybindings.global]\nsettings = ['F5']\nquit = ['F5']").is_err());
+    }
+
     /// Old clipboard overrides keep their meaning, including explicit opt-out.
     #[test]
     fn clipboard_modes_parse_without_overriding_legacy_choices() {
         for (setting, mode) in [
-            ("", ClipboardMode::Both),
-            ("mode = \"both\"", ClipboardMode::Both),
+            ("", ClipboardMode::Automatic),
+            ("mode = \"both\"", ClipboardMode::Automatic),
             ("mode = \"internal\"", ClipboardMode::Internal),
-            ("mode = \"system\"", ClipboardMode::System),
-            ("copy_to_system = true", ClipboardMode::Both),
+            ("mode = \"system\"", ClipboardMode::Automatic),
+            ("copy_to_system = true", ClipboardMode::Automatic),
             ("copy_to_system = false", ClipboardMode::Internal),
         ] {
             let config = format!("[clipboard]\n{setting}");

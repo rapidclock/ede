@@ -21,17 +21,21 @@ use unicode_width::UnicodeWidthStr;
 pub(crate) enum Control {
     SettingsButton(settings_ui::Button),
     SettingsField,
+    SettingsRow(usize),
     UseDefaults,
     Search(u8),
     Content,
     WelcomeOpen,
     WelcomeNew,
     Menu,
+    MenuOutside,
+    WorkspaceSettings,
     Help,
     Quit,
     Tabs,
     Tab(TabId),
-    TabClose,
+    TabClose(TabId),
+    TabDivider,
     TabList,
     TabListRow(TabId),
     TabListClose,
@@ -71,7 +75,12 @@ impl Control {
     /// Resolve buttons/menu items to the shared command handler.
     pub fn command(self) -> Option<Command> {
         match self {
-            Self::SettingsButton(_) | Self::SettingsField => None,
+            Self::SettingsButton(_)
+            | Self::SettingsField
+            | Self::SettingsRow(_)
+            | Self::MenuOutside
+            | Self::TabClose(_)
+            | Self::TabDivider => None,
             Self::UseDefaults => Some(Command::Cancel),
             Self::Search(0 | 1) => None,
             Self::Search(_) => Some(Command::Activate),
@@ -86,10 +95,10 @@ impl Control {
             Self::WelcomeNew => Some(Command::New),
             Self::ToggleFollow => Some(Command::ToggleFollow),
             Self::Menu => Some(Command::Menu),
+            Self::WorkspaceSettings => Some(Command::Settings),
             Self::SaveErrorAs => Some(Command::SaveAs),
             Self::Help => Some(Command::Help),
             Self::Tabs => Some(Command::Tabs),
-            Self::TabClose => Some(Command::CloseTab),
             Self::Quit | Self::HelpQuit => Some(Command::Quit),
             Self::HelpSuspend => Some(Command::Suspend),
             Self::HelpClose | Self::PathCancel | Self::DetailsClose => Some(Command::Cancel),
@@ -101,7 +110,7 @@ impl Control {
     fn label(self) -> &'static str {
         match self {
             Self::SettingsButton(button) => button.label(),
-            Self::SettingsField => "",
+            Self::SettingsField | Self::SettingsRow(_) => "",
             Self::UseDefaults => "Use defaults for this session",
             Self::WelcomeOpen => "Open File",
             Self::WelcomeNew => "New Scratch",
@@ -125,7 +134,10 @@ impl Control {
             Self::RecoveryErrorRetry => "Retry",
             Self::RecoveryErrorCancel => "Cancel quit",
             Self::Tabs => "Tabs",
-            Self::TabClose => "×",
+            Self::TabClose(_) => "×",
+            Self::TabDivider => "│",
+            Self::MenuOutside => "",
+            Self::WorkspaceSettings => "Settings",
             Self::TabListClose => "Close",
             Self::TabListSwitch => "Switch",
             Self::PickerUp => "Up",
@@ -159,7 +171,7 @@ pub(crate) struct Signature {
     modal: u8,
     detail: u64,
     active: Option<TabId>,
-    tabs: Vec<TabId>,
+    tabs: Vec<(TabId, u16)>,
     welcome: bool,
     picker_revision: u64,
     picker_request: u64,
@@ -177,6 +189,8 @@ pub(crate) struct Signature {
 pub(crate) struct LayoutSnapshot {
     pub area: Rect,
     pub generation: u64,
+    /// Header and modal hit targets can change while the text geometry stays fixed.
+    pub document_generation: u64,
     pub overlay: Option<Rect>,
     pub signature: Signature,
     targets: Vec<Target>,
@@ -195,6 +209,7 @@ impl LayoutSnapshot {
         let mut result = Self {
             area,
             generation,
+            document_generation: generation,
             overlay: None,
             signature: Signature {
                 help,
@@ -214,9 +229,18 @@ impl LayoutSnapshot {
             result.add(Control::HelpSuspend, Rect::new(overlay.x + 9, y, 11, 1));
             result.add(Control::HelpClose, Rect::new(overlay.x + 22, y, 9, 1));
         } else {
-            result.add(Control::Menu, Rect::new(area.right() - 25, area.y, 8, 1));
-            result.add(Control::Help, Rect::new(area.right() - 17, area.y, 8, 1));
-            result.add(Control::Quit, Rect::new(area.right() - 8, area.y, 8, 1));
+            let button_width = if area.width < 52 { 6 } else { 8 };
+            let mut x = area.right();
+            for (control, width) in [
+                (Control::Quit, button_width),
+                (Control::Help, button_width),
+                (Control::Menu, button_width),
+                (Control::WorkspaceSettings, 10),
+            ] {
+                x -= width;
+                result.add(control, Rect::new(x, area.y, width, 1));
+            }
+            result.targets[0..3].reverse();
             result.add(
                 Control::Content,
                 Rect::new(area.x, area.y + 1, area.width, area.height - 2),
@@ -256,7 +280,19 @@ impl LayoutSnapshot {
             modal,
             detail,
             active: app.screen.tab,
-            tabs: app.screen.tabs.iter().map(|tab| tab.id).collect(),
+            tabs: app
+                .screen
+                .tabs
+                .iter()
+                .map(|tab| {
+                    let width = if app.help || app.modal.is_some() {
+                        0
+                    } else {
+                        tab_label_width(tab)
+                    };
+                    (tab.id, width)
+                })
+                .collect(),
             welcome: app.screen.tab.is_none() && !app.screen.loading,
             picker_revision,
             picker_request,
@@ -340,28 +376,51 @@ impl LayoutSnapshot {
             return result;
         }
         result.targets.clear();
-        let overlay = result.overlay_rect(76, 22);
+        let overlay = if matches!(app.modal, Some(Modal::Settings)) {
+            let width = area.width.min(100);
+            let height = (area.height - 1).min(30);
+            Rect::new(
+                area.x + (area.width - width) / 2,
+                area.y + (area.height - 1 - height) / 2,
+                width,
+                height,
+            )
+        } else {
+            result.overlay_rect(76, 22)
+        };
         result.overlay = Some(overlay);
         let y = overlay.bottom() - 2;
         match &app.modal {
             Some(Modal::Settings) => {
                 if let Some(draft) = &app.settings_ui {
-                    if draft.editing() {
+                    let inline = draft.inline_scalar();
+                    for (offset, row) in draft.rows(overlay.height - 4).enumerate() {
+                        let y = overlay.y + 2 + offset as u16;
+                        result.add(
+                            Control::SettingsRow(row),
+                            Rect::new(overlay.x + 1, y, overlay.width - 2, 1),
+                        );
+                        if let Some((index, scalar)) = inline
+                            && row == index
+                        {
+                            let gutter = scalar.label().width() as u16 + 2;
+                            result.add(
+                                Control::SettingsField,
+                                Rect::new(overlay.x + 1 + gutter, y, overlay.width - 2 - gutter, 1),
+                            );
+                        }
+                    }
+                    if draft.editing() && inline.is_none() {
                         result.add(
                             Control::SettingsField,
-                            Rect::new(overlay.x + 1, overlay.y + 2, overlay.width - 2, 1),
+                            Rect::new(overlay.x + 1, overlay.y + 3, overlay.width - 2, 1),
                         );
                     }
                     for (row, buttons) in draft.buttons(
+                        overlay.height - 2,
                         app.settings_save_state,
                         app.config_location.user_directory().is_some(),
-                        app.settings.base.is_some(),
                     ) {
-                        let row = if draft.info() {
-                            overlay.height - 3
-                        } else {
-                            row
-                        };
                         let mut x = overlay.x + 1;
                         for button in buttons {
                             let width = button.label().width() as u16 + 2;
@@ -573,21 +632,35 @@ impl LayoutSnapshot {
     fn add_tab_strip(&mut self, app: &AppState) {
         let area = self.area;
         let tabs = &app.screen.tabs;
-        let right = area.right() - 25;
+        let right = self
+            .targets
+            .iter()
+            .find(|target| target.control == Control::WorkspaceSettings)
+            .expect("workspace Settings geometry")
+            .area
+            .x;
         self.add(Control::Tabs, Rect::new(right - 6, area.y, 6, 1));
         let Some(active) = tabs.iter().position(|t| Some(t.id) == app.screen.tab) else {
             return;
         };
-        self.add(Control::TabClose, Rect::new(right - 9, area.y, 3, 1));
-        let width = area.width - 34;
+        let width = right - 6 - area.x;
         let count = (usize::from(width) / 12).max(1).min(tabs.len());
         let start = active.saturating_sub(count - 1).min(tabs.len() - count);
         let mut x = area.x;
-        for (index, tab) in tabs.iter().skip(start).take(count).enumerate() {
-            let cells =
-                (width / count as u16 + u16::from(index == 0) * (width % count as u16)).min(24);
-            self.add(Control::Tab(tab.id), Rect::new(x, area.y, cells, 1));
-            x += cells;
+        let mut available = width - (count as u16 - 1);
+        let visible = &tabs[start..start + count];
+        for (index, tab) in visible.iter().enumerate() {
+            let remaining = (count - index) as u16;
+            let cells = (tab_label_width(tab) + 1).min(available / remaining);
+            self.add(Control::Tab(tab.id), Rect::new(x, area.y, cells - 1, 1));
+            x += cells - 1;
+            self.add(Control::TabClose(tab.id), Rect::new(x, area.y, 1, 1));
+            x += 1;
+            available -= cells;
+            if remaining > 1 {
+                self.add(Control::TabDivider, Rect::new(x, area.y, 1, 1));
+                x += 1;
+            }
         }
     }
 
@@ -636,7 +709,10 @@ impl LayoutSnapshot {
             .filter(|t| {
                 !matches!(
                     t.control,
-                    Control::PickerRow(_) | Control::TabListRow(_) | Control::RecoveryRow(_)
+                    Control::PickerRow(_)
+                        | Control::TabListRow(_)
+                        | Control::RecoveryRow(_)
+                        | Control::TabDivider
                 )
             })
             .collect();
@@ -690,6 +766,14 @@ fn tab_text(tab: &TabSummary, active: bool) -> String {
     )
 }
 
+fn strip_label(tab: &TabSummary) -> String {
+    format!("{} ", tab_text(tab, false).trim_start())
+}
+
+fn tab_label_width(tab: &TabSummary) -> u16 {
+    strip_label(tab).width().min(24) as u16
+}
+
 /// Render a prepared view without performing text reads or recomputing Unicode boundaries.
 pub(crate) fn render(frame: &mut Frame<'_>, app: &AppState, layout: &LayoutSnapshot) {
     let area = layout.area;
@@ -728,7 +812,13 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &AppState, layout: &LayoutSnaps
             } else {
                 "No open tabs"
             }),
-            Rect::new(area.x, area.y, area.width - 31, 1),
+            Rect::new(
+                area.x,
+                area.y,
+                area.width
+                    .saturating_sub(if area.width < 52 { 34 } else { 40 }),
+                1,
+            ),
         );
     }
     if app.switching.is_some() {
@@ -756,7 +846,7 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &AppState, layout: &LayoutSnaps
             .and_then(|(tab, document)| {
                 app.screen.syntax_projection.as_ref().filter(|projection| {
                     projection.key == ViewKey::new(tab, document, view)
-                        && view.generation == layout.generation
+                        && view.generation == layout.document_generation
                 })
             });
         for (y, row) in view
@@ -874,7 +964,7 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &AppState, layout: &LayoutSnaps
             && app.modal.is_none()
             && !app.screen.loading
             && !app.pending
-            && view.generation == layout.generation
+            && view.generation == layout.document_generation
             && app.focus == Some(Control::Content)
             && let Some((x, y)) = view.cursor
             && x < area.width
@@ -1112,11 +1202,18 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &AppState, layout: &LayoutSnaps
                         "Cmd aliases require terminal delivery.".into()
                     },
                     "Terminal paste inserts text through bracketed paste.".into(),
+                    "Copy retains the full selection across tabs.".into(),
+                    "Editor Paste reads the desktop locally, or ede's retained copy remotely."
+                        .into(),
+                    "Config clipboard.mode = \"internal\" keeps editor Copy and Cut private."
+                        .into(),
                     format!("{actions} opens Actions and the mouse capture toggle."),
+                    "Click outside Actions to dismiss it.".into(),
                     "Selection modifiers vary; tmux: copy mode.".into(),
-                    "Tabs: > active, * modified, ! save attention".into(),
+                    "Tab × closes that tab. Tabs lists hidden entries.".into(),
+                    "Highlighted tab is active. * modified, ! save attention.".into(),
                     "Tabs: … waiting, ↓ loading, ⇡ queued save, ↑ saving".into(),
-                    "Actions contains Language, Syntax Theme and Settings.".into(),
+                    "Settings opens from the header or Actions. F5 is the default.".into(),
                 ];
                 if app.config_location.safe() {
                     lines.splice(
@@ -1191,6 +1288,9 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &AppState, layout: &LayoutSnaps
                 render_field(frame, app, &dialog.field, target.area);
             }
         } else if let Some(Modal::Path(kind, field)) = &app.modal {
+            let save_label = app
+                .guarded_save_label()
+                .map(|label| format!("Save {}", tail_cells(label, inner.width.saturating_sub(5))));
             let label = match kind {
                 PathKind::GoTo => "Line[:cell], starting at 1:",
                 PathKind::Export
@@ -1203,7 +1303,9 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &AppState, layout: &LayoutSnaps
                     "Only the committed prefix will be copied. Enter a new path."
                 }
                 PathKind::Export => "Export the complete retained extent to a new path.",
-                PathKind::Save => "Path (no shell expansion):",
+                PathKind::Save => save_label
+                    .as_deref()
+                    .unwrap_or("Path (no shell expansion):"),
             };
             frame.render_widget(
                 Paragraph::new(label),
@@ -1247,30 +1349,27 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &AppState, layout: &LayoutSnaps
         }
     }
     for target in &layout.targets {
-        if let Control::Tab(id) = target.control {
+        if target.control == Control::TabDivider {
+            frame.render_widget(Paragraph::new("│"), target.area);
+            continue;
+        }
+        if let Control::Tab(id) | Control::TabClose(id) = target.control {
             if let Some(tab) = app.screen.tabs.iter().find(|tab| tab.id == id) {
                 let active = app.screen.tab == Some(id);
-                let label = tab_text(tab, false);
-                let label = label.trim_start();
-                let width = (UnicodeWidthStr::width(label) as u16).min(target.area.width - 2);
-                let style = if active {
+                let label = if target.control == Control::TabClose(id) {
+                    "×".to_owned()
+                } else {
+                    strip_label(tab)
+                };
+                let mut style = if active {
                     Style::default().add_modifier(Modifier::BOLD | Modifier::REVERSED)
-                } else if app.focus == Some(target.control) {
-                    Style::default().add_modifier(Modifier::UNDERLINED)
                 } else {
                     Style::default()
                 };
-                let x = target.area.x;
-                let y = target.area.y;
-                frame.render_widget(Paragraph::new("[").style(style), Rect::new(x, y, 1, 1));
-                frame.render_widget(
-                    Paragraph::new(label).style(style),
-                    Rect::new(x + 1, y, width, 1),
-                );
-                frame.render_widget(
-                    Paragraph::new("]").style(style),
-                    Rect::new(x + 1 + width, y, 1, 1),
-                );
+                if app.focus == Some(target.control) {
+                    style = style.add_modifier(Modifier::UNDERLINED);
+                }
+                frame.render_widget(Paragraph::new(label).style(style), target.area);
             }
             continue;
         }
@@ -1513,12 +1612,14 @@ fn render_settings(frame: &mut Frame<'_>, app: &AppState, layout: &LayoutSnapsho
     };
     frame.render_widget(Clear, overlay);
     frame.render_widget(
-        Block::default().title(" Settings ").borders(Borders::ALL),
+        Block::default()
+            .title(draft.title(&app.settings, &app.config_location))
+            .borders(Borders::ALL),
         overlay,
     );
     for (row, text) in draft.lines(&app.settings, &app.config_location) {
         let height = if draft.info() {
-            overlay.height.saturating_sub(3)
+            overlay.height.saturating_sub(4)
         } else {
             1
         };
@@ -1532,6 +1633,16 @@ fn render_settings(frame: &mut Frame<'_>, app: &AppState, layout: &LayoutSnapsho
                 overlay.width - 2,
                 height,
             ),
+        );
+    }
+    if let Some(message) = app
+        .field_error
+        .as_deref()
+        .or_else(|| draft.feedback(&app.settings))
+    {
+        frame.render_widget(
+            Paragraph::new(safe(message)).style(Style::default().add_modifier(Modifier::BOLD)),
+            Rect::new(overlay.x + 1, overlay.bottom() - 1, overlay.width - 2, 1),
         );
     }
     for target in &layout.targets {
@@ -1553,11 +1664,23 @@ fn render_settings(frame: &mut Frame<'_>, app: &AppState, layout: &LayoutSnapsho
             }
             Control::SettingsField => {
                 let text = tail_cells(&safe(&draft.field), target.area.width);
+                frame.render_widget(Clear, target.area);
                 if focus {
                     let column = (text.width() as u16).min(target.area.width.saturating_sub(1));
                     frame.set_cursor_position((target.area.x + column, target.area.y));
                 }
                 frame.render_widget(Paragraph::new(text).style(style), target.area);
+            }
+            Control::SettingsRow(index) => {
+                let label = match draft.inline_scalar() {
+                    Some((row, scalar)) if row == index => format!(">{} ", scalar.label()),
+                    _ => format!(
+                        "{}{}",
+                        if focus { '>' } else { ' ' },
+                        draft.row_label(index)
+                    ),
+                };
+                frame.render_widget(Paragraph::new(label).style(style), target.area);
             }
             _ => {}
         }

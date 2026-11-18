@@ -213,7 +213,13 @@ impl Coordinator {
         }
         // Pointer hits are valid only for the active viewport. A paste owns the
         // document it started in and has no dependency on pointer geometry.
-        if matches!(action, Action::Hit { .. } | Action::Scroll(..)) {
+        if matches!(
+            action,
+            Action::Hit { .. }
+                | Action::Scroll(..)
+                | Action::NativeCopy { cut: true, .. }
+                | Action::NativePaste { .. }
+        ) {
             return Ok(());
         }
         let Some(index) = self.tabs.iter().position(|t| t.id == id) else {

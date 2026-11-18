@@ -33,9 +33,9 @@ impl Scalar {
     pub const fn label(self) -> &'static str {
         match self {
             Self::Checkpoint => "Checkpoint interval (s)",
-            Self::Document => "Document limit (bytes)",
+            Self::Document => "Document limit (B)",
             Self::Line => "Line limit (bytes)",
-            Self::Timeout => "Analysis deadline (ms)",
+            Self::Timeout => "Parse timeout (ms)",
         }
     }
 
@@ -70,13 +70,12 @@ impl Scalar {
     }
 }
 
-/// Destinations for a document selection copied by ede.
+/// An explicit policy for access to external clipboards.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) enum ClipboardMode {
     Internal,
-    System,
     #[default]
-    Both,
+    Automatic,
 }
 
 impl ClipboardMode {
@@ -84,33 +83,16 @@ impl ClipboardMode {
     pub fn id(self) -> &'static str {
         match self {
             Self::Internal => "internal",
-            Self::System => "system",
-            Self::Both => "both",
+            Self::Automatic => "both",
         }
     }
 
     /// Read a stable configuration value.
     pub fn parse(value: &str) -> Option<Self> {
-        [Self::Internal, Self::System, Self::Both]
-            .into_iter()
-            .find(|mode| mode.id() == value)
-    }
-
-    /// Name displayed in Settings.
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Internal => "Internal",
-            Self::System => "System",
-            Self::Both => "Both",
-        }
-    }
-
-    /// Advance the Settings row by one choice.
-    pub fn next(self) -> Self {
-        match self {
-            Self::Internal => Self::System,
-            Self::System => Self::Both,
-            Self::Both => Self::Internal,
+        match value {
+            "internal" => Some(Self::Internal),
+            "system" | "both" => Some(Self::Automatic),
+            _ => None,
         }
     }
 }

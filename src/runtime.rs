@@ -2,6 +2,7 @@
 
 use std::{
     io,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -141,6 +142,7 @@ pub(crate) struct Launch {
     pub documents: crate::stream::Startup,
     pub recovery: crate::recovery::Store,
     pub syntax_program: Option<PathBuf>,
+    pub desktop_clipboard: Option<Arc<crate::clipboard::Backend>>,
     pub config: crate::settings::Location,
 }
 
@@ -182,11 +184,13 @@ pub(crate) fn run(
     let highlighting = editor.highlighting_process();
     let mut app = AppState::new();
     app.set_launch_directory(launch.directory);
+    app.desktop_clipboard = launch.desktop_clipboard;
     app.config_location = launch.config;
     app.settings.startup(&app.config_location);
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         event_loop_impl(&mut host, inbox, Some(&mut editor), Some(&picker), &mut app)
     }));
+    app.revoke_clipboard();
     let settings_exit = app.settings.exit(&app.config_location);
     host.ingress.stop();
     let streamed = editor.streamed();
@@ -279,6 +283,7 @@ fn event_loop_impl(
                 let intent = app.event(event);
                 if !had_surface && (app.modal.is_some() || app.help) {
                     bridge.revoke_search_navigation();
+                    app.revoke_clipboard_target();
                 }
                 if let Some(intent) = intent
                     && effect(intent, host, app, Some(bridge), picker)?
@@ -298,6 +303,9 @@ fn event_loop_impl(
             return Ok(Exit { code: 128 + signal });
         }
         if host.suspend_requested() {
+            app.request_suspend();
+        }
+        if app.suspend_ready() {
             suspend(host, app, editor.as_deref())?;
             area = host.area()?;
             rendered_generation = None;
@@ -334,7 +342,11 @@ fn event_loop_impl(
         // A timer can submit a pasted path and close its dialog. Reconcile that
         // change before drawing or reading another key, just like input effects.
         reconcile_layout(area, app, &mut layout);
-        let geometry = (area.width, layout.content_height(), layout.generation);
+        let geometry = (
+            area.width,
+            layout.content_height(),
+            layout.document_generation,
+        );
         if requested_geometry != Some(geometry) {
             if let Some(bridge) = editor.as_deref_mut() {
                 if bridge.submit(Action::Size(geometry.0, geometry.1, geometry.2)) {
@@ -394,15 +406,10 @@ fn event_loop_impl(
         {
             bridge.revoke_search_navigation();
         }
-        if let Some(intent) = intent {
-            let suspended = matches!(intent, Intent::Suspend);
-            if effect(intent, host, app, editor.as_deref_mut(), picker)? {
-                return Ok(Exit { code: 0 });
-            }
-            if suspended {
-                area = host.area()?;
-                rendered_generation = None;
-            }
+        if let Some(intent) = intent
+            && effect(intent, host, app, editor.as_deref_mut(), picker)?
+        {
+            return Ok(Exit { code: 0 });
         }
         // Admit a completed paste before releasing its reception guard.
         if let Some(bridge) = editor.as_deref() {
@@ -419,9 +426,7 @@ fn deliver_clipboard(
 ) -> ClipboardWrite {
     if app.system_clipboard_epoch() != Some(transfer.epoch) {
         if Some(transfer.sequence) == app.screen.clipboard_sequence {
-            let message = if !transfer.internal {
-                "System copy cancelled"
-            } else if transfer.cut {
+            let message = if transfer.cut {
                 "Cut internally | system request revoked"
             } else {
                 "Copied internally | system revoked"
@@ -432,8 +437,7 @@ fn deliver_clipboard(
     }
     let outcome = host.clipboard(&transfer);
     let message = match outcome {
-        ClipboardWrite::Sent => "System copy sent | unconfirmed",
-        ClipboardWrite::Unavailable if !transfer.internal => "System clipboard write failed",
+        ClipboardWrite::Sent => "Terminal copy sent | unconfirmed",
         ClipboardWrite::Unavailable if transfer.cut => "Cut internally | system write failed",
         ClipboardWrite::Unavailable => "Copied internally | system write failed",
         ClipboardWrite::Lost => return outcome,
@@ -445,7 +449,14 @@ fn deliver_clipboard(
 /// Keep displayed controls and focus consistent after asynchronous or timer-driven transitions.
 fn reconcile_layout(area: Rect, app: &mut AppState, layout: &mut LayoutSnapshot) {
     if layout.area != area || layout.signature != LayoutSnapshot::signature(app) {
-        *layout = LayoutSnapshot::for_app(area, app, layout.generation.wrapping_add(1));
+        let mut next = LayoutSnapshot::for_app(area, app, layout.generation.wrapping_add(1));
+        if layout.area == area
+            && layout.content_height() == next.content_height()
+            && layout.overlay.is_some() == next.overlay.is_some()
+        {
+            next.document_generation = layout.document_generation;
+        }
+        *layout = next;
     }
     app.sync_layout(layout);
 }
@@ -469,7 +480,7 @@ fn effect(
             }
         }
         Intent::QuitConfirmed => return Ok(true),
-        Intent::Suspend => suspend(host, app, editor.as_deref())?,
+        Intent::Suspend => app.request_suspend(),
         Intent::MouseCapture(enabled) => host.mouse(enabled)?,
         Intent::Picker(request) => {
             if let Some(picker) = picker {
@@ -488,11 +499,16 @@ fn effect(
         }
         Intent::Editor(action) => {
             if let Some(editor) = editor {
+                if action.invalidates_clipboard_target() {
+                    app.revoke_clipboard_target();
+                }
                 let action = match (app.screen.tab, action) {
                     (
                         Some(tab),
                         action @ (Action::Command(_)
                         | Action::Clipboard { .. }
+                        | Action::NativeCopy { .. }
+                        | Action::NativePaste { .. }
                         | Action::Insert(_)
                         | Action::Paste(_)
                         | Action::Save(_)
@@ -518,10 +534,9 @@ fn effect(
                         | Action::Follow(_)
                         | Action::Switch(_)
                         | Action::CycleTab(_)
-                        | Action::RemoveTab(_)
                         | Action::CancelOpen(_)
                         | Action::CancelActiveOpen(_)
-                );
+                ) || matches!(action, Action::RemoveTab(tab) if Some(tab) == app.screen.tab);
                 if editor.submit(action) {
                     if let Some(after) = guard {
                         app.expect_guard_for(editor.sequence(), after);
@@ -811,7 +826,8 @@ mod tests {
         };
         let mut host = Fake::new(Vec::new());
         let mut app = AppState::new();
-        app.settings.applied.values.clipboard_override = Some(crate::settings::ClipboardMode::Both);
+        app.settings.applied.values.clipboard_override =
+            Some(crate::settings::ClipboardMode::Automatic);
         let epoch = app.system_clipboard_epoch();
 
         assert!(editor.submit(Action::New));
@@ -820,7 +836,6 @@ mod tests {
         assert!(editor.submit(Action::Command(Command::SelectAll)));
         assert!(editor.submit(Action::Clipboard {
             cut: false,
-            internal: true,
             system: epoch
         }));
         let old_screen = ack(&editor);
@@ -838,7 +853,6 @@ mod tests {
         assert!(editor.submit(Action::Command(Command::SelectAll)));
         assert!(editor.submit(Action::Clipboard {
             cut: false,
-            internal: true,
             system: epoch
         }));
         let new_screen = ack(&editor);
@@ -857,7 +871,8 @@ mod tests {
     fn clipboard_feedback_survives_newer_layout_ack() {
         let mut host = Fake::new(Vec::new());
         let mut app = AppState::new();
-        app.settings.applied.values.clipboard_override = Some(crate::settings::ClipboardMode::Both);
+        app.settings.applied.values.clipboard_override =
+            Some(crate::settings::ClipboardMode::Automatic);
         let mut copied = app.screen.clone();
         copied.message = crate::editor::COPIED_INTERNALLY.into();
         copied.acknowledged = 12;
@@ -866,7 +881,6 @@ mod tests {
         let transfer = ClipboardTransfer {
             epoch: app.system_clipboard_epoch().unwrap(),
             cut: false,
-            internal: true,
             sequence: 11,
             frame: b"test frame".to_vec(),
             generation: 0,
@@ -877,14 +891,14 @@ mod tests {
             ClipboardWrite::Sent
         );
         assert_eq!(host.clipboard_frames, [b"test frame".to_vec()]);
-        assert_eq!(app.status.text(), "System copy sent | unconfirmed");
+        assert_eq!(app.status.text(), "Terminal copy sent | unconfirmed");
         let mut resized = app.screen.clone();
         resized.acknowledged += 1;
         app.update(resized.clone(), false);
-        assert_eq!(app.status.text(), "System copy sent | unconfirmed");
+        assert_eq!(app.status.text(), "Terminal copy sent | unconfirmed");
         resized.clipboard_sequence = Some(12);
         app.update(resized, false);
-        app.report_clipboard(11, "System copy sent | unconfirmed");
+        app.report_clipboard(11, "Terminal copy sent | unconfirmed");
         assert_eq!(app.status.text(), crate::editor::COPIED_INTERNALLY);
     }
 
@@ -897,12 +911,12 @@ mod tests {
         copied.message = crate::editor::COPIED_INTERNALLY.into();
         copied.clipboard_sequence = Some(0);
         app.update(copied.clone(), false);
-        app.settings.applied.values.clipboard_override = Some(crate::settings::ClipboardMode::Both);
+        app.settings.applied.values.clipboard_override =
+            Some(crate::settings::ClipboardMode::Automatic);
         let epoch = app.system_clipboard_epoch().unwrap();
         let transfer = ClipboardTransfer {
             epoch,
             cut: false,
-            internal: true,
             sequence: 0,
             frame: b"pending".to_vec(),
             generation: 0,
@@ -911,7 +925,8 @@ mod tests {
         app.settings.applied.values.clipboard_override =
             Some(crate::settings::ClipboardMode::Internal);
         app.revoke_clipboard();
-        app.settings.applied.values.clipboard_override = Some(crate::settings::ClipboardMode::Both);
+        app.settings.applied.values.clipboard_override =
+            Some(crate::settings::ClipboardMode::Automatic);
         assert_eq!(
             deliver_clipboard(&mut host, &mut app, transfer),
             ClipboardWrite::Unavailable
@@ -924,7 +939,6 @@ mod tests {
         let transfer = ClipboardTransfer {
             epoch: app.system_clipboard_epoch().unwrap(),
             cut: false,
-            internal: true,
             sequence: 0,
             frame: b"new".to_vec(),
             generation: 0,
@@ -951,7 +965,6 @@ mod tests {
         let transfer = ClipboardTransfer {
             epoch: app.system_clipboard_epoch().unwrap(),
             cut: false,
-            internal: true,
             sequence: 0,
             frame: b"still delivered".to_vec(),
             generation: 0,

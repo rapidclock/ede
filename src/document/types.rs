@@ -97,6 +97,7 @@ pub struct Cancellation {
     closed: Option<Arc<AtomicBool>>,
     stopping: Option<Arc<AtomicBool>>,
     epoch: Option<(Arc<AtomicU64>, u64)>,
+    authority: Option<Arc<Self>>,
 }
 impl Cancellation {
     /// Request cancellation. After save publication this cannot undo the commit.
@@ -118,6 +119,10 @@ impl Cancellation {
                 .stopping
                 .as_ref()
                 .is_some_and(|flag| flag.load(Ordering::Acquire))
+            || self
+                .authority
+                .as_ref()
+                .is_some_and(|authority| authority.is_cancelled())
     }
     /// Link document close and runtime shutdown without maintaining job lists.
     pub(crate) fn linked(closed: Arc<AtomicBool>, stopping: Arc<AtomicBool>) -> Self {
@@ -126,6 +131,12 @@ impl Cancellation {
             stopping: Some(stopping),
             ..Self::default()
         }
+    }
+
+    /// Preserve local shutdown and cancellation while enforcing the caller's commit authority.
+    pub(crate) fn with_authority(mut self, authority: Self) -> Self {
+        self.authority = Some(Arc::new(authority));
+        self
     }
     /// Share explicit cancellation while rejecting a superseded background view generation.
     pub(crate) fn for_epoch(&self, epoch: Arc<AtomicU64>, expected: u64) -> Self {

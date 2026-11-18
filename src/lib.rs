@@ -1,6 +1,13 @@
 //! Interactive paged text editor. Application state is independent of terminal ownership.
 
 mod app;
+mod clipboard;
+#[cfg(target_os = "macos")]
+#[doc(hidden)]
+pub use clipboard::macos_worker;
+#[cfg(target_os = "linux")]
+#[doc(hidden)]
+pub use clipboard::x11_worker;
 #[doc(hidden)]
 pub use syntax::serve as syntax_worker;
 mod command;
@@ -223,6 +230,11 @@ fn run_validated(
 ) -> Result<Exit, Failure> {
     let launch_directory = std::env::current_dir()?;
     let recovery = recovery::Store::open(recovery::Options::environment()?)?;
+    let desktop_clipboard = if safe {
+        None
+    } else {
+        clipboard::discover(executable.as_deref())
+    };
     // Keep signal subscriptions alive through explicit restoration and the Drop retry.
     let signals = Signals::register()?;
     let mut session = TerminalSession::new(terminal);
@@ -237,6 +249,7 @@ fn run_validated(
                 documents: startup,
                 recovery,
                 syntax_program: executable,
+                desktop_clipboard,
                 config: settings::Location::discover(safe),
             },
         )

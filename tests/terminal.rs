@@ -26,6 +26,190 @@ use nix::{
 /// Bounded timeouts turn a broken terminal loop into a useful test failure, not a hanging CI job.
 const TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Outside clicks consume the gesture and the direct Settings control works at 40×8.
+#[test]
+fn actions_outside_click_and_direct_settings_at_minimum_size() {
+    let root = tempfile::tempdir().unwrap();
+    let mut process = PtyChild::editor_with_options(
+        Some("xterm-256color"),
+        std::iter::empty::<&str>(),
+        None,
+        Some(root.path()),
+        None,
+    );
+    process.resize(40, 8);
+    process.expect("[Settings]");
+    process.send(b"\x1bOQ");
+    process.expect("Actions (wheel/arrows)");
+    process.send(b"\x1b[<0;3;2M\x1b[<0;3;2m"); // Top-left popup border.
+    process.send(b"\x1b[<0;39;1M\x1b[<32;10;3M\x1b[<0;39;1m");
+    process.send(b"\x1b[<0;10;3M\x1b[<32;39;1M\x1b[<0;10;3m");
+    process.expect("Actions (wheel/arrows)");
+    process.send(b"\x1b[<0;39;1M\x1b[<0;39;1m");
+    process.expect_absent("Actions (wheel/arrows)");
+    process.send(b"\x1bOQ");
+    process.expect("Actions (wheel/arrows)");
+    process.send(b"\x1b[<0;17;1M\x1b[<0;17;1m");
+    process.expect_absent("Actions (wheel/arrows)");
+    process.expect_absent("Checkpoint interval");
+    process.click_label("[Settings]", 1);
+    process.expect("Checkpoint interval");
+    process.send(b"\x1b");
+    process.expect_absent("Checkpoint interval");
+    process.send(b"\x1b[15~");
+    process.expect("Checkpoint interval");
+    process.send(b"\x1b");
+    process.expect_absent("Checkpoint interval");
+    process.send(b"\x11");
+    assert!(process.wait().success());
+}
+
+/// Save commits a still-focused inline scalar in a single gesture.
+#[test]
+fn settings_footer_saves_pending_value() {
+    let root = tempfile::tempdir().unwrap();
+    let mut process = PtyChild::editor_with_options(
+        Some("xterm-256color"),
+        std::iter::empty::<&str>(),
+        None,
+        Some(root.path()),
+        None,
+    );
+    process.resize(40, 8);
+    process.expect("New Scratch");
+    process.send(b"\x1b[15~");
+    process.expect("Checkpoint interval");
+    process.send(b"\r\x7f7");
+    process.click_label("[Save]", 1);
+    process.expect_status("Settings saved");
+    let config = std::fs::read_to_string(root.path().join("ede/config.toml")).unwrap();
+    assert!(
+        config.contains("checkpoint_interval_seconds = 7"),
+        "{config}"
+    );
+    process.send(b"\r\x7fx");
+    process.click_label("[Save]", 1);
+    process.expect("Enter a whole number from 1 to 3600");
+    process.click_label("[Exit]", 1);
+    process.expect(">Keep Editing<");
+    process.click_label("Save and Exit", 1);
+    process.expect("Enter a whole number from 1 to 3600");
+    process.resize(20, 4);
+    process.expect("Resize to 40x8");
+    process.send(b"\x1b");
+    process.resize(40, 8);
+    process.expect("Checkpoint interval (s) x");
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("ede/config.toml")).unwrap(),
+        config
+    );
+    process.send(b"\x1b");
+    process.expect("Checkpoint interval (s) 7");
+    process.send(b"\x1b");
+    process.expect_absent("Checkpoint interval");
+    process.click_label("[Quit]", 1);
+    assert!(process.wait().success());
+}
+
+/// The first close control targets the inactive tab and leaves the active view in place.
+#[test]
+fn tab_strip_closes_inactive_tab_by_id() {
+    let root = tempfile::tempdir().unwrap();
+    let one = root.path().join("one.txt");
+    let two = root.path().join("two.txt");
+    std::fs::write(&one, "first document").unwrap();
+    std::fs::write(&two, "second document").unwrap();
+    let mut process = PtyChild::editor_with_options(
+        Some("xterm-256color"),
+        [&one, &two],
+        None,
+        Some(root.path()),
+        None,
+    );
+    process.expect("one.txt ×");
+    process.expect("│");
+    process.expect_body("first document", TIMEOUT);
+    process.expect_status("Ready");
+    process.expect_absent("Use defaults for this session");
+    process.send(b"edited ");
+    process.expect_body("edited first document", TIMEOUT);
+    process.click_label("two.txt", 1);
+    process.expect_body("second document", TIMEOUT);
+    process.send(b"\x1b[C\x1b[C");
+    process.expect_status("Col 3");
+    let strip = process.parser.screen().rows(0, 80).next().unwrap();
+    let first_close = strip.find('×').unwrap();
+    let column = unicode_width::UnicodeWidthStr::width(&strip[..first_close]) + 1;
+    process.send(b"\x1bOQ");
+    process.expect("Actions (wheel/arrows)");
+    process.send(format!("\x1b[<0;{column};1M\x1b[<0;{column};1m").as_bytes());
+    process.expect_absent("Actions (wheel/arrows)");
+    process.expect("one.txt");
+    process.expect_status("Col 3");
+    process.click_label("×", 1);
+    process.expect("Close —");
+    process.expect("one.txt");
+    process.send(b"\r");
+    process.expect_absent("Save your changes before continuing?");
+    process.expect_body("second document", TIMEOUT);
+    process.expect_status("Col 3");
+    assert_eq!(std::fs::read(&one).unwrap(), b"first document");
+    process.click_label("×", 1);
+    process.expect("Close —");
+    process.send(b"\t\r");
+    process.expect_absent("one.txt");
+    process.expect_absent("│");
+    process.expect_body("second document", TIMEOUT);
+    process.expect_status("Col 3");
+    assert_eq!(std::fs::read(&one).unwrap(), b"edited first document");
+    process.send(b"\x11");
+    assert!(process.wait().success());
+}
+
+/// Inactive scratch Save As names the parked tab and leaves the active view at its old caret.
+#[test]
+fn inactive_scratch_close_names_save_as_target() {
+    let root = tempfile::tempdir().unwrap();
+    let other = root.path().join("other.txt");
+    let destination = root.path().join("saved.txt");
+    std::fs::write(&other, "active body").unwrap();
+    let mut process = PtyChild::editor_with_options(
+        Some("xterm-256color"),
+        [&other],
+        None,
+        Some(root.path()),
+        None,
+    );
+    process.expect_status("Ready");
+    process.send(b"\x0e");
+    process.expect_active_tab("~Untitled 1");
+    process.send(b"parked content");
+    process.expect_body("parked content", TIMEOUT);
+    process.send(b"\x1b[18~");
+    process.expect_body("active body", TIMEOUT);
+    process.send(b"\x1b[C");
+    process.expect_status("Col 2");
+    // The first × belongs to the active file. The second belongs to the parked scratch.
+    let strip = process.parser.screen().rows(0, 80).next().unwrap();
+    let offset = strip.match_indices('×').nth(1).unwrap().0;
+    let column = unicode_width::UnicodeWidthStr::width(&strip[..offset]) + 1;
+    process.send(format!("\x1b[<0;{column};1M\x1b[<0;{column};1m").as_bytes());
+    process.expect("Close — Untitled 1");
+    process.send(b"\t\r");
+    process.expect("Save As (new path)");
+    process.resize(40, 8);
+    process.expect("Save Untitled 1");
+    process.send(destination.as_os_str().as_encoded_bytes());
+    process.send(b"\r");
+    process.expect_absent("Save As (new path)");
+    process.expect_body("active body", TIMEOUT);
+    process.expect_status("Col 2");
+    assert_eq!(std::fs::read(destination).unwrap(), b"parked content");
+    assert_eq!(std::fs::read(other).unwrap(), b"active body");
+    process.send(b"\x11");
+    assert!(process.wait().success());
+}
+
 /// Markdown reaches the real terminal as colored, editable source and honors Plain Text.
 #[test]
 fn markdown_source_renders_syntax_colors() {
@@ -1325,12 +1509,10 @@ fn settings_keyboard_save_round_trips_at_minimum_size() {
     process.send(b"\x1b[20~");
     process.expect("Checkpoint interval (s) 5");
     process.send(b"\r");
-    process.expect("[Accept]");
+    process.expect("Range 1–3600");
     process.send(b"\x7f2\r");
     process.expect("Checkpoint interval (s) 2");
     process.send(b"\t\r");
-    process.expect("Save Settings");
-    process.send(b"\r");
     process.expect_status("Settings saved");
     process.send(b"\x1b");
     process.expect_absent("Checkpoint interval");
@@ -1346,9 +1528,7 @@ fn settings_keyboard_save_round_trips_at_minimum_size() {
     restarted.expect_status("User config");
     restarted.send(b"\x1b[20~");
     restarted.expect("Checkpoint interval (s) 2");
-    restarted.send(b"\t\r");
-    restarted.expect(">Save Settings<");
-    restarted.send(b"\t\t\r");
+    restarted.click_label("Restore Defaults", 1);
     restarted.expect("Checkpoint interval (s) 5");
     assert!(
         std::fs::read_to_string(&config)
@@ -1356,8 +1536,6 @@ fn settings_keyboard_save_round_trips_at_minimum_size() {
             .contains("checkpoint_interval_seconds = 2")
     );
     restarted.send(b"\t\r");
-    restarted.expect(">Save Settings<");
-    restarted.send(b"\r");
     restarted.expect_status("Settings saved");
     restarted.send(b"\x1b");
     restarted.expect_absent("Checkpoint interval");
@@ -1390,29 +1568,28 @@ fn settings_capture_and_dirty_confirmation_at_minimum_size() {
     process.resize(40, 8);
     process.send(b"\x1b[20~");
     process.expect("Checkpoint interval (s)");
-    process.send(&b"\x1b[B".repeat(5));
-    process.expect("controls.activate");
-    process.send(b"\x1b[<0;5;6M\x1b[<0;5;6m"); // Edit.
-    process.expect("Default 1/1 Enter");
-    process.send(b"\t\t\t\r");
-    process.expect("Type the replacement chord");
-    process.send(b"\x1b[<0;5;6M\x1b[<0;5;6m"); // Capture.
+    process.send(&b"\x1b[B".repeat(4));
+    process.click_label("controls.activate", 1);
+    process.expect("1/1 Enter (default)");
+    process.click_label("[Replace]", 1);
+    process.expect("Type the replacement shortcut");
+    process.click_label("[Capture]", 1);
     process.expect("Press a shortcut to preview");
     process.send(b"\r\r\r");
-    process.expect("Captured Enter");
+    process.expect("Captured shortcut");
     process.expect(">Discard<");
     process.send(b"\x1b");
-    process.expect("Type the replacement chord");
-    process.send(b"\x1b[<0;5;6M\x1b[<0;5;6m");
+    process.expect("Type the replacement shortcut");
+    process.click_label("[Capture]", 1);
     process.expect("Press a shortcut to preview");
     process.resize(20, 4);
     process.expect("Escape exit capture");
     process.send(b"\x1b");
     process.expect_absent("exit capture");
     process.resize(40, 8);
-    process.expect("Type the replacement chord");
-    process.send(b"\x1b[200~F10\x1b[201~\r");
-    process.expect("Override 1/1 F10");
+    process.expect("Type the replacement shortcut");
+    process.send(b"\x7f\x7f\x7f\x7f\x7f\x1b[200~F10\x1b[201~\r");
+    process.expect("1/1 F10 (override)");
     process.send(b"\x1b");
     process.expect("controls.activate");
     process.send(b"\x1b");
@@ -1426,7 +1603,7 @@ fn settings_capture_and_dirty_confirmation_at_minimum_size() {
     process.expect("controls.activate");
     process.send(b"\x1b");
     process.expect(">Keep Editing<");
-    process.send(b"\t\r");
+    process.send(b"\t\t\r");
     process.expect_absent("Keep Editing");
     assert_eq!(std::fs::read_to_string(config).unwrap(), original);
     process.send(b"\x11");
@@ -1803,11 +1980,11 @@ fn independent_instances_restore_overflow_and_open_after_freeing_a_slot() {
     c.send(b"\x17");
     c.expect("Unsaved changes");
     c.send(b"\t\t\r");
-    c.expect_active_tab("[~Untitled 34]");
+    c.expect_active_tab("~Untitled 34");
     c.send(&recovery_menu);
     c.expect("Scratch 65");
     c.send(b"\r");
-    c.expect_active_tab("[~Untitled 65]");
+    c.expect_active_tab("~Untitled 65");
     c.send(b"\x11");
     assert!(c.wait().success());
     c.assert_restored();
@@ -1856,7 +2033,7 @@ fn cancel_quit_preserves_tabs_after_earlier_discard_choice() {
     process.send(b"first-unsaved");
     process.expect_body("first-unsaved", TIMEOUT);
     process.send(b"\x1b[19~");
-    process.expect_active_tab("[second.txt]");
+    process.expect_active_tab("second.txt");
     process.send(b"second-unsaved");
     process.expect_body("second-unsaved", TIMEOUT);
     process.send(b"\x11");
@@ -1953,7 +2130,7 @@ fn fresh_launch_waits_for_explicit_new_scratch() {
     process.expect("Open missing-startup:");
     process.send(b"\r");
     process.expect_body("retained welcome scratch", TIMEOUT);
-    process.expect_active_tab("[~Untitled 1]");
+    process.expect_active_tab("~Untitled 1");
     process.expect_absent("Untitled 2");
     process.send(b"\x11");
     assert!(process.wait().success());
@@ -1982,7 +2159,7 @@ fn enabled_system_copy_sends_terminal_clipboard_request() {
     process.expect_status("Ready");
     process.send(b"\x01\x03");
     process.expect_raw("\x1b]52;c;55WMCno=\x1b\\");
-    process.expect_status("System copy sent | unconfirmed");
+    process.expect_status("Terminal copy sent | unconfirmed");
     process.send(b"\x11");
     assert!(process.wait().success());
     process.assert_restored();
@@ -2036,7 +2213,7 @@ fn maximum_clipboard_frame_survives_a_paced_terminal_reader() {
     process.output.extend_from_slice(&prefix);
     let payload = base64::engine::general_purpose::STANDARD.encode(&bytes);
     process.expect_raw(&format!("\x1b]52;c;{payload}\x1b\\"));
-    process.expect_status("System copy sent | unconfirmed");
+    process.expect_status("Terminal copy sent | unconfirmed");
     process.send(b"\x16\x13");
     process.expect_status("Saved");
     assert_eq!(std::fs::read(file).unwrap(), bytes);
@@ -2134,9 +2311,9 @@ fn oversized_system_copy_is_internal_and_round_trips() {
     process.assert_restored();
 }
 
-/// System-only Copy rejects oversized text without sending an OSC 52 frame.
+/// Legacy System opts into automatic routing and keeps oversized terminal copies.
 #[test]
-fn oversized_system_only_copy_reports_failure() {
+fn oversized_legacy_system_copy_is_retained() {
     let directory = tempfile::tempdir().unwrap();
     let config = directory.path().join("ede");
     std::fs::create_dir(&config).unwrap();
@@ -2146,7 +2323,8 @@ fn oversized_system_only_copy_reports_failure() {
     )
     .unwrap();
     let file = directory.path().join("clip.txt");
-    std::fs::write(&file, "x".repeat(8193)).unwrap();
+    let text = "x".repeat(8193);
+    std::fs::write(&file, &text).unwrap();
     let mut process = PtyChild::editor_with_options(
         Some("xterm-256color"),
         [&file],
@@ -2156,8 +2334,11 @@ fn oversized_system_only_copy_reports_failure() {
     );
     process.expect_status("Ready");
     process.send(b"\x01\x03");
-    process.expect_status("Copy failed | system limit 8 KiB");
+    process.expect_status("Copied internally | system limit 8 KiB");
     assert!(!process.output.windows(5).any(|bytes| bytes == b"\x1b]52;"));
+    process.send(b"\x1b[1;5F\x16\x13");
+    process.expect_status("Saved");
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), text.repeat(2));
     process.send(b"\x11");
     assert!(process.wait().success());
     process.assert_restored();
@@ -2191,106 +2372,84 @@ fn system_clipboard_uses_the_separate_tty_during_a_pipe() {
     process.assert_restored();
 }
 
-/// Apply clipboard modes through saved Settings while keeping safe mode internal.
+/// Legacy opt-out survives an unrelated save and can be removed by Restore Defaults.
 #[test]
-fn system_clipboard_settings_saves_and_safe_config_uses_internal_copy() {
+fn clipboard_opt_out_survives_save_and_restore_defaults_removes_it() {
     let directory = tempfile::tempdir().unwrap();
     let config = directory.path().join("ede");
     std::fs::create_dir(&config).unwrap();
     let config_file = config.join("config.toml");
-    std::fs::write(&config_file, "[keybindings.global]\nsettings = ['F9']\n").unwrap();
+    std::fs::write(
+        &config_file,
+        "[clipboard]\ncopy_to_system = false # private\n",
+    )
+    .unwrap();
     let source = directory.path().join("source.txt");
-    std::fs::write(&source, b"abc").unwrap();
-    let mut process = PtyChild::editor_with_options(
-        Some("xterm-256color"),
-        [&source],
-        None,
-        Some(directory.path()),
-        None,
-    );
+    let other = directory.path().join("other.txt");
+    std::fs::write(&source, "abc").unwrap();
+    std::fs::write(&other, "outside").unwrap();
+    let launch = |safe| {
+        let mut args = vec![source.as_os_str(), other.as_os_str()];
+        if safe {
+            args.insert(0, std::ffi::OsStr::new("--safe-config"));
+        }
+        PtyChild::editor_with_options(
+            Some("xterm-256color"),
+            args,
+            None,
+            Some(directory.path()),
+            None,
+        )
+    };
+    let mut process = launch(false);
     process.expect_status("Ready");
-    process.send(b"\x01\x03");
-    process.expect_raw("\x1b]52;c;YWJj\x1b\\");
-    process.expect_status("System copy sent | unconfirmed");
-    process.send(b"\x1b[C\x16");
-    process.expect_body("abcabc", TIMEOUT);
-    process.send(b"\x1a");
-    process.expect_absent("abcabc");
-    process.send(b"\x1b[20~");
-    process.expect("Checkpoint interval (s)");
-    process.send(&b"\x1b[B".repeat(4));
-    process.expect("Clipboard [Both]");
-    process.send(b"\r");
-    process.expect("Clipboard [Internal]");
-    process.send(b"\r");
-    process.expect("Clipboard [System]");
-    assert!(
-        !std::fs::read_to_string(&config_file)
-            .unwrap()
-            .contains("[clipboard]")
-    );
-    process.send(b"\t\r");
-    process.expect("Save Settings");
-    process.send(b"\r");
+    process.send(b"\x1b[15~");
+    process.expect("Checkpoint interval");
+    process.send(b"\r\x7f2\t\r");
     process.expect_status("Settings saved");
     assert!(
         std::fs::read_to_string(&config_file)
             .unwrap()
-            .contains("mode = \"system\"")
+            .contains("copy_to_system = false # private")
     );
     process.send(b"\x1b");
-    process.expect_absent("Clipboard [System]");
-    process.send(b"\x1b[Csystem");
-    process.expect_body("abcsystem", TIMEOUT);
-    process.send(b"\x01\x03");
-    process.expect_raw("\x1b]52;c;YWJjc3lzdGVt\x1b\\");
-    process.expect_status("System copy sent | unconfirmed");
-    process.output.clear();
-    process.send(b"\x18");
-    process.expect_status("Cut needs Internal or Both");
-    process.expect_body("abcsystem", TIMEOUT);
-    assert!(!process.output.windows(5).any(|bytes| bytes == b"\x1b]52;"));
-    process.send(b"\x16");
-    process.expect_status("Use the terminal Paste command");
-    process.send(b"\x1b[C\x1b[200~from Mac\x1b[201~");
-    process.expect_body("abcsystemfrom Mac", TIMEOUT);
-    process.send(b"\x1a");
-    process.expect_absent("abcsystemfrom Mac");
-    process.send(b"\x1b[20~");
-    process.expect("Checkpoint interval (s)");
-    process.send(&b"\x1b[B".repeat(4));
-    process.expect("Clipboard [System]");
-    process.send(b"\r\r");
-    process.expect("Clipboard [Internal]");
-    process.send(b"\t\r");
-    process.expect("Save Settings");
-    process.send(b"\r");
+    process.expect_absent("Checkpoint interval");
+
+    let check_private = |process: &mut PtyChild| {
+        process.reset_output();
+        process.send(b"\x01\x18");
+        process.expect_status("Cut internally");
+        process.send(b"\x1a\x1b[19~");
+        process.expect_body("outside", TIMEOUT);
+        process.send(b"\x01\x16");
+        process.expect_body("abc", TIMEOUT);
+        process.send(b"\x1a");
+        process.expect_body("outside", TIMEOUT);
+        assert!(!process.output.windows(5).any(|bytes| bytes == b"\x1b]52;"));
+        process.send(b"\x1b[18~");
+        process.expect_body("abc", TIMEOUT);
+    };
+    check_private(&mut process);
+
+    process.send(b"\x1b[15~");
+    process.click_label("Restore Defaults", 1);
+    process.click_label("[Save]", 1);
     process.expect_status("Settings saved");
-    process.expect("Clipboard [Internal]");
-    process.send(b"\x1b");
-    process.expect_absent("Clipboard [Internal]");
-    process.send(b"\x01\x16");
-    process.expect_absent("abcsystem");
-    process.expect_body("abc", TIMEOUT);
-    process.output.clear();
-    process.send(b"\x01\x03");
-    process.expect_status("Copied internally");
-    assert!(!process.output.windows(5).any(|bytes| bytes == b"\x1b]52;"));
-    process.send(b"\x11");
-    process.expect("Save your changes before continuing?");
-    process.send(b"\x1b[Z\r");
-    assert!(process.wait().success());
-    let mut safe = PtyChild::editor_with_options(
-        Some("xterm-256color"),
-        [std::ffi::OsStr::new("--safe-config"), source.as_os_str()],
-        None,
-        Some(directory.path()),
-        None,
+    assert!(
+        !std::fs::read_to_string(&config_file)
+            .unwrap()
+            .contains("copy_to_system")
     );
+    process.send(b"\x1b");
+    process.expect_absent("Checkpoint interval");
+    process.send(b"\x01\x03");
+    process.expect_raw("\x1b]52;c;YWJj\x1b\\");
+    process.send(b"\x11");
+    assert!(process.wait().success());
+
+    let mut safe = launch(true);
     safe.expect_status("Ready");
-    safe.send(b"\x01\x03");
-    safe.expect_status("Copied internally");
-    assert!(!safe.output.windows(5).any(|bytes| bytes == b"\x1b]52;"));
+    check_private(&mut safe);
     safe.send(b"\x11");
     assert!(safe.wait().success());
 }
@@ -2395,18 +2554,19 @@ fn mouse_tabs_overflow_and_stale_release() {
     process.expect_status("Ready");
     process.send(b"\x1b[<0;14;1M\x1b[19~"); // Press the next tab, then switch via F8.
     process.expect_body("body-1", TIMEOUT);
-    process.send(b"\x1b[<0;14;1m\x1b[<0;52;1M\x1b[<0;52;1m");
+    process.send(b"\x1b[<0;14;1m");
+    process.click_label("[Tabs]", 1);
     process.expect("Tabs — Enter to switch");
     process.expect("tab-6");
-    process.send(b"\x1b[<0;7;9M\x1b[<0;7;9m"); // Highlight tab 5.
-    process.send(b"\x1b[<0;27;21M\x1b[<0;27;21m");
+    process.click_label("tab-5", 1);
+    process.click_label("[Switch]", 1);
     process.expect_body("body-5", TIMEOUT);
     process.send(b"\x1b[18~\x1b[18~\x1b[18~\x1b[18~");
     process.expect_body("body-1", TIMEOUT);
-    process.send(b"\x1b[<0;52;1M\x1b[<0;52;1m");
+    process.click_label("[Tabs]", 1);
     process.expect("Tabs — Enter to switch");
-    process.send(b"\x1b[<0;7;10M\x1b[<0;7;10m"); // Highlight tab 6.
-    process.send(b"\x1b[<0;7;21M\x1b[<0;7;21m"); // Close the highlighted inactive tab.
+    process.click_label("tab-6", 1);
+    process.click_label("[Close]", 1);
     process.expect_absent("Tabs — Enter to switch");
     process.resize(40, 8);
     process.expect("Tabs");
@@ -2793,10 +2953,10 @@ fn large_file_interactive_benchmark() {
     process.expect_with_timeout("Ready", Duration::from_secs(120));
     let ready = started.elapsed();
     process.send(b"\x1b[19~");
-    process.expect_active_tab("[companion.txt]");
+    process.expect_active_tab("companion.txt");
     process.expect_body("Companion tab", TIMEOUT);
     process.send(b"\x1b[18~");
-    process.expect_active_tab("[allocated.txt]");
+    process.expect_active_tab("allocated.txt");
     process.expect_body(first, TIMEOUT);
     let pid = process.editor_pid();
     let rss = || {
@@ -3123,8 +3283,9 @@ fn text_mouse_drag_copy_paste_round_trip() {
         process.drain();
         assert!(
             Instant::now() < deadline,
-            "{}",
-            process.parser.screen().contents()
+            "saved {:?}, transcript {}",
+            std::fs::read_to_string(&path).unwrap(),
+            String::from_utf8_lossy(&process.output)
         );
         thread::sleep(Duration::from_millis(5));
     }

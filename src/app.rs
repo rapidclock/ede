@@ -1,10 +1,11 @@
 //! Terminal-independent interaction state, modal routing, and named runtime intents.
 use crate::{
+    clipboard::{Access, Backend},
     command::{Command, Movement},
     document::{Cancellation, JobId},
     editor::{
-        Action, After, COPIED_INTERNALLY, CUT_INTERNALLY, Event, PointerGesture,
-        SYSTEM_COPY_FAILED, SYSTEM_COPY_PENDING, SaveResult, Screen, TabId,
+        Action, After, COPIED_INTERNALLY, CUT_INTERNALLY, Event, PointerGesture, SaveResult,
+        Screen, TabId,
     },
     input::Input,
     picker::{self, Browse},
@@ -19,7 +20,7 @@ use crossterm::event::{
 use std::{
     collections::VecDeque,
     path::PathBuf,
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 mod dialogs;
@@ -125,6 +126,11 @@ pub(crate) struct AppState {
     pub(crate) settings_ui: Option<Box<settings_ui::Draft>>,
     pub(crate) settings_generation: u64,
     clipboard_epoch: u64,
+    pub(crate) desktop_clipboard: Option<Arc<Backend>>,
+    native_copy: Cancellation,
+    native_target: Cancellation,
+    native_active: Arc<Mutex<usize>>,
+    suspend_pending: bool,
     clipboard_feedback: Option<ClipboardFeedback>,
     pub(crate) settings_save_state: Option<settings::SaveState>,
     pub(crate) settings_saved: bool,
@@ -217,6 +223,11 @@ impl AppState {
             settings_ui: None,
             settings_generation: 0,
             clipboard_epoch: 0,
+            desktop_clipboard: None,
+            native_copy: Cancellation::default(),
+            native_target: Cancellation::default(),
+            native_active: Arc::default(),
+            suspend_pending: false,
             clipboard_feedback: None,
             settings_save_state: None,
             settings_saved: false,
@@ -714,6 +725,14 @@ impl AppState {
             .map_or("Untitled", |t| &t.label)
     }
 
+    /// Keep a guarded Save As dialog tied to its original tab even when parked.
+    pub(crate) fn guarded_save_label(&self) -> Option<&str> {
+        self.guarded_path
+            .and_then(After::target)
+            .or(self.path_tab.filter(|tab| Some(*tab) != self.screen.tab))
+            .map(|tab| self.tab_label(Some(tab)))
+    }
+
     /// Provide enough native path context to distinguish matching basenames.
     pub fn tab_path_hint(&self, tab: Option<TabId>) -> Option<&str> {
         self.screen
@@ -732,6 +751,18 @@ impl AppState {
     }
     /// Route one input to the owning modal, control, or text surface.
     pub fn input(&mut self, input: Input, layout: &LayoutSnapshot) -> Option<Intent> {
+        let focused = self.editor_focused();
+        if matches!(input, Input::FocusLost) {
+            self.revoke_clipboard_target();
+        }
+        let intent = self.input_inner(input, layout);
+        if focused && !self.editor_focused() {
+            self.revoke_clipboard_target();
+        }
+        intent
+    }
+
+    fn input_inner(&mut self, input: Input, layout: &LayoutSnapshot) -> Option<Intent> {
         if !matches!(input, Input::Pointer(_))
             && let Some(Modal::Open(picker)) = &mut self.modal
         {
@@ -949,22 +980,68 @@ impl AppState {
 
     /// Capture or validate the current destination at the terminal's dispatch boundary.
     pub(crate) fn system_clipboard_epoch(&self) -> Option<u64> {
-        (self.clipboard_mode() != ClipboardMode::Internal).then_some(self.clipboard_epoch)
+        (!self.suspend_pending && self.clipboard_mode() != ClipboardMode::Internal)
+            .then_some(self.clipboard_epoch)
     }
 
     /// A disabled or suspended session cannot publish any previously queued write.
     pub(crate) fn revoke_clipboard(&mut self) {
         self.clipboard_epoch = self.clipboard_epoch.wrapping_add(1);
+        self.revoke_native_clipboard();
+    }
+
+    fn revoke_native_clipboard(&mut self) {
+        self.native_copy.cancel();
+        self.native_copy = Cancellation::default();
+        self.revoke_clipboard_target();
+    }
+
+    /// Navigation or focus changes revoke any delayed native document change.
+    pub(crate) fn revoke_clipboard_target(&mut self) {
+        self.native_target.cancel();
+        self.native_target = Cancellation::default();
+    }
+
+    /// Stop admitting external work before leaving the process's running state.
+    pub(crate) fn request_suspend(&mut self) {
+        self.suspend_pending = true;
+        self.revoke_clipboard();
+    }
+
+    /// Continue pumping the event loop until a revoked native helper has settled.
+    pub(crate) fn suspend_ready(&mut self) -> bool {
+        if self.suspend_pending
+            && *self
+                .native_active
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                == 0
+        {
+            self.suspend_pending = false;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn desktop_access(&self, edits: bool) -> Option<Access> {
+        self.system_clipboard_epoch()?;
+        Some(Access {
+            backend: self.desktop_clipboard.clone()?,
+            active: self.native_active.clone(),
+            cancel: if edits {
+                self.native_target.clone()
+            } else {
+                self.native_copy.clone()
+            },
+        })
     }
 
     /// Retain the delivery outcome when the coordinator republishes the same action.
     pub(crate) fn report_clipboard(&mut self, sequence: u64, message: &'static str) {
         let source = &self.screen.message;
         if Some(sequence) != self.screen.clipboard_sequence
-            || !matches!(
-                source.as_str(),
-                COPIED_INTERNALLY | CUT_INTERNALLY | SYSTEM_COPY_PENDING
-            )
+            || !matches!(source.as_str(), COPIED_INTERNALLY | CUT_INTERNALLY)
             || self.status.text() != source
         {
             return;
@@ -983,7 +1060,9 @@ impl AppState {
         let status = self.status.text();
         status.starts_with(COPIED_INTERNALLY)
             || status.starts_with(CUT_INTERNALLY)
-            || status.starts_with(SYSTEM_COPY_FAILED)
+            || status.starts_with("Desktop ")
+            || status.starts_with("No plain text on desktop clipboard")
+            || status.starts_with("Nothing copied in ede")
             || self
                 .clipboard_feedback
                 .as_ref()
@@ -1055,6 +1134,7 @@ impl AppState {
             command = Command::FocusPrevious;
         }
         if command == Command::Cancel {
+            self.revoke_native_clipboard();
             if self.guard_request.is_some() && (layout.area.width < 40 || layout.area.height < 8) {
                 return None;
             }
@@ -1477,14 +1557,7 @@ impl AppState {
             Command::PreviousTab | Command::NextTab => {
                 self.tab_change(Action::CycleTab(command == Command::PreviousTab))
             }
-            Command::CloseTab => {
-                if self.switching.is_some() {
-                    return None;
-                }
-                Some(Intent::Editor(Action::Guard(After::Close(
-                    self.screen.tab?,
-                ))))
-            }
+            Command::CloseTab => self.close_tab(self.screen.tab?),
             Command::TabDetails => {
                 self.modal = Some(Modal::TabDetails);
                 self.focus = Some(Control::DetailsClose);
@@ -1638,6 +1711,7 @@ impl AppState {
             {
                 match self.focus {
                     Some(Control::Tab(tab)) => self.tab_change(Action::Switch(tab)),
+                    Some(Control::TabClose(tab)) => self.close_tab(tab),
                     focus => focus
                         .and_then(Control::command)
                         .and_then(|command| self.command(command, layout)),
@@ -1651,24 +1725,55 @@ impl AppState {
             {
                 None
             }
-            Command::Paste if self.clipboard_mode() == ClipboardMode::System => {
-                self.message("Use the terminal Paste command");
-                None
+            Command::Paste => Some(Intent::Editor(self.desktop_access(true).map_or(
+                Action::Command(Command::Paste),
+                |access| Action::NativePaste {
+                    access,
+                    observed: self.screen.acknowledged,
+                },
+            ))),
+            Command::Copy | Command::Cut => {
+                self.revoke_native_clipboard();
+                let cut = command == Command::Cut;
+                Some(Intent::Editor(self.desktop_access(cut).map_or_else(
+                    || Action::Clipboard {
+                        cut,
+                        system: self.system_clipboard_epoch(),
+                    },
+                    |access| Action::NativeCopy { cut, access },
+                )))
             }
-            Command::Copy | Command::Cut => Some(Intent::Editor(Action::Clipboard {
-                cut: command == Command::Cut,
-                internal: self.clipboard_mode() != ClipboardMode::System,
-                system: self.system_clipboard_epoch(),
-            })),
             _ => Some(Intent::Editor(Action::Command(command))),
         }
     }
+
+    /// Guard the original target without switching away from the active document.
+    fn close_tab(&mut self, tab: TabId) -> Option<Intent> {
+        if self.switching.is_some() || !self.screen.tabs.iter().any(|entry| entry.id == tab) {
+            return None;
+        }
+        if self.focus == Some(Control::TabClose(tab)) {
+            self.focus = Some(Control::Content);
+        }
+        Some(Intent::Editor(Action::Guard(After::Close(tab))))
+    }
+
     /// Press captures the text/control surface; dragging cannot activate other controls.
     fn pointer(&mut self, mouse: MouseEvent, layout: &LayoutSnapshot) -> Option<Intent> {
         if !self.mouse_capture {
             return None;
         }
-        let hit = layout.hit(mouse.column, mouse.row);
+        let hit = match layout.hit(mouse.column, mouse.row) {
+            None if matches!(self.modal, Some(Modal::Menu(_)))
+                && layout
+                    .overlay
+                    .is_some_and(|area| !area.contains((mouse.column, mouse.row).into())) =>
+            {
+                Some(Control::MenuOutside)
+            }
+            Some(Control::TabDivider) => None,
+            hit => hit,
+        };
         if let Some(Modal::Open(picker)) = &mut self.modal {
             match (mouse.kind, hit) {
                 (MouseEventKind::Down(MouseButton::Left), Some(Control::PickerRow(row))) => {
@@ -1770,7 +1875,9 @@ impl AppState {
                     x: mouse.column,
                     y: mouse.row,
                 });
-                if let Some(control) = hit {
+                if let Some(control) = hit.filter(|control| {
+                    !matches!(control, Control::MenuOutside | Control::TabClose(_))
+                }) {
                     self.focus = Some(control);
                     self.dirty = true;
                 }
@@ -1789,10 +1896,15 @@ impl AppState {
                 }
             }
             MouseEventKind::Drag(MouseButton::Left) => {
-                if self
-                    .capture
-                    .is_some_and(|capture| matches!(capture.control, Control::PickerRow(_)))
-                {
+                if self.capture.is_some_and(|capture| {
+                    matches!(
+                        capture.control,
+                        Control::PickerRow(_)
+                            | Control::MenuItem(_)
+                            | Control::MenuOutside
+                            | Control::TabClose(_)
+                    )
+                }) {
                     self.capture = None;
                 }
                 if let Some(capture) = &mut self.capture
@@ -1833,6 +1945,9 @@ impl AppState {
                             );
                         }
                     } else if hit == Some(capture.control) {
+                        if capture.control == Control::MenuOutside {
+                            return self.command(Command::Cancel, layout);
+                        }
                         if let (Control::PickerRow(row), Some(Modal::Open(picker))) =
                             (capture.control, &mut self.modal)
                         {
@@ -1848,9 +1963,13 @@ impl AppState {
                         }
                         // Keyboard focus may have changed while the button was held.
                         // Activate the clicked control, not another focused button.
-                        self.focus = Some(capture.control);
+                        if !matches!(capture.control, Control::TabClose(_)) {
+                            self.focus = Some(capture.control);
+                        }
                         if let Control::SettingsButton(button) = capture.control {
                             self.settings_button(button, layout);
+                        } else if let Control::SettingsRow(row) = capture.control {
+                            self.settings_row(row, layout);
                         } else if let Control::MenuItem(clicked) = capture.control
                             && let Some(Modal::Menu(index)) = &mut self.modal
                         {
@@ -1859,6 +1978,10 @@ impl AppState {
                         } else if let Control::Tab(tab) = capture.control {
                             if self.guard_request.is_none() {
                                 return self.tab_change(Action::Switch(tab));
+                            }
+                        } else if let Control::TabClose(tab) = capture.control {
+                            if self.guard_request.is_none() {
+                                return self.close_tab(tab);
                             }
                         } else if let Some(command) = capture.control.command() {
                             return self.command(command, layout);
@@ -1897,7 +2020,7 @@ impl AppState {
             return None;
         }
         let view = self.screen.view.as_ref()?;
-        if view.generation != layout.generation
+        if view.generation != layout.document_generation
             || view.width != layout.area.width
             || view.height != layout.content_height()
         {
@@ -1917,7 +2040,7 @@ impl AppState {
         Some(Intent::Editor(Action::Hit {
             caret,
             extend,
-            generation: layout.generation,
+            generation: layout.document_generation,
             revision: view.revision,
             document: self.screen.document?,
             top: view.top,
@@ -1934,15 +2057,15 @@ impl AppState {
             && layout.area.height >= 8
         {
             self.field_submit = None;
+            if matches!(self.modal, Some(Modal::Settings)) {
+                self.finish_settings_field(layout);
+                return None;
+            }
             self.focus = self
                 .search_submit_field
                 .take()
                 .map(Control::Search)
-                .or(Some(if matches!(self.modal, Some(Modal::Settings)) {
-                    Control::SettingsField
-                } else {
-                    Control::PathField
-                }));
+                .or(Some(Control::PathField));
             return self.command(Command::Newline, layout);
         }
         if now.saturating_sub(self.last_drag) < Duration::from_millis(50) {
@@ -2091,6 +2214,34 @@ impl AppState {
 mod tests {
     use super::*;
     use ratatui::layout::Rect;
+
+    /// Job control waits for the revoked helper, and refuses new clipboard admission.
+    #[test]
+    fn suspension_waits_for_revoked_native_clipboard_helper() {
+        let mut app = AppState::new();
+        let active = app.native_active.clone();
+        let lifetime = app.native_copy.clone();
+        let (entered, started) = std::sync::mpsc::sync_channel(1);
+        let (finish, finished) = std::sync::mpsc::sync_channel(1);
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                *active.lock().unwrap() += 1;
+                entered.send(()).unwrap();
+                finished.recv().unwrap();
+                *active.lock().unwrap() -= 1;
+            });
+            started.recv().unwrap();
+            app.request_suspend();
+            let revoked = lifetime.is_cancelled();
+            let epoch = app.system_clipboard_epoch();
+            let ready_early = app.suspend_ready();
+            finish.send(()).unwrap();
+            assert!(revoked);
+            assert_eq!(epoch, None);
+            assert!(!ready_early);
+        });
+        assert!(app.suspend_ready());
+    }
 
     /// At the layout floor all options remain reachable and a row click applies to the original tab.
     #[test]

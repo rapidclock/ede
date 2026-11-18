@@ -468,13 +468,28 @@ impl StorageService {
     /// Try to enqueue work without filesystem I/O or waiting for queue capacity.
     /// Requests for an opening document wait for its preparation to settle.
     pub fn submit(&mut self, request_id: u64, request: Request) -> Result<Job, SubmissionError> {
-        match self.admit(request_id, request) {
+        self.submit_authorized(request_id, request, None)
+    }
+
+    /// Admit a request whose final storage commit also checks the initiating operation's token.
+    pub(crate) fn submit_authorized(
+        &mut self,
+        request_id: u64,
+        request: Request,
+        authority: Option<Cancellation>,
+    ) -> Result<Job, SubmissionError> {
+        match self.admit(request_id, request, authority) {
             Ok(job) => Ok(job),
             Err((error, request)) => Err(SubmissionError { error, request }),
         }
     }
     /// Reserve entry and payload capacity before sending an envelope to its owner.
-    fn admit(&mut self, request_id: u64, request: Request) -> Result<Job, (Error, Box<Request>)> {
+    fn admit(
+        &mut self,
+        request_id: u64,
+        request: Request,
+        authority: Option<Cancellation>,
+    ) -> Result<Job, (Error, Box<Request>)> {
         if self
             .entries
             .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
@@ -520,7 +535,10 @@ impl StorageService {
             Ok(id) => JobId(id),
             Err(error) => return Err((error, Box::new(request))),
         };
-        let cancel = Cancellation::linked(closed.clone(), self.stopping.clone());
+        let mut cancel = Cancellation::linked(closed.clone(), self.stopping.clone());
+        if let Some(authority) = authority {
+            cancel = cancel.with_authority(authority);
+        }
         let progress_permit = match self
             .resources
             .buffers
