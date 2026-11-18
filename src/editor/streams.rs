@@ -252,7 +252,6 @@ impl Coordinator {
             let active = self.tab.screen.tab == Some(id);
             if let Some(snapshot) = update.snapshot {
                 self.publish_extent(id, snapshot)?;
-                self.startup_fallback = false;
             }
             if let Some((generations, reason)) = update.boundary {
                 let status = self.state_mut(id).unwrap().screen.stream.as_mut().unwrap();

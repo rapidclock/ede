@@ -164,6 +164,9 @@ inserts the application clipboard as one undoable edit. An empty clipboard is a
 visible no-op. Keep clipboard contents on document replacement, clear on process
 exit, and apply private-file permissions and temporary-space admission.
 
+[Stage 10 clipboard modes](10_mvp_validation.md#clipboard-setting-and-client-paste) build on
+this policy. Internal and Both preserve the private clipboard behavior.
+
 External text enters through the terminal's Paste action/bracketed paste. Without
 bracketed paste, received characters behave as ordinary key input; do not promise
 safe recognition of a paste the terminal does not identify. Stage 03 must support

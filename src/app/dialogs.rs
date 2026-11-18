@@ -384,11 +384,6 @@ impl AppState {
                 self.focus = Some(Control::RecoveryList);
                 self.dirty = true;
             }
-            (Some(Modal::Open(picker)), Control::PickerRow(row)) => {
-                picker.highlight = row;
-                self.focus = Some(Control::PickerList);
-                self.dirty = true;
-            }
             (Some(Modal::Tabs(selected)), Control::TabListRow(tab)) => {
                 *selected = Some(tab);
                 self.focus = Some(Control::TabList);

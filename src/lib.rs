@@ -226,7 +226,7 @@ fn run_validated(
     // Keep signal subscriptions alive through explicit restoration and the Drop retry.
     let signals = Signals::register()?;
     let mut session = TerminalSession::new(terminal);
-    guarded(&mut session, |session| {
+    let result = guarded(&mut session, |session| {
         session.acquire()?;
         runtime::run(
             session,
@@ -240,7 +240,12 @@ fn run_validated(
                 config: settings::Location::discover(safe),
             },
         )
-    })
+    });
+    if session.output_lost() {
+        // The client's parser may still be inside the abandoned control string.
+        return Ok(result.unwrap_or(Exit { code: 1 }));
+    }
+    result
 }
 
 /// Catch unwinding while the owner remains alive, then combine primary and cleanup outcomes.

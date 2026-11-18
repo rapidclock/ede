@@ -70,17 +70,65 @@ impl Scalar {
     }
 }
 
+/// Destinations for a document selection copied by ede.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum ClipboardMode {
+    Internal,
+    System,
+    #[default]
+    Both,
+}
+
+impl ClipboardMode {
+    /// Stable configuration value.
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::Internal => "internal",
+            Self::System => "system",
+            Self::Both => "both",
+        }
+    }
+
+    /// Read a stable configuration value.
+    pub fn parse(value: &str) -> Option<Self> {
+        [Self::Internal, Self::System, Self::Both]
+            .into_iter()
+            .find(|mode| mode.id() == value)
+    }
+
+    /// Name displayed in Settings.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Internal => "Internal",
+            Self::System => "System",
+            Self::Both => "Both",
+        }
+    }
+
+    /// Advance the Settings row by one choice.
+    pub fn next(self) -> Self {
+        match self {
+            Self::Internal => Self::System,
+            Self::System => Self::Both,
+            Self::Both => Self::Internal,
+        }
+    }
+}
+
 /// Explicit overrides are separate from their effective defaults.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) struct Values([Option<u64>; 4]);
+pub(crate) struct Values {
+    scalars: [Option<u64>; 4],
+    pub(crate) clipboard_override: Option<ClipboardMode>,
+}
 
 impl Values {
     pub fn set(&mut self, setting: Scalar, value: Option<u64>) {
-        self.0[setting as usize] = value;
+        self.scalars[setting as usize] = value;
     }
 
     pub fn override_value(self, setting: Scalar) -> Option<u64> {
-        self.0[setting as usize]
+        self.scalars[setting as usize]
     }
 
     pub fn get(self, setting: Scalar) -> u64 {
@@ -90,6 +138,11 @@ impl Values {
 
     pub fn checkpoint(self) -> Duration {
         Duration::from_secs(self.get(Scalar::Checkpoint))
+    }
+
+    /// Effective normal-session destination.
+    pub fn clipboard_mode(self) -> ClipboardMode {
+        self.clipboard_override.unwrap_or_default()
     }
 
     pub fn syntax(self) -> SyntaxLimits {
