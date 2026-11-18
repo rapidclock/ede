@@ -710,6 +710,51 @@ at `/verify`. The baseline and larger-than-RAM containers had
 Client-visible timing, standalone mouse and navigation latency samples, and
 complete per-workload allocation and peak measurements remain open.
 
+### Review fixes verified on `01c3bb0`
+
+A further independent review of `a76fa83` reproduced six findings. The
+regressions failed before the fixes below and passed afterward.
+
+| Finding | Fix and regression evidence |
+| --- | --- |
+| Duplicate recovery identity could lose scratch edits on normal Quit | Opening a retained scratch removes its cached startup entry after admission. `manual_recovery_and_startup_refill_keep_one_scratch_owner` fills 64 startup slots, manually opens an overflow scratch, cancels a loading CLI tab, checks one owner per identity and verifies retained bytes after Quit. Removing the new guard in an isolated copy fails the duplicate-owner assertion with two owners. |
+| An overtaken Copy could transmit after its transfer left the pending slot | A shared generation remains attached to the transfer. Every first-byte attempt checks it under the same mutex as internal Copy/Cut commit, with readiness waits outside the mutex. `newer_oversized_copy_revokes_taken_transfer` forces an unsuccessful first attempt, then completes an 8,193-byte internal copy before retry. Disabling the generation check in isolation fails with Sent instead of Unavailable. `clipboard_first_write_serializes_authority_until_callback_returns` holds a synchronized writer callback. Releasing the mutex before the write in isolation fails its intended assertion. |
+| Double-clicking a scrolled picker moved the target under the pointer | The picker retains its viewport while the selected row remains visible. `picker_double_click_keeps_scrolled_rows_stationary` uses real PTY input to open the clicked file after keyboard scrolling. |
+| A release on another picker row left a prior click armed | A mismatched press/release target clears click history. `picker_mismatched_release_interrupts_double_click` confirms the interrupted sequence leaves the picker open. |
+| SIGTERM during an incomplete clipboard write returned exit status 1 | The runtime preserves pending external signal status, and the poisoned-output wrapper preserves that result through cleanup. `clipboard_backpressure_preserves_signal_exit_status` holds a real PTY reader after the OSC introducer and checks SIGINT, SIGTERM and SIGHUP exit statuses and exact termios restoration. |
+| A newer layout acknowledgment hid the actual clipboard delivery outcome | Clipboard feedback uses the originating Copy/Cut sequence independently of layout acknowledgments. `clipboard_feedback_survives_newer_layout_ack` verifies delivery feedback persists across layout updates and cannot overwrite a newer Copy's status. |
+
+Additional V08 checks now cover an oversized request emitting no OSC 52 frame
+while retaining all bytes for internal Paste and Save. The synchronized
+`held_copy_respects_settings_and_suspension_at_delivery` check runs the normal
+editor worker, holds Copy inside a real storage read, and overtakes it with
+actual settings reloads or suspension. Disabled-to-enabled, disable/re-enable,
+and suspension cases all suppress the obsolete system write and retain the
+internal clipboard through a saved-byte round trip.
+
+Final locked workspace checks passed on the same native macOS, Ubuntu and
+Debian arm64 environments recorded above, starting with a 256-descriptor soft
+limit. Formatting and Clippy passed with warnings denied. There were 334
+enabled tests on macOS and 336 on each Linux target, with ten opt-in tests
+excluded from each default suite. The optimized macOS and Ubuntu clipboard and
+picker regressions and oversized clipboard round trip passed. The isolated
+macOS tmux editing and suspension probe passed. Native macOS and Ubuntu release
+binaries continue to report `0.0.1-dev.10`.
+
+Initial full runs exposed a cycle in the new fixtures, which retained rendered
+views while multiple editors shared the process-wide two-view budget. Thread
+samples identified the wait in `LayoutLease::acquire`. Releasing unused test
+views fixed it with the original five-second waits and production limits.
+A piped-input check also inherited personal settings, which clipped its
+expected coordinates behind the footer control. Its default test profile is
+now isolated. Both full suites were rerun after these fixture corrections.
+
+The final independent reviewer followed [REVIEW.md](../../REVIEW.md) against
+`a76fa83`, inspected the six fixes and the fixture corrections, ran focused
+clipboard and recovery checks, and independently verified the first-write
+guard mutation. No actionable findings remained. Earlier frontend and release
+acceptance gaps below remain open.
+
 ### Remaining acceptance
 
 MVP-01 and MVP-06 have automated candidate evidence for V01–V09. Required
