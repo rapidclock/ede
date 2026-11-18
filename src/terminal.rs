@@ -1,18 +1,22 @@
 //! Sole owner of terminal modes and Unix signal subscriptions.
 
 use std::{
+    cell::Cell,
     env,
     fs::File,
     io::{self, IsTerminal, Write},
-    os::fd::AsRawFd,
+    os::fd::{AsFd, AsRawFd},
     os::unix::fs::OpenOptionsExt,
+    rc::Rc,
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
+    time::{Duration, Instant},
 };
 
 use crossterm::{cursor, event, execute, terminal};
+use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 use nix::sys::termios::{self, SetArg, Termios};
 use nix::unistd::{getpgid, getpgrp, getpid, getppid, getsid, tcgetpgrp};
 use signal_hook::{SigId, consts::signal::*, flag, low_level};
@@ -58,6 +62,15 @@ pub(crate) trait TerminalDriver {
 pub(crate) struct UnixTerminal {
     tty: Option<File>,
     raw: Option<Termios>,
+    output_lost: Rc<Cell<bool>>,
+}
+
+/// None, all, or only part of a framed clipboard request reached the tty.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ClipboardWrite {
+    Sent,
+    Unavailable,
+    Lost,
 }
 
 impl UnixTerminal {
@@ -74,6 +87,7 @@ impl UnixTerminal {
         Ok(Self {
             tty: Some(tty),
             raw: None,
+            output_lost: Rc::default(),
         })
     }
 
@@ -92,9 +106,9 @@ impl UnixTerminal {
 
     /// Keep the normal stdout path and use the controlling tty in stream mode.
     pub(crate) fn output(&self) -> io::Result<TerminalOutput> {
-        Ok(match &self.tty {
-            Some(tty) => TerminalOutput::Tty(tty.try_clone()?),
-            None => TerminalOutput::Stdout(io::stdout()),
+        Ok(TerminalOutput {
+            tty: self.tty.as_ref().map(File::try_clone).transpose()?,
+            lost: self.output_lost.clone(),
         })
     }
 
@@ -102,26 +116,65 @@ impl UnixTerminal {
     pub(crate) fn size(&self) -> io::Result<(u16, u16)> {
         self.tty.as_ref().map_or_else(terminal::size, size_of)
     }
+
+    /// Reopen the renderer's tty without changing flags on its existing descriptor.
+    fn clipboard_output(&self) -> io::Result<File> {
+        let path = if self.tty.is_some() {
+            std::path::PathBuf::from("/dev/tty")
+        } else {
+            nix::unistd::ttyname(io::stdout())?
+        };
+        let tty = File::options()
+            .write(true)
+            .custom_flags(nix::libc::O_NONBLOCK | nix::libc::O_NOCTTY)
+            .open(path)?;
+        if tcgetpgrp(&tty)? != getpgrp() {
+            return Err(io::Error::other("clipboard tty is not in the foreground"));
+        }
+        Ok(tty)
+    }
+}
+
+/// Keep the complete frame under one output owner, including short writes.
+fn clipboard_frame(
+    frame: &[u8],
+    mut write: impl FnMut(&[u8]) -> io::Result<usize>,
+) -> ClipboardWrite {
+    let mut written = 0;
+    while written < frame.len() {
+        match write(&frame[written..]) {
+            Ok(count) if count != 0 => written += count,
+            _ if written == 0 => return ClipboardWrite::Unavailable,
+            _ => return ClipboardWrite::Lost,
+        }
+    }
+    ClipboardWrite::Sent
 }
 
 /// Output destination shared by terminal commands and the rendering backend.
-pub(crate) enum TerminalOutput {
-    Stdout(io::Stdout),
-    Tty(File),
+pub(crate) struct TerminalOutput {
+    tty: Option<File>,
+    lost: Rc<Cell<bool>>,
 }
 
 impl Write for TerminalOutput {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        match self {
-            Self::Stdout(out) => out.write(buf),
-            Self::Tty(out) => out.write(buf),
+        if self.lost.get() {
+            return Ok(buf.len());
+        }
+        match &mut self.tty {
+            Some(out) => out.write(buf),
+            None => io::stdout().write(buf),
         }
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        match self {
-            Self::Stdout(out) => out.flush(),
-            Self::Tty(out) => out.flush(),
+        if self.lost.get() {
+            return Ok(());
+        }
+        match &mut self.tty {
+            Some(out) => out.flush(),
+            None => io::stdout().flush(),
         }
     }
 }
@@ -148,6 +201,9 @@ pub(crate) fn size_of(tty: &impl AsRawFd) -> io::Result<(u16, u16)> {
 impl TerminalDriver for UnixTerminal {
     /// Issue each command independently, so one write failure does not skip later cleanup.
     fn set(&mut self, mode: Mode, enabled: bool) -> io::Result<()> {
+        if self.output_lost.get() && mode != Mode::Raw {
+            return Ok(());
+        }
         if mode == Mode::Raw
             && let Some(tty) = &self.tty
         {
@@ -209,6 +265,71 @@ pub(crate) struct TerminalSession<D: TerminalDriver> {
     acquired: Vec<Mode>,
     mouse: bool,
     keyboard: bool,
+}
+
+impl TerminalSession<UnixTerminal> {
+    /// Send a prepared frame between renders, with a finite tty output deadline.
+    pub(crate) fn clipboard(
+        &mut self,
+        transfer: &crate::editor::ClipboardTransfer,
+        interrupted: impl Fn() -> bool,
+    ) -> ClipboardWrite {
+        let Ok(mut tty) = self.driver.clipboard_output() else {
+            return ClipboardWrite::Unavailable;
+        };
+        let mut deadline = Instant::now() + Duration::from_millis(25);
+        let mut started = false;
+        self.write_clipboard(&transfer.frame, |remaining| {
+            while let Some(wait) = deadline.checked_duration_since(Instant::now()) {
+                let result = if started {
+                    tty.write(remaining)
+                } else if interrupted() {
+                    return Err(io::ErrorKind::Interrupted.into());
+                } else {
+                    transfer.write_first(|bytes| tty.write(bytes))
+                };
+                match result {
+                    Ok(count) if count > 0 && !started => {
+                        // Before admission we can skip a busy tty. After a short write,
+                        // the client needs time to drain the frame before output resumes.
+                        started = true;
+                        deadline = Instant::now() + Duration::from_secs(1);
+                        return Ok(count);
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        let mut fd = [PollFd::new(tty.as_fd(), PollFlags::POLLOUT)];
+                        let timeout = PollTimeout::try_from(wait).unwrap_or(PollTimeout::ZERO);
+                        match poll(&mut fd, timeout) {
+                            Ok(0) => break,
+                            Ok(_) | Err(nix::errno::Errno::EINTR) => continue,
+                            Err(error) => return Err(error.into()),
+                        }
+                    }
+                    result => return result,
+                }
+            }
+            Err(io::Error::from(io::ErrorKind::TimedOut))
+        })
+    }
+
+    fn write_clipboard(
+        &mut self,
+        frame: &[u8],
+        write: impl FnMut(&[u8]) -> io::Result<usize>,
+    ) -> ClipboardWrite {
+        let outcome = clipboard_frame(frame, write);
+        if outcome == ClipboardWrite::Lost {
+            // The client may still be parsing OSC. Restore termios, but send no more frames.
+            self.driver.output_lost.set(true);
+        }
+        outcome
+    }
+
+    /// An incomplete control sequence prevents further terminal text and mode commands.
+    pub(crate) fn output_lost(&self) -> bool {
+        self.driver.output_lost.get()
+    }
 }
 
 impl<D: TerminalDriver> TerminalSession<D> {
@@ -378,6 +499,13 @@ impl Signals {
         (signal != 0).then_some(signal as u8)
     }
 
+    /// Defer an unstarted clipboard frame to terminal lifecycle requests.
+    pub(crate) fn output_interrupted(&self) -> bool {
+        self.termination.load(Ordering::Relaxed) != 0
+            || self.suspend.load(Ordering::Relaxed)
+            || self.continued.load(Ordering::Relaxed)
+    }
+
     /// Take a requested job-control suspension.
     pub(crate) fn suspend_requested(&self) -> bool {
         self.suspend.swap(false, Ordering::Relaxed)
@@ -406,6 +534,50 @@ impl Drop for Signals {
 mod tests {
     use super::*;
     use std::{cell::RefCell, rc::Rc};
+
+    /// A partial OSC cannot be followed by cursor cleanup, redraw, or late tty writes.
+    #[test]
+    fn incomplete_clipboard_frame_poisoned_output_includes_renderer_drop() {
+        use ratatui::{Terminal, backend::CrosstermBackend};
+        use std::os::unix::fs::FileExt;
+
+        let sink = tempfile::tempfile().unwrap();
+        let mut writer = sink.try_clone().unwrap();
+        let mut session = TerminalSession::new(UnixTerminal {
+            tty: Some(sink.try_clone().unwrap()),
+            ..UnixTerminal::default()
+        });
+        let mut output = session.driver().output().unwrap();
+        let mut renderer = Terminal::with_options(
+            CrosstermBackend::new(session.driver().output().unwrap()),
+            ratatui::TerminalOptions {
+                viewport: ratatui::Viewport::Fixed(ratatui::layout::Rect::new(0, 0, 40, 8)),
+            },
+        )
+        .unwrap();
+        renderer.hide_cursor().unwrap();
+        assert_eq!(
+            session.write_clipboard(b"\x1b]52;c;YWJj\x1b\\", |bytes| {
+                if bytes.starts_with(b"\x1b]52;") {
+                    writer.write(&bytes[..5])
+                } else {
+                    Err(io::ErrorKind::BrokenPipe.into())
+                }
+            }),
+            ClipboardWrite::Lost
+        );
+        let written = sink.metadata().unwrap().len();
+        drop(renderer);
+        output.write_all(b"never sent").unwrap();
+        assert_eq!(
+            sink.metadata().unwrap().len(),
+            written,
+            "poisoned tty emitted cleanup bytes"
+        );
+        let mut tail = [0; 5];
+        sink.read_exact_at(&mut tail, written - 5).unwrap();
+        assert_eq!(&tail, b"\x1b]52;");
+    }
 
     /// Shared trace survives Drop so tests can inspect unwind restoration.
     type Trace = Rc<RefCell<Vec<(Mode, bool)>>>;

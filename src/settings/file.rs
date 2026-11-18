@@ -1,6 +1,6 @@
 //! Parse an entire settings revision and publish edits using a verified disk base.
 
-use super::{Context, Revision, Scalar, values::Values};
+use super::{ClipboardMode, Context, Revision, Scalar, values::Values};
 use nix::{
     errno::Errno,
     fcntl::{AtFlags, Flock, FlockArg, OFlag, open, openat, renameat},
@@ -146,6 +146,28 @@ fn parse(text: &str) -> io::Result<Revision> {
         }
     }
     settings.map.revalidate().map_err(invalid)?;
+    if let Some(clipboard) = table.remove("clipboard") {
+        let Value::Table(entries) = clipboard else {
+            return Err(invalid("clipboard: expected table"));
+        };
+        if entries.contains_key("mode") && entries.contains_key("copy_to_system") {
+            return Err(invalid("clipboard: use mode or copy_to_system, not both"));
+        }
+        for (key, value) in entries {
+            settings.values.clipboard_override = Some(match key.as_str() {
+                "mode" => value
+                    .as_str()
+                    .and_then(ClipboardMode::parse)
+                    .ok_or_else(|| invalid("clipboard.mode: expected internal, system, or both"))?,
+                "copy_to_system" => match value.as_bool() {
+                    Some(true) => ClipboardMode::Both,
+                    Some(false) => ClipboardMode::Internal,
+                    None => return Err(invalid("clipboard.copy_to_system: expected boolean")),
+                },
+                _ => return Err(invalid(format!("clipboard.{key}: unknown setting"))),
+            });
+        }
+    }
     for (name, entries) in table {
         if !matches!(name.as_str(), "recovery" | "highlighting") {
             return Err(invalid(format!("{name}: unknown setting")));
@@ -292,6 +314,15 @@ fn serialize(base: &Base, draft: &Revision) -> io::Result<String> {
         draft.values,
         &mut comments,
     )?;
+    if previous.values.clipboard_override != draft.values.clipboard_override {
+        let clipboard = table(doc.as_table_mut(), "clipboard")?;
+        remove(clipboard, "copy_to_system", &mut comments);
+        if let Some(mode) = draft.values.clipboard_override {
+            change(clipboard, "mode", toml_edit::value(mode.id()));
+        } else {
+            remove(clipboard, "mode", &mut comments);
+        }
+    }
     for (before, after) in previous.map.rows.iter().zip(&draft.map.rows) {
         if before.override_keys == after.override_keys {
             continue;
@@ -612,6 +643,24 @@ mod tests {
 
     fn editing() -> Revision {
         parse("[recovery]\ncheckpoint_interval_seconds = 11\n").unwrap()
+    }
+
+    /// Old clipboard overrides keep their meaning, including explicit opt-out.
+    #[test]
+    fn clipboard_modes_parse_without_overriding_legacy_choices() {
+        for (setting, mode) in [
+            ("", ClipboardMode::Both),
+            ("mode = \"both\"", ClipboardMode::Both),
+            ("mode = \"internal\"", ClipboardMode::Internal),
+            ("mode = \"system\"", ClipboardMode::System),
+            ("copy_to_system = true", ClipboardMode::Both),
+            ("copy_to_system = false", ClipboardMode::Internal),
+        ] {
+            let config = format!("[clipboard]\n{setting}");
+            assert_eq!(parse(&config).unwrap().values.clipboard_mode(), mode);
+        }
+        assert!(parse("[clipboard]\nmode = \"auto\"").is_err());
+        assert!(parse("[clipboard]\nmode = \"both\"\ncopy_to_system = false").is_err());
     }
 
     #[test]

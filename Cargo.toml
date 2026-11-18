@@ -1,12 +1,13 @@
 [package]
 name = "ede"
-version = "0.0.1-dev.9"
+version = "0.0.1-dev.11"
 edition = "2024"
 rust-version = "1.99.1"
 description = "A terminal text editor for macOS and Linux"
 publish = false
 
 [dependencies]
+base64 = "0.22.1"
 crossterm = { version = "0.29.0", default-features = false, features = ["events", "bracketed-paste"] }
 memchr = "2.8.3"
 grep-matcher = "0.1.9"

@@ -264,7 +264,8 @@ fn observed_source_change_rejects_ready() {
         &Cancellation::default(),
         |event| {
             if matches!(event, OpenProgress::Preparing { .. }) && !changed {
-                fs::write(&path, vec![b'b'; 2048]).unwrap();
+                // Make the change observable even when both writes share a timestamp tick.
+                fs::write(&path, vec![b'b'; 2049]).unwrap();
                 changed = true;
             }
         },

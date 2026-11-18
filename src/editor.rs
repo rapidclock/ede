@@ -16,6 +16,7 @@ use crate::{
 };
 use std::{
     collections::VecDeque,
+    io::Read,
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
@@ -63,7 +64,45 @@ struct ViewControl {
     search_replacing: AtomicBool,
     streamed: AtomicBool,
     export: Mutex<Option<Cancellation>>,
+    clipboard: Mutex<Option<ClipboardTransfer>>,
+    /// Serializes successful copies with the first nonblocking tty write.
+    clipboard_generation: Arc<Mutex<u64>>,
 }
+
+/// One prepared terminal clipboard write, tied to the dispatch authorization.
+pub(crate) struct ClipboardTransfer {
+    pub epoch: u64,
+    pub cut: bool,
+    pub internal: bool,
+    pub sequence: u64,
+    pub frame: Vec<u8>,
+    pub generation: u64,
+    pub authority: Arc<Mutex<u64>>,
+}
+
+impl ClipboardTransfer {
+    /// Admit the first byte only while this is still the newest successful copy.
+    /// The caller must perform one nonblocking write and release before waiting.
+    pub(crate) fn write_first(
+        &self,
+        write: impl FnOnce(&[u8]) -> std::io::Result<usize>,
+    ) -> std::io::Result<usize> {
+        let generation = self
+            .authority
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if *generation != self.generation {
+            return Err(std::io::ErrorKind::PermissionDenied.into());
+        }
+        write(&self.frame)
+    }
+}
+
+const SYSTEM_CLIPBOARD_LIMIT: u64 = 8 * 1024;
+pub(crate) const COPIED_INTERNALLY: &str = "Copied internally";
+pub(crate) const CUT_INTERNALLY: &str = "Cut internally";
+pub(crate) const SYSTEM_COPY_PENDING: &str = "System copy pending";
+pub(crate) const SYSTEM_COPY_FAILED: &str = "Copy failed";
 impl ViewControl {
     /// Bind a queued replacement to the current tab and the capabilities visible at dispatch.
     fn replacement_scope(&self) -> search::ReplacementScope {
@@ -179,6 +218,11 @@ pub(crate) enum Action {
     InvalidateReplacement,
     RevokeSearch,
     Command(Command),
+    Clipboard {
+        cut: bool,
+        internal: bool,
+        system: Option<u64>,
+    },
     Insert(String),
     Paste(Arc<Spool>),
     FieldPaste(Arc<Spool>, u64),
@@ -321,6 +365,8 @@ pub(crate) struct Screen {
     pub loading: bool,
     pub message: String,
     pub acknowledged: u64,
+    /// The Copy/Cut responsible for a retained clipboard status, independent of layout ACKs.
+    pub clipboard_sequence: Option<u64>,
     pub pointer_press: Option<u64>,
 }
 impl Default for Screen {
@@ -352,6 +398,7 @@ impl Default for Screen {
             loading: true,
             message: "Preparing document".into(),
             acknowledged: 0,
+            clipboard_sequence: None,
             pointer_press: None,
         }
     }
@@ -419,6 +466,15 @@ pub(crate) struct Editor {
     worker: Option<JoinHandle<()>>,
 }
 impl Editor {
+    /// Admit only the latest completed clipboard write after the UI sees its acknowledgement.
+    pub(crate) fn take_clipboard(&self, acknowledged: u64) -> Option<ClipboardTransfer> {
+        let mut slot = self.view_cancel.clipboard.try_lock().ok()?;
+        if slot.as_ref()?.sequence > acknowledged {
+            return None;
+        }
+        slot.take()
+    }
+
     /// Isolate parser lifecycle from terminal job control and restoration.
     pub(crate) fn pause_highlighting(&self) -> u64 {
         self.view_cancel.syntax.pause()
@@ -441,6 +497,25 @@ impl Editor {
         syntax_program: Option<PathBuf>,
         syntax_config_directory: Option<PathBuf>,
     ) -> std::io::Result<Self> {
+        Self::with_options(
+            launch_directory,
+            startup,
+            recovery,
+            syntax_program,
+            syntax_config_directory,
+            OpenOptions::default(),
+        )
+    }
+
+    /// Supply storage policy and fault boundaries while retaining the normal worker loop.
+    pub(crate) fn with_options(
+        launch_directory: PathBuf,
+        startup: crate::stream::Startup,
+        recovery: crate::recovery::Store,
+        syntax_program: Option<PathBuf>,
+        syntax_config_directory: Option<PathBuf>,
+        options: OpenOptions,
+    ) -> std::io::Result<Self> {
         let (sender, receiver) = mpsc::sync_channel(256);
         let (event_sender, events) = mpsc::sync_channel(16);
         let screen = Arc::new(Mutex::new(None));
@@ -456,8 +531,8 @@ impl Editor {
         let active = activity.clone();
         let worker = thread::Builder::new()
             .name("ede-editor".into())
-            .spawn(move || {
-                match StorageService::with_stop_flag(OpenOptions::default(), stopping.clone()) {
+            .spawn(
+                move || match StorageService::with_stop_flag(options, stopping.clone()) {
                     Ok(service) => {
                         let mut coordinator = Coordinator::new(
                             service,
@@ -481,8 +556,8 @@ impl Editor {
                             });
                         }
                     }
-                }
-            })?;
+                },
+            )?;
         Ok(Self {
             sender: Some(sender),
             events,
@@ -727,7 +802,6 @@ struct Coordinator {
     next_untitled: u64,
     launch_directory: PathBuf,
     opening: Option<OpenJob>,
-    startup_fallback: bool,
     saving: Option<RunningSave>,
     saves: VecDeque<SaveIntent>,
     completed_open: Option<document::Completion>,
@@ -783,7 +857,6 @@ impl Coordinator {
             next_untitled: 0,
             launch_directory: PathBuf::new(),
             opening: None,
-            startup_fallback: false,
             saving: None,
             saves: VecDeque::new(),
             completed_open: None,
@@ -1209,7 +1282,7 @@ impl Coordinator {
         {
             // The deletion has committed even if a later layout/read fails.
             if let Some(clipboard) = self.cut_clipboard.take() {
-                self.clipboard = Some(clipboard);
+                self.commit_clipboard(Some(clipboard));
             }
             if revision != expected {
                 self.cache.edited(expected, revision, range.start);
@@ -1265,11 +1338,19 @@ impl Coordinator {
         self.tab.preferred = None;
         Ok(())
     }
-    /// Copy exact selection bytes to a private disk spool with fixed buffers.
-    fn copy(&mut self, cut: bool) -> Result<(), Error> {
+    /// Copy exact selection bytes with fixed buffers. Cut requires a retained copy.
+    fn copy(&mut self, cut: bool, internal: bool, system: Option<u64>) -> Result<(), Error> {
+        if cut && !internal {
+            self.tab.screen.message = "Cut needs Internal or Both".into();
+            return Ok(());
+        }
         let range = self.tab.screen.position.selection();
         if range.is_empty() {
             self.tab.screen.message = "No selection".into();
+            return Ok(());
+        }
+        if !internal && range.end - range.start > SYSTEM_CLIPBOARD_LIMIT {
+            self.tab.screen.message = format!("{SYSTEM_COPY_FAILED} | system limit 8 KiB");
             return Ok(());
         }
         let snapshot = self.snapshot()?;
@@ -1287,15 +1368,98 @@ impl Coordinator {
         }
         drop(snapshot);
         let spool = Arc::new(spool);
-        if cut {
-            self.cut_clipboard = Some(spool);
+        let result = if cut {
+            self.cut_clipboard = Some(spool.clone());
             let result = self.replace(Some(String::new()), None, range);
             self.cut_clipboard = None;
-            result?;
+            result
         } else {
-            self.clipboard = Some(spool);
+            self.commit_clipboard(internal.then(|| spool.clone()));
+            Ok(())
+        };
+        if !cut
+            || self
+                .clipboard
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, &spool))
+        {
+            let status = if cut {
+                CUT_INTERNALLY
+            } else if internal {
+                COPIED_INTERNALLY
+            } else {
+                SYSTEM_COPY_PENDING
+            };
+            self.tab.screen.message = match system
+                .and_then(|epoch| self.prepare_clipboard(&spool, epoch, cut, internal).err())
+            {
+                Some(reason) if internal => format!("{status} | {reason}"),
+                Some(reason) => format!("{SYSTEM_COPY_FAILED} | {reason}"),
+                None => status.into(),
+            };
+            self.tab.screen.clipboard_sequence = Some(self.active_sequence);
         }
-        self.tab.screen.message = if cut { "Cut" } else { "Copied" }.into();
+        result
+    }
+
+    /// Supersede any unadmitted transfer and replace the retained copy if supplied.
+    fn commit_clipboard(&mut self, clipboard: Option<Arc<Spool>>) {
+        let mut generation = self
+            .view_cancel
+            .clipboard_generation
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        *generation = generation.wrapping_add(1);
+        let mut pending = self
+            .view_cancel
+            .clipboard
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let previous = clipboard.and_then(|clipboard| self.clipboard.replace(clipboard));
+        *pending = None;
+        drop(pending);
+        drop(generation);
+        drop(previous);
+    }
+
+    /// Read and encode only bounded selections, on the coordinator thread.
+    fn prepare_clipboard(
+        &self,
+        spool: &Spool,
+        epoch: u64,
+        cut: bool,
+        internal: bool,
+    ) -> Result<(), &'static str> {
+        use base64::Engine;
+
+        if spool.len > SYSTEM_CLIPBOARD_LIMIT {
+            return Err("system limit 8 KiB");
+        }
+        let mut bytes = vec![0; spool.len as usize];
+        spool
+            .reader()
+            .read_exact(&mut bytes)
+            .map_err(|_| "system request prep failed")?;
+        let data = base64::engine::general_purpose::STANDARD.encode(bytes);
+        let frame = format!("\x1b]52;c;{data}\x1b\\").into_bytes();
+        let generation = *self
+            .view_cancel
+            .clipboard_generation
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        *self
+            .view_cancel
+            .clipboard
+            .lock()
+            .unwrap_or_else(|err| err.into_inner()) = Some(ClipboardTransfer {
+            epoch,
+            cut,
+            internal,
+            sequence: self.active_sequence,
+            frame,
+            generation,
+            authority: self.view_cancel.clipboard_generation.clone(),
+        });
         Ok(())
     }
     /// Navigate using the same chunked cell mapping as rendering and pointer hits.
@@ -1401,7 +1565,7 @@ impl Coordinator {
         }
         if matches!(
             action,
-            Action::Insert(_) | Action::Paste(_) | Action::Command(_)
+            Action::Insert(_) | Action::Paste(_) | Action::Clipboard { .. } | Action::Command(_)
         ) && self
             .tab
             .scratch
@@ -1687,6 +1851,11 @@ impl Coordinator {
                     self.tab.screen.message = "Selection ignored: view changed; retry".into();
                 }
             }
+            Action::Clipboard {
+                cut,
+                internal,
+                system,
+            } => self.copy(cut, internal, system)?,
             Action::Command(command) => match command {
                 Command::Move(movement, extend) => self.movement(movement, extend)?,
                 Command::SelectAll => {
@@ -1699,8 +1868,8 @@ impl Coordinator {
                     self.tab.preferred = None;
                     self.layout(true)?;
                 }
-                Command::Copy => self.copy(false)?,
-                Command::Cut => self.copy(true)?,
+                Command::Copy => self.copy(false, true, None)?,
+                Command::Cut => self.copy(true, true, None)?,
                 Command::Paste => {
                     if let Some(paste) = self.clipboard.clone() {
                         self.replace(None, Some(paste), self.tab.screen.position.selection())?;
@@ -1800,6 +1969,42 @@ mod tests {
             offset += window.text().len() as u64;
         }
         result
+    }
+
+    /// A new internal copy cannot commit between authorization and the first tty byte.
+    #[test]
+    fn clipboard_first_write_serializes_authority_until_callback_returns() {
+        let authority = Arc::new(Mutex::new(1));
+        let transfer = ClipboardTransfer {
+            epoch: 0,
+            cut: false,
+            internal: true,
+            sequence: 1,
+            frame: b"first frame".to_vec(),
+            generation: 1,
+            authority: authority.clone(),
+        };
+        let (entered, reached) = mpsc::sync_channel(1);
+        let (release, held) = mpsc::sync_channel(1);
+        let writer = thread::spawn(move || {
+            transfer.write_first(|bytes| {
+                entered.send(()).unwrap();
+                held.recv_timeout(Duration::from_secs(5)).unwrap();
+                Ok(bytes.len())
+            })
+        });
+        reached.recv_timeout(Duration::from_secs(5)).unwrap();
+        let protected = matches!(
+            authority.try_lock(),
+            Err(std::sync::TryLockError::WouldBlock)
+        );
+        release.send(()).unwrap();
+        assert_eq!(writer.join().unwrap().unwrap(), b"first frame".len());
+        assert!(
+            protected,
+            "a newer copy could commit before the first byte was written"
+        );
+        *authority.lock().unwrap() = 2;
     }
     /// Pump an independent save to its acknowledged completion, with a finite deadline.
     fn saved(worker: &mut Coordinator) {

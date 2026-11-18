@@ -6,7 +6,7 @@ use std::{
 };
 
 use crate::{
-    editor::{Action, After, Editor},
+    editor::{Action, After, ClipboardTransfer, Editor},
     ingress::Ingress,
 };
 use ratatui::{Terminal, TerminalOptions, Viewport, backend::CrosstermBackend, layout::Rect};
@@ -17,7 +17,7 @@ use crate::{
     app::{AppState, Intent},
     input::Input,
     status::{Severity, StatusInbox, StatusMessage},
-    terminal::{Signals, TerminalOutput, TerminalSession, UnixTerminal},
+    terminal::{ClipboardWrite, Signals, TerminalOutput, TerminalSession, UnixTerminal},
     ui::{self, LayoutSnapshot},
 };
 
@@ -57,6 +57,10 @@ trait Host {
     /// Toggle mouse reporting without altering the user's terminal settings.
     fn mouse(&mut self, _enabled: bool) -> io::Result<()> {
         Ok(())
+    }
+    /// Send a prepared terminal clipboard frame beside normal drawing.
+    fn clipboard(&mut self, _transfer: &ClipboardTransfer) -> ClipboardWrite {
+        ClipboardWrite::Unavailable
     }
 }
 
@@ -117,6 +121,10 @@ impl Host for TerminalHost<'_> {
     /// Preserve capture choice across suspension and restore it on exit.
     fn mouse(&mut self, enabled: bool) -> io::Result<()> {
         self.session.set_mouse(enabled)
+    }
+    fn clipboard(&mut self, transfer: &ClipboardTransfer) -> ClipboardWrite {
+        self.session
+            .clipboard(transfer, || self.signals.output_interrupted())
     }
     /// Invalidate Ratatui's previous buffer following re-entry.
     fn clear(&mut self) -> io::Result<()> {
@@ -185,23 +193,27 @@ pub(crate) fn run(
     let worker = editor.shutdown();
     let picker_worker = picker.shutdown();
     let restoration = host.session.restore();
+    let output_lost = host.session.output_lost();
+    let bounded_cleanup = streamed || output_lost;
     highlighting.pause();
-    if !streamed {
+    if !bounded_cleanup {
         host.ingress.join();
     }
     drop(host);
     let deadline = Instant::now() + Duration::from_millis(250);
     for worker in [worker, picker_worker].into_iter().flatten() {
-        if streamed {
+        if bounded_cleanup {
             while !worker.is_finished() && Instant::now() < deadline {
                 std::thread::sleep(Duration::from_millis(5));
             }
         }
-        if !streamed || worker.is_finished() {
+        if !bounded_cleanup || worker.is_finished() {
             let _ = worker.join();
         }
     }
-    if let Some(message) = settings_exit.or_else(|| app.settings.exit(&app.config_location)) {
+    if let Some(message) = settings_exit.or_else(|| app.settings.exit(&app.config_location))
+        && !output_lost
+    {
         eprintln!("ede: {message}");
     }
     match result {
@@ -291,6 +303,7 @@ fn event_loop_impl(
             rendered_generation = None;
         }
         if host.continued() {
+            app.revoke_clipboard();
             host.clear()?;
             area = host.area()?;
             app.input(Input::Resize(area.width, area.height), &layout);
@@ -302,6 +315,14 @@ fn event_loop_impl(
                 break;
             };
             app.notify(message);
+        }
+        if let Some(bridge) = editor.as_deref()
+            && let Some(transfer) = bridge.take_clipboard(app.screen.acknowledged)
+            && deliver_clipboard(host, app, transfer) == ClipboardWrite::Lost
+        {
+            return Ok(Exit {
+                code: host.termination().map_or(1, |signal| 128 + signal),
+            });
         }
         reconcile_layout(area, app, &mut layout);
         if let Some(intent) = app.tick(host.now(), &layout) {
@@ -390,6 +411,37 @@ fn event_loop_impl(
     }
 }
 
+/// Validate dispatch authority at the tty and report what reached the endpoint.
+fn deliver_clipboard(
+    host: &mut impl Host,
+    app: &mut AppState,
+    transfer: ClipboardTransfer,
+) -> ClipboardWrite {
+    if app.system_clipboard_epoch() != Some(transfer.epoch) {
+        if Some(transfer.sequence) == app.screen.clipboard_sequence {
+            let message = if !transfer.internal {
+                "System copy cancelled"
+            } else if transfer.cut {
+                "Cut internally | system request revoked"
+            } else {
+                "Copied internally | system revoked"
+            };
+            app.report_clipboard(transfer.sequence, message);
+        }
+        return ClipboardWrite::Unavailable;
+    }
+    let outcome = host.clipboard(&transfer);
+    let message = match outcome {
+        ClipboardWrite::Sent => "System copy sent | unconfirmed",
+        ClipboardWrite::Unavailable if !transfer.internal => "System clipboard write failed",
+        ClipboardWrite::Unavailable if transfer.cut => "Cut internally | system write failed",
+        ClipboardWrite::Unavailable => "Copied internally | system write failed",
+        ClipboardWrite::Lost => return outcome,
+    };
+    app.report_clipboard(transfer.sequence, message);
+    outcome
+}
+
 /// Keep displayed controls and focus consistent after asynchronous or timer-driven transitions.
 fn reconcile_layout(area: Rect, app: &mut AppState, layout: &mut LayoutSnapshot) {
     if layout.area != area || layout.signature != LayoutSnapshot::signature(app) {
@@ -440,6 +492,7 @@ fn effect(
                     (
                         Some(tab),
                         action @ (Action::Command(_)
+                        | Action::Clipboard { .. }
                         | Action::Insert(_)
                         | Action::Paste(_)
                         | Action::Save(_)
@@ -519,6 +572,7 @@ fn draw(
 
 /// Report unavailable job control without leaving active modes partially restored.
 fn suspend(host: &mut impl Host, app: &mut AppState, editor: Option<&Editor>) -> io::Result<()> {
+    app.revoke_clipboard();
     if let Some(editor) = editor {
         app.syntax_epoch = editor.pause_highlighting();
         app.screen.syntax_projection = None;
@@ -555,6 +609,361 @@ mod tests {
     use crossterm::event::{KeyModifiers, MouseEvent, MouseEventKind};
     use std::{cell::Cell, collections::VecDeque};
 
+    /// Settings and suspension can overtake a Copy held inside a real storage read.
+    #[test]
+    fn held_copy_respects_settings_and_suspension_at_delivery() {
+        crate::provide_descriptor_headroom();
+        use crate::document::{FaultInjector, IoPoint, OpenOptions};
+        use std::sync::{
+            Arc, Mutex,
+            atomic::{AtomicBool, Ordering},
+            mpsc,
+        };
+
+        #[derive(Debug)]
+        struct HoldRead {
+            armed: AtomicBool,
+            entered: mpsc::SyncSender<()>,
+            release: Mutex<mpsc::Receiver<()>>,
+        }
+        impl FaultInjector for HoldRead {
+            fn check(&self, point: IoPoint) -> io::Result<()> {
+                if point == IoPoint::Read && self.armed.swap(false, Ordering::AcqRel) {
+                    self.entered.send(()).unwrap();
+                    self.release
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(5))
+                        .map_err(io::Error::other)?;
+                }
+                Ok(())
+            }
+        }
+        let acknowledged = |editor: &Editor| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut last = None;
+            loop {
+                if let Some(screen) = editor.screen() {
+                    if screen.acknowledged == editor.sequence() {
+                        return screen;
+                    }
+                    last = Some((screen.acknowledged, screen.message));
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "worker did not acknowledge command {}, last {last:?}, stopped {}, events {:?}",
+                    editor.sequence(),
+                    editor.failed(),
+                    editor.events.try_iter().collect::<Vec<_>>()
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        };
+        for (enabled, suspending) in [(false, false), (true, false), (true, true)] {
+            let root = tempfile::tempdir().unwrap();
+            let (entered, reached) = mpsc::sync_channel(1);
+            let (release, held) = mpsc::sync_channel(1);
+            let gate = Arc::new(HoldRead {
+                armed: AtomicBool::new(false),
+                entered,
+                release: Mutex::new(held),
+            });
+            let store = crate::recovery::Store::open(crate::recovery::Options {
+                root: root.path().join("state"),
+                reserve_bytes: 0,
+                ..Default::default()
+            })
+            .unwrap();
+            let mut editor = Editor::with_options(
+                root.path().to_owned(),
+                crate::stream::Startup {
+                    paths: Vec::new(),
+                    source: None,
+                },
+                store,
+                None,
+                None,
+                OpenOptions {
+                    faults: Some(gate.clone()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let mut app = AppState::new();
+            app.config_location = crate::settings::Location::isolated(root.path().to_owned());
+            let apply = |app: &mut AppState, editor: &mut Editor, enabled| {
+                std::fs::write(
+                    root.path().join("config.toml"),
+                    format!("[clipboard]\ncopy_to_system = {enabled}\n"),
+                )
+                .unwrap();
+                let previous = app.settings_generation;
+                app.settings.reload();
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while app.settings_generation == previous {
+                    app.poll_settings(Some(editor));
+                    assert!(Instant::now() < deadline, "settings did not apply");
+                    std::thread::yield_now();
+                }
+            };
+            apply(&mut app, &mut editor, enabled);
+            assert!(editor.submit(Action::New));
+            acknowledged(&editor);
+            assert!(editor.submit(Action::Insert("held copy text".into())));
+            assert!(editor.submit(Action::Command(Command::SelectAll)));
+            app.update(acknowledged(&editor), false);
+            let layout = LayoutSnapshot::for_app(Rect::new(0, 0, 80, 24), &app, 1);
+            let Some(Intent::Editor(copy)) = app.input(Input::Command(Command::Copy), &layout)
+            else {
+                panic!("Copy did not dispatch");
+            };
+            gate.armed.store(true, Ordering::Release);
+            assert!(editor.submit(copy));
+            reached.recv_timeout(Duration::from_secs(5)).unwrap();
+            // The test retains status, not a rendered frame. Multiple editor fixtures
+            // share the process-wide two-layout budget while tests run in parallel.
+            app.screen.view = None;
+            let mut host = Fake::new(Vec::new());
+            if suspending {
+                suspend(&mut host, &mut app, Some(&editor)).unwrap();
+            } else {
+                if enabled {
+                    apply(&mut app, &mut editor, false);
+                }
+                apply(&mut app, &mut editor, true);
+            }
+            release.send(()).unwrap();
+            let copied = acknowledged(&editor);
+            let transfer = editor.take_clipboard(copied.acknowledged);
+            app.update(copied, false);
+            if enabled {
+                assert_eq!(
+                    deliver_clipboard(&mut host, &mut app, transfer.unwrap()),
+                    ClipboardWrite::Unavailable
+                );
+            } else {
+                assert!(
+                    transfer.is_none(),
+                    "enabling revived an internal-only command"
+                );
+            }
+            assert!(host.clipboard_frames.is_empty());
+            app.screen.view = None;
+            assert!(editor.submit(Action::Insert(String::new())));
+            assert!(editor.submit(Action::Command(Command::Paste)));
+            acknowledged(&editor);
+            let destination = root.path().join("round-trip.txt");
+            assert!(editor.submit(Action::Save(Some(destination.clone()))));
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !std::fs::read_to_string(&destination).is_ok_and(|text| text == "held copy text")
+            {
+                assert!(
+                    Instant::now() < deadline,
+                    "internal copy did not survive revocation"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            editor.shutdown().unwrap().join().unwrap();
+        }
+    }
+
+    /// A later successful internal copy retires a frame before its first byte.
+    #[test]
+    fn newer_oversized_copy_revokes_taken_transfer() {
+        crate::provide_descriptor_headroom();
+        let root = tempfile::tempdir().unwrap();
+        let store = crate::recovery::Store::open(crate::recovery::Options {
+            root: root.path().join("state"),
+            reserve_bytes: 0,
+            ..Default::default()
+        })
+        .unwrap();
+        let mut editor = Editor::new(
+            root.path().to_owned(),
+            crate::stream::Startup {
+                paths: Vec::new(),
+                source: None,
+            },
+            store,
+            None,
+            None,
+        )
+        .unwrap();
+        let ack = |editor: &Editor| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut last = None;
+            loop {
+                if let Some(screen) = editor.screen() {
+                    if screen.acknowledged == editor.sequence() {
+                        return screen;
+                    }
+                    last = Some((screen.acknowledged, screen.message));
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "worker did not acknowledge command {}, last {last:?}, stopped {}, events {:?}",
+                    editor.sequence(),
+                    editor.failed(),
+                    editor.events.try_iter().collect::<Vec<_>>()
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        };
+        let mut host = Fake::new(Vec::new());
+        let mut app = AppState::new();
+        app.settings.applied.values.clipboard_override = Some(crate::settings::ClipboardMode::Both);
+        let epoch = app.system_clipboard_epoch();
+
+        assert!(editor.submit(Action::New));
+        ack(&editor);
+        assert!(editor.submit(Action::Insert("old".into())));
+        assert!(editor.submit(Action::Command(Command::SelectAll)));
+        assert!(editor.submit(Action::Clipboard {
+            cut: false,
+            internal: true,
+            system: epoch
+        }));
+        let old_screen = ack(&editor);
+        let old = editor.take_clipboard(old_screen.acknowledged).unwrap();
+        app.update(old_screen, false);
+        app.screen.view = None;
+
+        // An unsuccessful nonblocking attempt does not reserve output authority.
+        let first = old.write_first(|_| Err(io::ErrorKind::WouldBlock.into()));
+        assert_eq!(first.unwrap_err().kind(), io::ErrorKind::WouldBlock);
+
+        // The worker can finish these during a readiness wait before the first
+        // nonblocking tty write. No copy has reached the fake tty yet.
+        assert!(editor.submit(Action::Insert("n".repeat(8193))));
+        assert!(editor.submit(Action::Command(Command::SelectAll)));
+        assert!(editor.submit(Action::Clipboard {
+            cut: false,
+            internal: true,
+            system: epoch
+        }));
+        let new_screen = ack(&editor);
+        assert!(new_screen.message.contains("system limit 8 KiB"));
+        assert!(editor.take_clipboard(new_screen.acknowledged).is_none());
+
+        assert_eq!(
+            deliver_clipboard(&mut host, &mut app, old),
+            ClipboardWrite::Unavailable
+        );
+        assert!(host.clipboard_frames.is_empty());
+    }
+
+    /// A size acknowledgement can coalesce away the older copy acknowledgement.
+    #[test]
+    fn clipboard_feedback_survives_newer_layout_ack() {
+        let mut host = Fake::new(Vec::new());
+        let mut app = AppState::new();
+        app.settings.applied.values.clipboard_override = Some(crate::settings::ClipboardMode::Both);
+        let mut copied = app.screen.clone();
+        copied.message = crate::editor::COPIED_INTERNALLY.into();
+        copied.acknowledged = 12;
+        copied.clipboard_sequence = Some(11);
+        app.update(copied, false);
+        let transfer = ClipboardTransfer {
+            epoch: app.system_clipboard_epoch().unwrap(),
+            cut: false,
+            internal: true,
+            sequence: 11,
+            frame: b"test frame".to_vec(),
+            generation: 0,
+            authority: std::sync::Arc::default(),
+        };
+        assert_eq!(
+            deliver_clipboard(&mut host, &mut app, transfer),
+            ClipboardWrite::Sent
+        );
+        assert_eq!(host.clipboard_frames, [b"test frame".to_vec()]);
+        assert_eq!(app.status.text(), "System copy sent | unconfirmed");
+        let mut resized = app.screen.clone();
+        resized.acknowledged += 1;
+        app.update(resized.clone(), false);
+        assert_eq!(app.status.text(), "System copy sent | unconfirmed");
+        resized.clipboard_sequence = Some(12);
+        app.update(resized, false);
+        app.report_clipboard(11, "System copy sent | unconfirmed");
+        assert_eq!(app.status.text(), crate::editor::COPIED_INTERNALLY);
+    }
+
+    /// A prepared write overtaken by disable/re-enable cannot enter terminal output.
+    #[test]
+    fn clipboard_delivery_skips_a_revoked_write() {
+        let mut host = Fake::new(Vec::new());
+        let mut app = AppState::new();
+        let mut copied = app.screen.clone();
+        copied.message = crate::editor::COPIED_INTERNALLY.into();
+        copied.clipboard_sequence = Some(0);
+        app.update(copied.clone(), false);
+        app.settings.applied.values.clipboard_override = Some(crate::settings::ClipboardMode::Both);
+        let epoch = app.system_clipboard_epoch().unwrap();
+        let transfer = ClipboardTransfer {
+            epoch,
+            cut: false,
+            internal: true,
+            sequence: 0,
+            frame: b"pending".to_vec(),
+            generation: 0,
+            authority: std::sync::Arc::default(),
+        };
+        app.settings.applied.values.clipboard_override =
+            Some(crate::settings::ClipboardMode::Internal);
+        app.revoke_clipboard();
+        app.settings.applied.values.clipboard_override = Some(crate::settings::ClipboardMode::Both);
+        assert_eq!(
+            deliver_clipboard(&mut host, &mut app, transfer),
+            ClipboardWrite::Unavailable
+        );
+        assert!(
+            host.clipboard_frames.is_empty(),
+            "revoked clipboard request reached terminal output"
+        );
+        assert!(app.status.text().contains("system revoked"));
+        let transfer = ClipboardTransfer {
+            epoch: app.system_clipboard_epoch().unwrap(),
+            cut: false,
+            internal: true,
+            sequence: 0,
+            frame: b"new".to_vec(),
+            generation: 0,
+            authority: std::sync::Arc::default(),
+        };
+        assert_eq!(
+            deliver_clipboard(&mut host, &mut app, transfer),
+            ClipboardWrite::Sent
+        );
+        assert_eq!(host.clipboard_frames, [b"new".to_vec()]);
+        app.update(app.screen.clone(), false);
+        assert!(app.reports_clipboard());
+        let mut saved = app.screen.clone();
+        saved.message = "Saved newer file state".into();
+        app.update(saved, false);
+        assert_eq!(app.status.text(), "Saved newer file state");
+        assert!(!app.reports_clipboard());
+
+        app.update(copied, false);
+        app.notify(StatusMessage::new(
+            Severity::Info,
+            "Saved before clipboard delivery",
+        ));
+        let transfer = ClipboardTransfer {
+            epoch: app.system_clipboard_epoch().unwrap(),
+            cut: false,
+            internal: true,
+            sequence: 0,
+            frame: b"still delivered".to_vec(),
+            generation: 0,
+            authority: std::sync::Arc::default(),
+        };
+        assert_eq!(
+            deliver_clipboard(&mut host, &mut app, transfer),
+            ClipboardWrite::Sent
+        );
+        assert_eq!(app.status.text(), "Saved before clipboard delivery");
+    }
+
     /// Deferred field submission must replace dialog geometry/focus before the next key.
     #[test]
     fn deferred_path_submission_reconciles_focus_and_geometry() {
@@ -568,6 +977,7 @@ mod tests {
         let area = Rect::new(0, 0, 80, 24);
         let mut app = AppState::new();
         app.screen.loading = false;
+        app.screen.tab = Some(crate::editor::TabId(1));
         app.screen.document = Some(crate::document::DocumentId(1));
         app.modal = Some(Modal::Path(PathKind::Save, String::new()));
         app.focus = Some(Control::PathField);
@@ -601,6 +1011,7 @@ mod tests {
         frames: Vec<(Duration, u64, Rect)>,
         fail_draw: bool,
         keyboards: usize,
+        clipboard_frames: Vec<Vec<u8>>,
         terminate_at: Duration,
     }
 
@@ -613,12 +1024,22 @@ mod tests {
                 frames: Vec::new(),
                 fail_draw: false,
                 keyboards: 0,
+                clipboard_frames: Vec::new(),
                 terminate_at: Duration::from_millis(100),
             }
         }
     }
 
     impl Host for Fake {
+        fn clipboard(&mut self, transfer: &ClipboardTransfer) -> ClipboardWrite {
+            match transfer.write_first(|frame| {
+                self.clipboard_frames.push(frame.to_vec());
+                Ok(frame.len())
+            }) {
+                Ok(_) => ClipboardWrite::Sent,
+                Err(_) => ClipboardWrite::Unavailable,
+            }
+        }
         /// Read virtual monotonic time.
         fn now(&self) -> Duration {
             self.now.get()

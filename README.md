@@ -1,16 +1,15 @@
 # ede
 
 A Rust terminal text editor for macOS and Linux, built in reviewed stages.
-Current version **0.0.1-dev.9**. This version adds configurable shortcuts,
-scratch checkpoint timing, and highlighting limits. See the
-[MVP overview](specs/001_initial_mvp/overview.md),
-[Stage 6 validation record](specs/001_initial_mvp/06_search_and_replace.md#validation-record),
-and [Stage 7 validation record](specs/001_initial_mvp/07_syntax_highlighting.md#validation-record).
+Current version **0.0.1-dev.10**. See the
+[MVP overview](specs/001_initial_mvp/overview.md) and the
+[Stage 10 validation record](specs/001_initial_mvp/10_mvp_validation.md#validation-record).
 
 ## Build and run
 
 Install Rust through rustup. `rust-toolchain.toml` pins the toolchain and its
-formatting/linting components.
+formatting and linting components. Install the Xcode Command Line Tools on macOS
+or a C compiler and linker on Linux for the bundled syntax grammars.
 
 ```sh
 cargo build --locked
@@ -27,6 +26,10 @@ cargo run --locked -- --safe-config path/to/file.txt
 Run in a terminal with a usable `TERM`, at least 40 columns by 8 rows. Smaller
 windows preserve work and show a resize prompt; return to a supported size to
 answer unsaved-change prompts. `--help` and `--version` work without a terminal.
+
+A launch without a file or retained scratch opens a welcome screen. Choose
+**Open File** (Ctrl+O) or **New Scratch** (Ctrl+N). File-open errors are shown
+in the session. Existing scratch documents restore on launch.
 
 Start with `--safe-config` to use bundled configuration for the session. The
 option comes before file arguments, `--`, or `--follow`. Safe mode skips local
@@ -86,7 +89,8 @@ with the shell's `fg` command.
 New and Open add tabs, and switching restores each tab's caret, selection,
 scrolling, and undo history. Use the Tabs button or Actions → Tabs to select or
 close a tab outside the strip. Actions → Tab details shows the active file's
-path. The strip marks active (`>`), modified (`*`), waiting (`…`), loading
+path. Brackets separate tabs and reverse video marks the active tab. The strip
+also marks modified (`*`), waiting (`…`), loading
 (`↓`), queued save (`⇡`), saving (`↑`), scratch (`~`), and attention (`!`).
 
 Find and Replace search the current document or all open tabs, including unsaved
@@ -105,9 +109,10 @@ Search highlights the exact match separately from ordinary selection; navigation
 clears the old selection and keeps the caret on a grapheme boundary.
 
 Open starts in the active file's parent directory or the launch directory.
-Use arrows or the wheel to select an entry and Enter to open it. Up and the
-page buttons browse directories. Tab to Path to enter a literal absolute or
-relative path. The listing includes hidden entries.
+Use arrows or the wheel to select an entry and Enter to open it. Double-click
+a directory to browse it or a file to open it. Up and the page buttons browse
+directories. Tab to Path to enter a literal absolute or relative path. The
+listing includes hidden entries.
 
 Click to place the caret, Shift-click to extend, or drag to select. Dragging beyond
 the text area autoscrolls while the terminal continues reporting pointer events.
@@ -116,17 +121,52 @@ capture pauses capture for terminal-native selection; F2 gives a keyboard route
 to turn it back on. Native-selection modifiers depend on the terminal; use tmux's
 copy mode inside tmux.
 
-Copy/cut use **ede's private internal clipboard**, retained until process exit.
-Ctrl+V, or a directly delivered Cmd+V key, inserts that clipboard. A terminal's
-Paste command sends its external clipboard text through bracketed paste; this is
-a different input path. Both support large contents using disk staging, with no
-arbitrary paste-size cutoff. A paste commits as one undoable edit or leaves the
-document unchanged on validation, staging, space, or pre-commit cancellation
-failure. Bytes within bracketed paste are always data, including Escape. While
-the status shows `Receiving paste`, run the displayed `kill -USR1 PID` command
+Choose **Internal**, **System**, or **Both** in the **Clipboard** row in
+Settings, then save. **Both** is the default.
+
+- **Internal** keeps Copy and Cut in ede. Ctrl+V or a directly delivered Cmd+V
+  pastes from ede's private clipboard.
+- **System** sends Copy to the terminal's clipboard. Use the terminal's Paste
+  command. To Cut, switch to Internal or Both so ede can keep the removed text
+  recoverable even if the terminal does not update the clipboard.
+- **Both** keeps Copy and Cut in ede and also asks the terminal to update its
+  clipboard. Ctrl+V still pastes from ede.
+
+The terminal's Paste command works in every mode and sends system clipboard
+text through bracketed paste. Both paste paths
+support large contents using disk staging. A paste commits as one undoable edit
+or leaves the document unchanged on validation, staging, space, or pre-commit
+cancellation failure. Bytes within bracketed paste are always data, including
+Escape. While the status shows `Receiving paste`, run the displayed `kill -USR1 PID` command
 from another shell on the editor host to cancel reception. The reader discards
 the rest of that frame through its closing marker. Escape can cancel an admitted
 paste before it commits once the terminal has sent the closing marker.
+
+Set `clipboard.mode` to `"internal"`, `"system"`, or `"both"` in TOML.
+`--safe-config` uses Internal. Existing `copy_to_system = false` and `true`
+settings still mean Internal and Both, respectively. System copy requests
+use OSC 52 and are limited to 8 KiB. In Both, larger selections are still
+copied in full inside ede. **System copy sent | unconfirmed** means ede sent
+the request. The client controls whether it updates the clipboard.
+
+For iTerm2, check its clipboard write permission. An intervening tmux server
+needs to accept writes from programs inside a pane and forward them to the
+client. Its `set-clipboard external` mode can forward tmux copy-mode selections
+while ignoring application writes. When the terminal path cannot accept OSC 52,
+use ede's internal clipboard, terminal-native selection with mouse capture
+paused, or tmux copy mode as appropriate. See the
+[tested terminal and transport paths](specs/001_initial_mvp/10_mvp_validation.md#terminal-transport-and-client-clipboard-evidence).
+[iTerm2 clipboard settings](https://iterm2.com/documentation-preferences-general.html),
+[tmux clipboard documentation](https://github.com/tmux/tmux/wiki/Clipboard).
+
+In Apple Terminal, ede's system clipboard copy did not work in the tested SSH
+session. For text visible on screen, press **F2**, choose **Mouse capture:
+enabled (toggle)**, then drag to select the text and press
+**Option+Shift+Cmd+C** to copy it as plain text. Press **F2** and toggle capture
+back on to restore clicks in ede. The equivalent Terminal control is
+**View → Allow Mouse Reporting**. **Cmd+V** or **Edit → Paste** sends Mac
+clipboard text into ede. In iTerm2, copying from ede to the Mac clipboard
+passed over direct SSH and through remote tmux.
 
 Save As creates a new destination; it does not overwrite an existing path. Normal
 Save checks the previously acknowledged destination for external changes. Editing
@@ -176,6 +216,9 @@ checkpoint_interval_seconds = 5
 max_document_bytes = 20971520
 max_line_bytes = 65536
 parse_timeout_ms = 250
+
+[clipboard]
+mode = "both"
 
 [keybindings.global]
 save = ["Ctrl+S", "F9", "Cmd+S"]
@@ -579,8 +622,10 @@ Generated files are warm, and a PTY observer does not measure a graphical termin
 or remote transport. Linux CI exercises storage, editing, scratch recovery, and
 refresh and search/replacement with 256 MiB and swap disabled. The search benchmark
 counts and replaces one marker per MiB, measures input during a dense-match scan,
-cancels, verifies saved bytes, and undoes. Native and CI measurements are recorded
-in the Stage 5 and Stage 6 validation records.
+cancels, verifies the full saved output, and exercises Undo. Set
+`EDE_BENCH_MARKER_STRIDE_MIB=8` for an 8 MiB interval between matches when
+testing larger files within the existing undo budget. See the
+[Stage 10 measurements](specs/001_initial_mvp/10_mvp_validation.md#performance-and-resources).
 
 The resource probe runs the coordinator and UI against ordinary, dense, long-line
 and mixed Unicode files. It records managed allocation high waters, working-file

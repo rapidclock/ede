@@ -158,7 +158,6 @@ impl Coordinator {
     /// Establish startup order before admitting the first named preparation.
     pub(super) fn start(&mut self, directory: PathBuf, paths: Vec<PathBuf>) {
         self.launch_directory = directory;
-        self.startup_fallback = true;
         for path in paths {
             if let Err(error) = self.add_named(&path, false) {
                 self.open_error(&path, &error);
@@ -172,6 +171,10 @@ impl Coordinator {
         }
         if let Err(error) = self.restore_startup() {
             self.event(Event::OpenFailed(format!("Scratch recovery: {error}")));
+        }
+        if self.tab.screen.tab.is_none() {
+            self.tab.screen.loading = false;
+            self.tab.screen.message = "No open tabs".into();
         }
     }
 
@@ -298,13 +301,18 @@ impl Coordinator {
         self.tab.screen.acknowledged = self.acknowledged;
     }
 
-    /// Charge retained path copies and the bounded Stage 02 history positions up front.
-    pub(super) fn admit_tab(&mut self, path: Option<PathBuf>) -> Result<TabId, Error> {
+    /// A cancelled preparation retains its tab charge until completion settles.
+    pub(super) fn tab_slots_used(&self) -> usize {
         let cancelling = self
             .opening
             .as_ref()
             .is_some_and(|job| self.state(job.tab).is_none());
-        if self.tabs.len() + usize::from(cancelling) >= crate::TAB_LIMIT {
+        self.tabs.len() + usize::from(cancelling)
+    }
+
+    /// Charge retained path copies and the bounded Stage 02 history positions up front.
+    pub(super) fn admit_tab(&mut self, path: Option<PathBuf>) -> Result<TabId, Error> {
+        if self.tab_slots_used() >= crate::TAB_LIMIT {
             return Err(Error::ResourceLimit("64 open tabs"));
         }
         // Charge both 1,000-entry history stacks, Vec growth, and tab metadata.
@@ -363,7 +371,6 @@ impl Coordinator {
 
     /// Create an unnamed tab without joining the named-file preparation queue.
     pub(super) fn add_new(&mut self) -> Result<(), Error> {
-        self.startup_fallback = false;
         let id = self.admit_tab(None)?;
         match self.call(Request::New) {
             Ok(Response::Ready { document, .. }) => {
@@ -518,10 +525,10 @@ impl Coordinator {
             .is_none_or(|save| save.intent.tab != id)
             && !self.saves.iter().any(|save| save.tab == id)
         {
-            let startup = self.tabs.iter().any(|tab| tab.id == id && tab.startup);
+            let startup = self.startup_tab(id);
             self.remove_tab(id)?;
-            if startup && self.tabs.is_empty() {
-                self.startup_fallback = true;
+            if startup && self.opening.as_ref().is_none_or(|job| job.tab != id) {
+                self.restore_startup()?;
             }
         }
         Ok(())
@@ -606,11 +613,6 @@ impl Coordinator {
             }
             changed = true;
         }
-        if self.startup_fallback && self.tabs.is_empty() && self.opening.is_none() {
-            self.startup_fallback = false;
-            self.add_new()?;
-            changed = true;
-        }
         Ok(changed)
     }
 
@@ -630,6 +632,9 @@ impl Coordinator {
         let failed = completion.result.is_err();
         let Some(state) = self.state_mut(id) else {
             self.service.close(completion.document);
+            if opening.released.is_some_and(|tab| tab.startup) {
+                self.restore_startup()?;
+            }
             return Ok(());
         };
         match completion.result {
@@ -659,7 +664,6 @@ impl Coordinator {
                         return Ok(());
                     }
                 };
-                self.startup_fallback = false;
                 let state = self.state_mut(id).expect("open tab still exists");
                 state.screen.document = Some(document);
                 state.screen.loading = false;
@@ -1368,7 +1372,7 @@ mod tests {
 
     /// Escape accepted against an opening tab still wins if Ready arrives before dispatch.
     #[test]
-    fn late_open_cancellation_respects_dispatch_and_startup_fallback() {
+    fn late_open_cancellation_respects_dispatch_and_leaves_empty_session() {
         let (mut worker, _, _) = gated(document::IoPoint::Publish);
         let temp = tempfile::tempdir().unwrap();
         let first = temp.path().join("first");
@@ -1380,9 +1384,7 @@ mod tests {
         until(&mut worker, |w| !w.tab.screen.loading);
         worker.cancel_open(startup).unwrap();
         worker.poll_opens().unwrap();
-        let fallback = worker.tab.screen.tab.unwrap();
-        assert_ne!(fallback, startup);
-        assert!(worker.tab.screen.path.is_none());
+        assert!(worker.tab.screen.tab.is_none());
 
         worker.active_sequence = 10;
         worker.action(Action::Open(next)).unwrap();
@@ -1391,7 +1393,7 @@ mod tests {
         worker.cancel_active_open(Some(9)).unwrap();
         assert_eq!(worker.tab.screen.tab, Some(opening));
         worker.cancel_active_open(Some(10)).unwrap();
-        assert_eq!(worker.tab.screen.tab, Some(fallback));
-        assert_eq!(worker.tabs.len(), 1);
+        assert!(worker.tab.screen.tab.is_none());
+        assert!(worker.tabs.is_empty());
     }
 }

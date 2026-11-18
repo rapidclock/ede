@@ -24,6 +24,8 @@ pub(crate) enum Control {
     UseDefaults,
     Search(u8),
     Content,
+    WelcomeOpen,
+    WelcomeNew,
     Menu,
     Help,
     Quit,
@@ -80,6 +82,8 @@ impl Control {
             | Self::PickerRow(_) => None,
             Self::RecoveryRow(_) | Self::RecoveryList => None,
             Self::RetryRefresh => Some(Command::RetryRefresh),
+            Self::WelcomeOpen => Some(Command::Open),
+            Self::WelcomeNew => Some(Command::New),
             Self::ToggleFollow => Some(Command::ToggleFollow),
             Self::Menu => Some(Command::Menu),
             Self::SaveErrorAs => Some(Command::SaveAs),
@@ -99,6 +103,8 @@ impl Control {
             Self::SettingsButton(button) => button.label(),
             Self::SettingsField => "",
             Self::UseDefaults => "Use defaults for this session",
+            Self::WelcomeOpen => "Open File",
+            Self::WelcomeNew => "New Scratch",
             Self::Search(_) => "",
             Self::Content
             | Self::PathField
@@ -154,6 +160,7 @@ pub(crate) struct Signature {
     detail: u64,
     active: Option<TabId>,
     tabs: Vec<TabId>,
+    welcome: bool,
     picker_revision: u64,
     picker_request: u64,
     switching: Option<u64>,
@@ -250,6 +257,7 @@ impl LayoutSnapshot {
             detail,
             active: app.screen.tab,
             tabs: app.screen.tabs.iter().map(|tab| tab.id).collect(),
+            welcome: app.screen.tab.is_none() && !app.screen.loading,
             picker_revision,
             picker_request,
             switching: app.switching,
@@ -286,6 +294,20 @@ impl LayoutSnapshot {
         if app.modal.is_none() {
             if !app.help {
                 result.add_tab_strip(app);
+                if result.signature.welcome {
+                    result
+                        .targets
+                        .retain(|target| target.control != Control::Content);
+                    for (offset, control) in [Control::WelcomeOpen, Control::WelcomeNew]
+                        .into_iter()
+                        .enumerate()
+                    {
+                        result.add(
+                            control,
+                            Rect::new(area.x + 2, area.y + 2 + offset as u16, area.width - 4, 1),
+                        );
+                    }
+                }
                 if app.screen.stream.is_some() && area.width >= 64 {
                     result.add(
                         Control::ToggleFollow,
@@ -486,7 +508,7 @@ impl LayoutSnapshot {
                     Control::PickerList,
                     Rect::new(overlay.x + 1, overlay.y + 2, overlay.width - 2, rows),
                 );
-                let start = list_start(dialog.highlight, rows);
+                let start = dialog.list_start(rows);
                 for (offset, row) in (start..dialog.count().min(start + rows as usize)).enumerate()
                 {
                     result.add(
@@ -562,7 +584,8 @@ impl LayoutSnapshot {
         let start = active.saturating_sub(count - 1).min(tabs.len() - count);
         let mut x = area.x;
         for (index, tab) in tabs.iter().skip(start).take(count).enumerate() {
-            let cells = width / count as u16 + u16::from(index == 0) * (width % count as u16);
+            let cells =
+                (width / count as u16 + u16::from(index == 0) * (width % count as u16)).min(24);
             self.add(Control::Tab(tab.id), Rect::new(x, area.y, cells, 1));
             x += cells;
         }
@@ -877,6 +900,9 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &AppState, layout: &LayoutSnaps
                 .map
                 .portable_hint(Context::Dialog, Command::Cancel);
             return format!("Waiting for tab state or save | {cancel} cancels");
+        }
+        if app.modal.is_none() && !app.help && app.reports_clipboard() {
+            return app.status.text().to_owned();
         }
         let syntax = match (
             matches!(app.screen.syntax_status, SyntaxStatus::Fallback(_)),
@@ -1221,6 +1247,53 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &AppState, layout: &LayoutSnaps
         }
     }
     for target in &layout.targets {
+        if let Control::Tab(id) = target.control {
+            if let Some(tab) = app.screen.tabs.iter().find(|tab| tab.id == id) {
+                let active = app.screen.tab == Some(id);
+                let label = tab_text(tab, false);
+                let label = label.trim_start();
+                let width = (UnicodeWidthStr::width(label) as u16).min(target.area.width - 2);
+                let style = if active {
+                    Style::default().add_modifier(Modifier::BOLD | Modifier::REVERSED)
+                } else if app.focus == Some(target.control) {
+                    Style::default().add_modifier(Modifier::UNDERLINED)
+                } else {
+                    Style::default()
+                };
+                let x = target.area.x;
+                let y = target.area.y;
+                frame.render_widget(Paragraph::new("[").style(style), Rect::new(x, y, 1, 1));
+                frame.render_widget(
+                    Paragraph::new(label).style(style),
+                    Rect::new(x + 1, y, width, 1),
+                );
+                frame.render_widget(
+                    Paragraph::new("]").style(style),
+                    Rect::new(x + 1 + width, y, 1, 1),
+                );
+            }
+            continue;
+        }
+        if matches!(target.control, Control::WelcomeOpen | Control::WelcomeNew) {
+            let command = target.control.command().expect("welcome action");
+            let key = app
+                .settings
+                .applied
+                .map
+                .portable_hint(Context::Global, command);
+            let label = if key.is_empty() {
+                target.control.label().to_owned()
+            } else {
+                format!("{} ({key})", target.control.label())
+            };
+            let style = if app.focus == Some(target.control) {
+                Style::default().add_modifier(Modifier::REVERSED)
+            } else {
+                Style::default()
+            };
+            frame.render_widget(Paragraph::new(label).style(style), target.area);
+            continue;
+        }
         let row = match (target.control, &app.modal) {
             (Control::ToggleFollow, _) => app.screen.stream.as_ref().map(|status| {
                 (
@@ -1235,7 +1308,7 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &AppState, layout: &LayoutSnaps
             (Control::PickerOpen, Some(Modal::Open(dialog))) if dialog.follow => {
                 Some(("Follow".into(), app.focus == Some(Control::PickerOpen)))
             }
-            (Control::Tab(id), _) | (Control::TabListRow(id), _) => {
+            (Control::TabListRow(id), _) => {
                 app.screen.tabs.iter().find(|tab| tab.id == id).map(|tab| {
                     let highlighted =
                         matches!(app.modal, Some(Modal::Tabs(Some(highlight))) if highlight == id);
