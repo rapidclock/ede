@@ -420,6 +420,23 @@ impl Keymap {
 
     /// Rebuild the dispatch index only after validating collisions and recovery routes.
     pub fn revalidate(&mut self) -> Result<(), String> {
+        let f5 = Chord(K::F(5), M::NONE);
+        let competing_f5 = self.rows.iter().any(|row| {
+            (row.context.has_global() || row.context == X::Global && row.command != C::Settings)
+                && row
+                    .override_keys
+                    .as_ref()
+                    .is_some_and(|keys| keys.contains(&f5))
+        });
+        let settings = self
+            .rows
+            .iter_mut()
+            .find(|row| row.context == X::Global && row.command == C::Settings)
+            .expect("global Settings command");
+        settings.defaults.clear();
+        if !competing_f5 {
+            settings.defaults.push(f5);
+        }
         let mut dispatch = HashMap::new();
         for row in &self.rows {
             if row.keys().len() > 8 {

@@ -1,6 +1,6 @@
 # 001 — Initial MVP overview
 
-Status — **MVP scope and roadmap accepted. Stages 01–09 merged. Stage 10 in progress.**
+Status — **MVP scope and roadmap accepted. Stages 01–10 merged. Stage 11 implemented with acceptance checks open.**
 
 Project: **ede**, a predominantly Rust terminal text editor for macOS and Linux.
 
@@ -107,8 +107,10 @@ test them; do not claim universal support for every protocol/version combination
 - Keep selection and controls accurate after scrolling, resizing, and switching
   tabs, including with wide characters and tab expansion.
 - Define how application selection, terminal-native selection, tmux copy mode,
-  and clipboard integration coexist. Internal copy/paste must remain available
-  when local system clipboard integration is unavailable.
+  and clipboard integration coexist. Stage 10 provides a private clipboard
+  fallback. In Stage 11, editor Paste uses the retained selection
+  on terminal and private-only routes. On a direct desktop it reads the current
+  system clipboard and reports a failed read without inserting stale text.
 
 Double-click word selection, triple-click line selection, and draggable scrollbars
 are proposed interaction details, subject to review.
@@ -612,7 +614,7 @@ Evidence — [Stage 09 validation record](09_configuration_and_keybindings.md#va
 
 Design — [10_mvp_validation.md](10_mvp_validation.md). Depends on Stages 01–09.
 
-Status — Implementation authorized. Integrated validation in progress.
+Status — Merged in PR #10. See the validation record for outstanding checks.
 
 Branch — `stage/mvp_validation`. PR target — `feat/initial_mvp`.
 
@@ -636,6 +638,18 @@ the reported macOS shortcuts and SSH clipboard paths.
 - Supply concise build/use/configuration guidance and supported-terminal details.
   Finish at package version `0.0.1`, with development prereleases used beforehand.
   Distribution and deployment remain outside scope.
+
+### 11 — Extras
+
+Outcome — Copy retains the selection across ede tabs and attempts desktop
+delivery automatically. Editor Paste uses the current clipboard on a direct
+desktop and the retained selection over SSH. Terminal Paste accepts client text.
+Users can dismiss Actions with an outside click, open a unified Settings pane
+directly, and identify and close individual tabs using dividers and per-tab × buttons.
+Depends on Stage 10. Branch `stage/extras`, PR target `feat/initial_mvp`.
+
+Design — [Stage 11 specification](11_extras.md).
+Evidence and open checks — [Stage 11 validation record](11_extras.md#validation-record).
 
 ## 9. Research references
 

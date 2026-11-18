@@ -1,9 +1,9 @@
-//! Keyboard- and mouse-operable editing of one settings revision and its disk base.
+//! Draft editing, navigation, and publication for the Settings pane.
 
 use super::*;
-use crate::settings::{Base, Chord, ClipboardMode, Revision, SaveState, Scalar, Update};
+use crate::settings::{Base, Chord, Revision, SaveState, Scalar, Update};
 
-const GENERAL_ROWS: usize = Scalar::ALL.len() + 1;
+const GENERAL_ROWS: usize = Scalar::ALL.len();
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Operation {
@@ -14,7 +14,8 @@ enum Operation {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Confirmation {
-    Close,
+    Exit,
+    Discard,
     Reload,
 }
 
@@ -25,22 +26,18 @@ enum Page {
     Edit(Operation),
     Capture(Operation),
     Preview(Operation, Chord),
-    Options,
     Confirm(Confirmation),
     Info,
-    Writing,
+    Writing { exit: bool },
 }
 
-/// A visible button on the active settings page.
+/// Stable targets for pane-local actions.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Button {
-    PreviousRow,
-    NextRow,
-    Edit,
-    Options,
-    Close,
     PreviousKey,
     NextKey,
+    Edit,
+    Exit,
     Add,
     Replace,
     Remove,
@@ -48,10 +45,12 @@ pub(crate) enum Button {
     Back,
     Capture,
     Accept,
+    DiscardCapture,
     Discard,
     KeepEditing,
-    Confirm,
     Save,
+    SaveAndExit,
+    DiscardAndExit,
     Reload,
     Restore,
     Info,
@@ -61,11 +60,10 @@ pub(crate) enum Button {
 impl Button {
     pub(crate) fn label(self) -> &'static str {
         match self {
-            Self::PreviousRow | Self::PreviousKey => "Prev",
-            Self::NextRow | Self::NextKey => "Next",
+            Self::PreviousKey => "Prev",
+            Self::NextKey => "Next",
             Self::Edit => "Edit",
-            Self::Options => "Options",
-            Self::Close => "Close",
+            Self::Exit => "Exit",
             Self::Add => "Add",
             Self::Replace => "Replace",
             Self::Remove => "Remove",
@@ -73,33 +71,35 @@ impl Button {
             Self::Back => "Back",
             Self::Capture => "Capture",
             Self::Accept => "Accept",
-            Self::Discard => "Discard",
+            Self::DiscardCapture | Self::Discard => "Discard",
             Self::KeepEditing => "Keep Editing",
-            Self::Confirm => "Discard draft",
-            Self::Save => "Save Settings",
-            Self::Reload => "Reload Settings",
-            Self::Restore => "Restore defaults",
-            Self::Info => "Config info",
+            Self::Save => "Save",
+            Self::SaveAndExit => "Save and Exit",
+            Self::DiscardAndExit => "Discard and Exit",
+            Self::Reload => "Reload",
+            Self::Restore => "Restore Defaults",
+            Self::Info => "Config",
             Self::CancelSave => "Cancel Save",
         }
     }
 }
 
-/// Draft and navigation persist independently of asynchronous document updates.
+/// One working revision and its publication base, including unaccepted field text.
 #[derive(Debug)]
 pub(crate) struct Draft {
     base: Option<Base>,
     original: Revision,
     revision: Revision,
     page: Page,
+    return_page: Page,
     selected: usize,
     chord: usize,
     pub(crate) generation: u64,
     pub(crate) field: String,
     pub(crate) info_scroll: u16,
-    invalid: Option<String>,
     feedback: Option<String>,
     blocked: Option<Chord>,
+    field_action: Option<Button>,
 }
 
 impl Draft {
@@ -109,79 +109,134 @@ impl Draft {
             original: settings.applied.clone(),
             revision: settings.applied.clone(),
             page: Page::List,
+            return_page: Page::List,
             selected: 0,
             chord: 0,
             generation: 0,
             field: String::new(),
             info_scroll: 0,
-            invalid: None,
             feedback: None,
             blocked: None,
+            field_action: None,
         }
     }
 
-    fn scalar(&self) -> Option<Scalar> {
-        Scalar::ALL.get(self.selected).copied()
-    }
-
     fn index(&self) -> usize {
-        self.selected.saturating_sub(GENERAL_ROWS)
+        self.selected - GENERAL_ROWS
     }
 
-    fn clipboard_row(&self) -> bool {
-        self.selected == Scalar::ALL.len()
+    fn count(&self) -> usize {
+        GENERAL_ROWS + self.revision.map.rows.len()
     }
 
     fn changed(&self) -> bool {
         self.original != self.revision
     }
 
-    fn row_label(&self, safe: bool) -> String {
-        if let Some(scalar) = self.scalar() {
-            format!("{} {}", scalar.label(), self.revision.values.get(scalar))
-        } else if self.clipboard_row() {
-            let mode = if safe {
-                ClipboardMode::Internal
-            } else {
-                self.revision.values.clipboard_mode()
-            };
-            format!("Clipboard [{}]", mode.label())
+    fn dirty(&self) -> bool {
+        let page = if matches!(self.page, Page::Confirm(_)) {
+            self.return_page
         } else {
-            self.revision.map.rows[self.index()].identifier()
+            self.page
+        };
+        self.changed()
+            || match page {
+                Page::Edit(Operation::Scalar(scalar)) => {
+                    self.field != self.revision.values.get(scalar).to_string()
+                }
+                Page::Edit(Operation::Add) | Page::Capture(Operation::Add) => {
+                    !self.field.is_empty()
+                }
+                Page::Edit(Operation::Replace) | Page::Capture(Operation::Replace) => {
+                    self.revision.map.rows[self.index()]
+                        .keys()
+                        .get(self.chord)
+                        .is_some_and(|key| self.field != key.to_string())
+                }
+                Page::Preview(..) => true,
+                _ => false,
+            }
+    }
+
+    /// Label and effective contents of a logical row, including inherited bindings.
+    pub(crate) fn row_label(&self, index: usize) -> String {
+        if let Some(scalar) = Scalar::ALL.get(index).copied() {
+            let source = if self.revision.values.override_value(scalar).is_some() {
+                "override"
+            } else {
+                "default"
+            };
+            format!(
+                "{} {} ({source})",
+                scalar.label(),
+                self.revision.values.get(scalar)
+            )
+        } else {
+            let row = &self.revision.map.rows[index - GENERAL_ROWS];
+            let keys = row
+                .keys()
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>();
+            let source = if row.override_keys.is_some() {
+                "override"
+            } else {
+                "default"
+            };
+            let value = if keys.is_empty() {
+                "Unbound".into()
+            } else {
+                keys.join(" / ")
+            };
+            format!("{} · {value} ({source})", row.identifier())
         }
     }
 
-    fn detail(&self) -> String {
-        if self.clipboard_row() {
-            return "Edit cycles modes • default Both".into();
+    fn section(&self) -> &'static str {
+        match self.selected {
+            0 => "Recovery",
+            1..GENERAL_ROWS => "Highlighting limits",
+            _ => "Keyboard shortcuts",
         }
-        if let Some(scalar) = self.scalar() {
-            return format!(
-                "Range 1–{} • default {}",
-                scalar.maximum(),
-                scalar.default()
-            );
-        }
-        let row = &self.revision.map.rows[self.index()];
-        let source = if row.override_keys.is_some() {
-            "Override"
+    }
+
+    pub(crate) fn title(
+        &self,
+        settings: &settings::Service,
+        location: &settings::Location,
+    ) -> String {
+        let state = if location.safe() {
+            "Safe config"
+        } else if settings.user_config {
+            "User config"
         } else {
-            "Default"
+            "Defaults"
         };
-        if let Some(chord) = row.keys().get(self.chord) {
-            let suffix = format!("{}/{} {chord}", self.chord + 1, row.keys().len());
-            if source.len() + suffix.len() >= 34 {
-                format!("{} {suffix}", &source[..1])
-            } else {
-                format!("{source} {suffix}")
-            }
+        let context = if self.page == Page::Info {
+            "Config"
         } else {
-            format!("{source} • Unbound")
-        }
+            self.section()
+        };
+        format!(
+            " Settings · {context} · {state}{} ",
+            if self.dirty() { " *" } else { "" }
+        )
+    }
+
+    pub(crate) fn feedback<'a>(&'a self, settings: &'a settings::Service) -> Option<&'a str> {
+        self.feedback.as_deref().or(settings.diagnostic.as_deref())
     }
 
     pub(crate) fn editing(&self) -> bool {
         matches!(self.page, Page::Edit(_))
+    }
+
+    /// A scalar's input occupies the value column of its actual list row.
+    pub(crate) fn inline_scalar(&self) -> Option<(usize, Scalar)> {
+        match self.page {
+            Page::Edit(Operation::Scalar(scalar)) => Some((self.selected, scalar)),
+            _ => None,
+        }
     }
 
     pub(crate) fn capturing(&self) -> bool {
@@ -192,54 +247,72 @@ impl Draft {
         self.page == Page::Info
     }
 
+    /// Keep the selected logical row in the viewport independent of terminal size.
+    pub(crate) fn rows(&self, capacity: u16) -> std::ops::Range<usize> {
+        if self.page != Page::List && self.inline_scalar().is_none() {
+            return 0..0;
+        }
+        let capacity = usize::from(capacity);
+        let start = self
+            .selected
+            .saturating_sub(capacity / 2)
+            .min(self.count().saturating_sub(capacity));
+        start..(start + capacity).min(self.count())
+    }
+
+    /// Row numbers are relative to the pane interior.
     pub(crate) fn buttons(
         &self,
+        height: u16,
         save_state: Option<SaveState>,
         writable: bool,
-        can_save: bool,
     ) -> Vec<(u16, Vec<Button>)> {
         use Button as B;
+        let footer = height - 1;
         match self.page {
-            Page::List => vec![
-                (1, vec![B::PreviousRow, B::NextRow]),
-                (3, vec![B::Edit, B::Options, B::Close]),
-            ],
-            Page::Binding => {
-                if !writable {
-                    return vec![(2, vec![B::PreviousKey, B::NextKey]), (3, vec![B::Back])];
+            Page::Confirm(Confirmation::Exit) => {
+                return vec![
+                    (2, vec![B::SaveAndExit, B::DiscardAndExit]),
+                    (footer, vec![B::KeepEditing]),
+                ];
+            }
+            Page::Confirm(_) => return vec![(footer, vec![B::Discard, B::KeepEditing])],
+            Page::Writing { .. } => {
+                return if save_state == Some(SaveState::Staging) {
+                    vec![(footer, vec![B::CancelSave])]
+                } else {
+                    Vec::new()
+                };
+            }
+            _ => {}
+        }
+        let mut result = vec![(footer, vec![B::Save, B::Discard, B::Exit])];
+        match self.page {
+            Page::List => {
+                let mut header = vec![B::Info];
+                if writable {
+                    header.extend([B::Reload, B::Restore]);
                 }
+                result.insert(0, (0, header));
+            }
+            Page::Binding if writable => {
                 let mut keys = vec![B::PreviousKey, B::NextKey, B::Add];
                 let mut edits = vec![B::Defaults, B::Back];
                 if !self.revision.map.rows[self.index()].keys().is_empty() {
                     keys.push(B::Replace);
                     edits.insert(0, B::Remove);
                 }
-                vec![(2, keys), (3, edits)]
+                result.extend([(2, keys), (3, edits)]);
             }
-            Page::Edit(Operation::Scalar(_)) => vec![(3, vec![B::Accept, B::Back])],
-            Page::Edit(_) => vec![(3, vec![B::Capture, B::Accept, B::Back])],
-            Page::Capture(_) => vec![(3, vec![B::Back])],
-            Page::Preview(..) => vec![(3, vec![B::Discard, B::Accept])],
-            Page::Options if writable => vec![
-                (
-                    1,
-                    if can_save {
-                        vec![B::Save, B::Reload]
-                    } else {
-                        vec![B::Reload]
-                    },
-                ),
-                (2, vec![B::Restore, B::Info]),
-                (3, vec![B::Back, B::Close]),
-            ],
-            Page::Options => vec![(2, vec![B::Info]), (3, vec![B::Back, B::Close])],
-            Page::Confirm(_) => vec![(3, vec![B::KeepEditing, B::Confirm])],
-            Page::Info => vec![(3, vec![B::Back])],
-            Page::Writing if save_state == Some(SaveState::Staging) => {
-                vec![(3, vec![B::CancelSave])]
-            }
-            Page::Writing => vec![(3, vec![B::Close])],
+            Page::Binding => result.push((3, vec![B::PreviousKey, B::NextKey, B::Back])),
+            Page::Edit(Operation::Scalar(_)) => {}
+            Page::Edit(_) => result.push((3, vec![B::Capture, B::Accept, B::Back])),
+            Page::Capture(_) => result.push((3, vec![B::Back])),
+            Page::Preview(..) => result.push((3, vec![B::DiscardCapture, B::Accept])),
+            Page::Info => result.push((0, vec![B::Back])),
+            _ => {}
         }
+        result
     }
 
     pub(crate) fn lines(
@@ -247,114 +320,80 @@ impl Draft {
         settings: &settings::Service,
         location: &settings::Location,
     ) -> Vec<(u16, String)> {
-        let error = self
-            .feedback
-            .as_deref()
-            .or(self.invalid.as_deref())
-            .or(settings.diagnostic.as_deref());
-        let state = match (location.safe(), settings.user_config) {
-            (true, _) => "Safe config",
-            (_, true) => "User config",
-            _ => "Defaults",
-        };
         match self.page {
-            Page::List => vec![
-                (
-                    0,
-                    format!(
-                        "{state}{}  {}/{}",
-                        if self.changed() { " • Draft" } else { "" },
-                        self.selected + 1,
-                        GENERAL_ROWS + self.revision.map.rows.len()
-                    ),
+            Page::List => Vec::new(),
+            Page::Binding => {
+                let row = &self.revision.map.rows[self.index()];
+                let value = row.keys().get(self.chord).map_or_else(
+                    || "Unbound".into(),
+                    |chord| format!("{}/{} {chord}", self.chord + 1, row.keys().len()),
+                );
+                let source = if row.override_keys.is_some() {
+                    "override"
+                } else {
+                    "default"
+                };
+                vec![(0, row.identifier()), (1, format!("{value} ({source})"))]
+            }
+            Page::Edit(Operation::Scalar(scalar)) => vec![(
+                0,
+                format!(
+                    "Range 1–{} · default {}",
+                    scalar.maximum(),
+                    scalar.default()
                 ),
-                (2, self.row_label(location.safe())),
-            ],
-            Page::Binding => vec![(0, self.row_label(location.safe())), (1, self.detail())],
+            )],
             Page::Edit(op) => vec![
+                (0, self.revision.map.rows[self.index()].identifier()),
                 (
-                    0,
+                    1,
                     match op {
-                        Operation::Scalar(scalar) => {
-                            format!("{} • 1–{}", scalar.label(), scalar.maximum())
-                        }
-                        Operation::Add => "Type a chord to add".into(),
-                        Operation::Replace => "Type the replacement chord".into(),
+                        Operation::Scalar(_) => unreachable!(),
+                        Operation::Add => "Type a shortcut to add".into(),
+                        Operation::Replace => "Type the replacement shortcut".into(),
                     },
                 ),
-                (
-                    2,
-                    error
-                        .unwrap_or(if matches!(op, Operation::Scalar(_)) {
-                            ""
-                        } else {
-                            "For example Ctrl+S or F9"
-                        })
-                        .to_owned(),
-                ),
             ],
-            Page::Capture(_) => vec![
-                (0, "Press a shortcut to preview".into()),
-                (1, error.unwrap_or("Any supported chord").to_owned()),
-                (2, "Back cancels capture".into()),
+            Page::Capture(_) => vec![(1, "Press a shortcut to preview".into())],
+            Page::Preview(_, chord) => vec![
+                (0, "Captured shortcut".into()),
+                (1, chord.to_string()),
+                (2, "Accept adds it to the draft".into()),
             ],
-            Page::Preview(_, chord) => {
-                let preview = format!("Captured {chord}");
-                if preview.len() <= 34 {
-                    vec![(0, preview), (1, "Accept adds it to the draft".into())]
-                } else {
-                    vec![
-                        (0, "Captured shortcut".into()),
-                        (1, chord.to_string()),
-                        (2, "Accept adds it to the draft".into()),
-                    ]
-                }
-            }
-            Page::Options => vec![(
-                0,
-                if let Some(error) = error {
-                    if error.len() > 33 {
-                        "See Config info for the diagnostic".into()
-                    } else {
-                        error.to_owned()
-                    }
-                } else if location.user_directory().is_none() {
-                    "Saving and reloading disabled".into()
-                } else if settings.base.is_none() {
-                    "Reload before saving".into()
-                } else {
-                    state.to_owned()
-                },
-            )],
             Page::Confirm(decision) => vec![(
                 0,
                 match decision {
-                    Confirmation::Close => "Discard unsaved settings?".into(),
-                    Confirmation::Reload => "Discard draft and reload settings?".into(),
-                },
+                    Confirmation::Exit => "Exit with unsaved settings?",
+                    Confirmation::Discard => "Discard unsaved settings?",
+                    Confirmation::Reload => "Discard draft and reload settings?",
+                }
+                .into(),
             )],
             Page::Info => vec![(
-                0,
+                1,
                 format!(
-                    "{state}\n{}\n{}",
+                    "{}\n{}",
                     location
                         .display_file()
                         .unwrap_or_else(|| "Configuration path unavailable".into()),
-                    error.unwrap_or(if location.user_directory().is_none() {
-                        "Saving and reloading are disabled."
-                    } else if settings.base.is_none() {
-                        "Reload a valid file before saving."
-                    } else {
-                        "No configuration errors."
-                    })
+                    self.feedback(settings)
+                        .unwrap_or(if location.user_directory().is_none() {
+                            "Saving and reloading are disabled."
+                        } else if settings.base.is_none() {
+                            "Reload a valid file before saving."
+                        } else {
+                            "No configuration errors."
+                        })
                 ),
             )],
-            Page::Writing => vec![(
+            Page::Writing { .. } => vec![(
                 0,
                 match settings.save_state() {
-                    Some(SaveState::Finishing) => "Finishing save".into(),
-                    _ => "Saving settings…".into(),
-                },
+                    Some(SaveState::Finishing) => "Finishing save",
+                    Some(SaveState::Cancelled) => "Cancelling save…",
+                    _ => "Saving settings…",
+                }
+                .into(),
             )],
         }
     }
@@ -363,79 +402,123 @@ impl Draft {
         let selected = self.selected;
         let generation = self.generation.wrapping_add(1);
         *self = Self::new(service);
-        self.selected = selected;
+        self.selected = selected.min(self.count() - 1);
         self.generation = generation;
     }
 
-    fn validate(&mut self) {
-        self.invalid = self.revision.map.revalidate().err();
-        self.feedback = self.invalid.clone();
-        self.generation = self.generation.wrapping_add(1);
-    }
-
     fn adjacent(&mut self, delta: isize) {
-        if self.page == Page::List {
-            self.selected = self
-                .selected
-                .saturating_add_signed(delta)
-                .min(GENERAL_ROWS + self.revision.map.rows.len() - 1);
-            self.chord = 0;
-        } else if self.page == Page::Binding {
-            self.chord = self.chord.saturating_add_signed(delta).min(
-                self.revision.map.rows[self.index()]
-                    .keys()
-                    .len()
-                    .saturating_sub(1),
-            );
-        } else if self.page == Page::Info {
-            self.info_scroll = self
-                .info_scroll
-                .saturating_add_signed(delta.clamp(-8, 8) as i16);
+        match self.page {
+            Page::List => {
+                self.selected = self
+                    .selected
+                    .saturating_add_signed(delta)
+                    .min(self.count() - 1);
+                self.chord = 0;
+            }
+            Page::Binding => {
+                self.chord = self.chord.saturating_add_signed(delta).min(
+                    self.revision.map.rows[self.index()]
+                        .keys()
+                        .len()
+                        .saturating_sub(1),
+                );
+            }
+            Page::Info => {
+                self.info_scroll = self
+                    .info_scroll
+                    .saturating_add_signed(delta.clamp(-16, 16) as i16);
+            }
+            _ => {}
         }
         self.generation = self.generation.wrapping_add(1);
     }
 
-    fn bind(&mut self, operation: Operation, chord: Chord) -> Result<(), String> {
+    fn update_keys(&mut self, op: Option<(Operation, Chord)>) -> Result<(), String> {
         let index = self.index();
         let row = &mut self.revision.map.rows[index];
-        let keys = row
-            .override_keys
-            .get_or_insert_with(|| row.defaults.clone());
-        match operation {
-            Operation::Add if keys.len() < 8 => {
+        let mut keys = row.keys().to_vec();
+        match op {
+            Some((Operation::Add, chord)) if keys.len() < 8 => {
                 self.chord = keys.len();
                 keys.push(chord);
             }
-            Operation::Add => return Err("At most eight shortcuts per command".into()),
-            Operation::Replace => {
+            Some((Operation::Add, _)) => return Err("At most eight shortcuts per command".into()),
+            Some((Operation::Replace, chord)) => {
                 *keys.get_mut(self.chord).ok_or("Select a shortcut first")? = chord;
             }
-            Operation::Scalar(_) => unreachable!(),
+            Some((Operation::Scalar(_), _)) => unreachable!(),
+            None if self.chord < keys.len() => {
+                keys.remove(self.chord);
+                self.chord = self.chord.min(keys.len().saturating_sub(1));
+            }
+            None => return Ok(()),
         }
-        self.validate();
+        row.override_keys = Some(keys);
+        self.revalidate();
         Ok(())
+    }
+
+    fn revalidate(&mut self) {
+        self.feedback = self.revision.map.revalidate().err();
+        self.generation = self.generation.wrapping_add(1);
+    }
+
+    fn accept_field(&mut self) -> Result<Page, String> {
+        match self.page {
+            Page::Edit(Operation::Scalar(scalar)) => {
+                let value = scalar
+                    .validate(self.field.parse().ok())
+                    .map_err(|_| format!("Enter a whole number from 1 to {}", scalar.maximum()))?;
+                if value != self.revision.values.get(scalar) {
+                    self.revision.values.set(scalar, Some(value));
+                }
+                Ok(Page::List)
+            }
+            Page::Edit(operation) => {
+                let chord = self.field.parse::<Chord>().map_err(str::to_owned)?;
+                self.update_keys(Some((operation, chord)))?;
+                Ok(Page::Binding)
+            }
+            Page::Preview(operation, chord) => {
+                self.update_keys(Some((operation, chord)))?;
+                Ok(Page::Binding)
+            }
+            _ => Ok(self.page),
+        }
+    }
+
+    fn focus(&self) -> Control {
+        use Button as B;
+        match self.page {
+            Page::List => Control::SettingsRow(self.selected),
+            Page::Edit(_) => Control::SettingsField,
+            Page::Confirm(_) => Control::SettingsButton(B::KeepEditing),
+            Page::Preview(..) => Control::SettingsButton(B::DiscardCapture),
+            Page::Binding => Control::SettingsButton(B::PreviousKey),
+            Page::Writing { .. } => Control::SettingsButton(B::CancelSave),
+            _ => Control::SettingsButton(B::Back),
+        }
     }
 }
 
 impl AppState {
     pub(super) fn open_settings(&mut self) {
-        if self.settings_ui.is_none() {
-            self.settings_ui = Some(Box::new(Draft::new(&self.settings)));
-        }
+        self.settings_saved = false;
+        let draft = self
+            .settings_ui
+            .get_or_insert_with(|| Box::new(Draft::new(&self.settings)));
         self.opener = self.opener.or(self.focus);
         self.help = false;
         self.modal = Some(Modal::Settings);
-        self.focus = Some(Control::SettingsButton(Button::Edit));
+        self.focus = Some(draft.focus());
         self.capture = None;
         self.field_paste = None;
         self.field_generation = self.field_generation.wrapping_add(1);
         self.dirty = true;
     }
 
-    fn close_settings(&mut self, preserve: bool) {
-        if !preserve {
-            self.settings_ui = None;
-        }
+    fn close_settings(&mut self) {
+        self.settings_ui = None;
         self.modal = None;
         self.focus = self.opener.take().or(Some(Control::Content));
         self.capture = None;
@@ -452,52 +535,47 @@ impl AppState {
         };
         match update {
             Update::ReadApplied
-                if !draft.changed()
-                    && matches!(
-                        draft.page,
-                        Page::List | Page::Binding | Page::Options | Page::Info
-                    ) =>
+                if !draft.dirty()
+                    && matches!(draft.page, Page::List | Page::Binding | Page::Info) =>
             {
+                let page = draft.page;
                 draft.reset(&self.settings);
+                self.switch_settings(page);
+            }
+            Update::WriteApplied if draft.page == (Page::Writing { exit: true }) => {
+                self.close_settings();
             }
             Update::WriteApplied => {
-                if matches!(self.modal, Some(Modal::Settings)) {
-                    draft.reset(&self.settings);
-                    draft.feedback = Some("Settings saved".into());
-                } else {
-                    self.settings_ui = None;
-                }
+                draft.reset(&self.settings);
+                self.switch_settings(Page::List);
             }
-            Update::Diagnostic if draft.page == Page::Writing => {
-                draft.page = Page::Options;
-                draft.generation = draft.generation.wrapping_add(1);
-                if matches!(self.modal, Some(Modal::Settings)) {
-                    self.focus = Some(Control::SettingsButton(Button::Info));
-                }
+            Update::Cancelled if matches!(draft.page, Page::Writing { .. }) => {
+                draft.feedback = Some("Settings save cancelled".into());
+                self.switch_settings(Page::List);
+            }
+            Update::Diagnostic if matches!(draft.page, Page::Writing { .. }) => {
+                self.switch_settings(Page::List);
             }
             _ => {}
         }
     }
 
-    fn switch_settings(&mut self, page: Page, focus: Control) {
+    fn switch_settings(&mut self, page: Page) {
         if let Some(draft) = self.settings_ui.as_mut() {
             draft.page = page;
             draft.generation = draft.generation.wrapping_add(1);
+            draft.field_action = None;
             if page == Page::Info {
                 draft.info_scroll = 0;
             }
+            self.focus = Some(draft.focus());
         }
-        self.focus = Some(focus);
         self.capture = None;
         self.field_generation = self.field_generation.wrapping_add(1);
         self.field_paste = None;
         self.field_submit = None;
         self.field_error = None;
         self.dirty = true;
-    }
-
-    fn settings_page(&mut self, page: Page, button: Button) {
-        self.switch_settings(page, Control::SettingsButton(button));
     }
 
     pub(super) fn settings_key(
@@ -513,7 +591,6 @@ impl AppState {
                 if key.kind == KeyEventKind::Release {
                     draft.blocked = None;
                 }
-                // Below the layout floor a dedicated Cancel still exits capture.
                 if layout.overlay.is_some() || command != Some(Command::Cancel) {
                     return None;
                 }
@@ -524,16 +601,16 @@ impl AppState {
         if let Page::Capture(operation) = draft.page {
             if layout.overlay.is_none() {
                 if command == Some(Command::Cancel) && key.kind == KeyEventKind::Press {
-                    self.switch_settings(Page::Edit(operation), Control::SettingsField);
+                    self.switch_settings(Page::Edit(operation));
                 }
                 return None;
             }
             if key.kind != KeyEventKind::Press {
                 return None;
             }
-            if let Some(chord) = Chord::delivered(key) {
+            if let Some(chord) = raw {
                 draft.blocked = Some(chord);
-                self.settings_page(Page::Preview(operation, chord), Button::Discard);
+                self.switch_settings(Page::Preview(operation, chord));
             } else {
                 draft.feedback = Some("Unsupported chord. Try typing it instead.".into());
                 self.dirty = true;
@@ -564,30 +641,54 @@ impl AppState {
         command: Command,
         layout: &LayoutSnapshot,
     ) -> Option<Intent> {
+        use Button as B;
         let draft = self.settings_ui.as_ref()?;
         if command == Command::Cancel {
-            if self.cancel_receiving_paste() {
-                return None;
+            if layout.overlay.is_some() && !self.cancel_receiving_paste() {
+                self.settings_back(layout);
             }
-            self.settings_back(layout);
             return None;
         }
-        layout.overlay?;
+        let area = layout.overlay?;
         let button = match command {
             Command::FocusNext | Command::FocusPrevious => {
-                self.focus = layout.next(self.focus, command == Command::FocusPrevious);
+                let backwards = command == Command::FocusPrevious;
+                self.focus = match self.focus {
+                    Some(Control::SettingsRow(_)) if !backwards => {
+                        Some(Control::SettingsButton(B::Save))
+                    }
+                    Some(Control::SettingsRow(_)) if backwards => {
+                        Some(Control::SettingsButton(B::Restore))
+                            .filter(|button| layout.contains(*button))
+                            .or(Some(Control::SettingsButton(B::Info)))
+                    }
+                    Some(Control::SettingsField) if draft.inline_scalar().is_some() => {
+                        Some(Control::SettingsButton(if backwards {
+                            B::Exit
+                        } else {
+                            B::Save
+                        }))
+                    }
+                    _ => match layout.next(self.focus, backwards) {
+                        Some(Control::SettingsRow(_)) if draft.inline_scalar().is_some() => {
+                            Some(Control::SettingsField)
+                        }
+                        Some(Control::SettingsRow(_)) => Some(Control::SettingsRow(draft.selected)),
+                        next => next,
+                    },
+                };
                 self.dirty = true;
                 return None;
             }
             Command::Move(movement, _) => {
-                let count = GENERAL_ROWS + draft.revision.map.rows.len();
+                let page = (area.height - 4) as isize;
                 let step = match movement {
                     Movement::Up | Movement::Left => -1,
                     Movement::Down | Movement::Right => 1,
-                    Movement::PageUp => -8,
-                    Movement::PageDown => 8,
-                    Movement::Home | Movement::Start => -(count as isize),
-                    Movement::End | Movement::Finish => count as isize,
+                    Movement::PageUp => -page,
+                    Movement::PageDown => page,
+                    Movement::Home | Movement::Start => -(draft.count() as isize),
+                    Movement::End | Movement::Finish => draft.count() as isize,
                 };
                 self.settings_adjacent(step);
                 return None;
@@ -602,29 +703,36 @@ impl AppState {
                 {
                     button
                 }
-                Some(Control::SettingsField) => Button::Accept,
+                Some(Control::SettingsRow(row)) if layout.contains(Control::SettingsRow(row)) => {
+                    self.settings_row(row, layout);
+                    return None;
+                }
+                Some(Control::SettingsField) => B::Accept,
                 _ => return None,
             },
-            Command::EditSetting | Command::SelectRow => Button::Edit,
-            Command::AddShortcut => Button::Add,
-            Command::ReplaceShortcut => Button::Replace,
-            Command::RemoveShortcut => Button::Remove,
-            Command::UseDefaults => Button::Defaults,
-            Command::CaptureShortcut => Button::Capture,
-            Command::AcceptSetting => Button::Accept,
-            Command::DiscardCapture => Button::Discard,
-            Command::KeepEditing => Button::KeepEditing,
-            Command::DiscardDraft
-                if self.focus == Some(Control::SettingsButton(Button::Confirm)) =>
-            {
-                Button::Confirm
-            }
-            Command::SettingsOptions => Button::Options,
-            Command::SettingsInfo => Button::Info,
-            Command::ReloadSettings => Button::Reload,
-            Command::SaveSettings => Button::Save,
-            Command::CancelSave => Button::CancelSave,
-            Command::RestoreDefaults => Button::Restore,
+            Command::EditSetting | Command::SelectRow => B::Edit,
+            Command::AddShortcut => B::Add,
+            Command::ReplaceShortcut => B::Replace,
+            Command::RemoveShortcut => B::Remove,
+            Command::UseDefaults => B::Defaults,
+            Command::CaptureShortcut => B::Capture,
+            Command::AcceptSetting => B::Accept,
+            Command::DiscardCapture => B::DiscardCapture,
+            Command::KeepEditing => B::KeepEditing,
+            Command::DiscardDraft => match (draft.page, self.focus) {
+                (
+                    Page::Confirm(Confirmation::Exit),
+                    Some(Control::SettingsButton(B::DiscardAndExit)),
+                ) => B::DiscardAndExit,
+                (Page::Confirm(_), Some(Control::SettingsButton(B::Discard))) => B::Discard,
+                (Page::Confirm(_), _) => return None,
+                _ => B::Discard,
+            },
+            Command::SettingsOptions | Command::SettingsInfo => B::Info,
+            Command::ReloadSettings => B::Reload,
+            Command::SaveSettings => B::Save,
+            Command::CancelSave => B::CancelSave,
+            Command::RestoreDefaults => B::Restore,
             _ => return None,
         };
         self.settings_button(button, layout);
@@ -634,8 +742,37 @@ impl AppState {
     pub(super) fn settings_adjacent(&mut self, delta: isize) {
         if let Some(draft) = self.settings_ui.as_deref_mut() {
             draft.adjacent(delta);
+            if draft.page == Page::List {
+                self.focus = Some(draft.focus());
+            }
             self.capture = None;
             self.dirty = true;
+        }
+    }
+
+    pub(super) fn settings_row(&mut self, row: usize, layout: &LayoutSnapshot) {
+        if let Some(draft) = self.settings_ui.as_deref_mut()
+            && layout.contains(Control::SettingsRow(row))
+        {
+            if let Some((selected, _)) = draft.inline_scalar() {
+                if selected == row || self.field_paste.is_some() {
+                    self.focus = Some(Control::SettingsField);
+                    return;
+                }
+                if let Err(error) = draft.accept_field() {
+                    draft.feedback = Some(error);
+                    self.focus = Some(Control::SettingsField);
+                    self.dirty = true;
+                    return;
+                }
+                draft.page = Page::List;
+            }
+            if draft.page != Page::List {
+                return;
+            }
+            draft.selected = row;
+            draft.chord = 0;
+            self.settings_button(Button::Edit, layout);
         }
     }
 
@@ -644,30 +781,29 @@ impl AppState {
             return;
         };
         match draft.page {
-            Page::List | Page::Options if !draft.changed() => self.close_settings(false),
-            Page::List | Page::Options if layout.overlay.is_some() => {
-                self.settings_page(Page::Confirm(Confirmation::Close), Button::KeepEditing);
+            Page::List if !draft.dirty() => self.close_settings(),
+            Page::List => self.settings_button(Button::Exit, layout),
+            Page::Binding | Page::Info | Page::Edit(Operation::Scalar(_)) => {
+                self.switch_settings(Page::List)
             }
-            Page::List | Page::Options => {}
-            Page::Binding => self.settings_page(Page::List, Button::Edit),
-            Page::Confirm(_) if layout.overlay.is_some() => {
-                self.settings_page(Page::List, Button::Edit)
-            }
-            Page::Confirm(_) => {}
-            Page::Info => self.settings_page(Page::Options, Button::Info),
-            Page::Edit(Operation::Scalar(_)) => self.settings_page(Page::List, Button::Edit),
-            Page::Edit(_) => self.settings_page(Page::Binding, Button::Add),
+            Page::Edit(_) => self.switch_settings(Page::Binding),
             Page::Capture(operation) | Page::Preview(operation, _) => {
-                self.switch_settings(Page::Edit(operation), Control::SettingsField);
+                self.switch_settings(Page::Edit(operation))
             }
-            Page::Writing => {
-                if self.settings.cancel_save() {
-                    self.settings_page(Page::Options, Button::Save);
-                } else if self.settings.save_state() == Some(SaveState::Finishing) {
-                    self.close_settings(true);
-                }
+            Page::Confirm(_) => self.switch_settings(draft.return_page),
+            Page::Writing { .. } => {
+                self.settings.cancel_save();
             }
         }
+    }
+
+    pub(super) fn finish_settings_field(&mut self, layout: &LayoutSnapshot) {
+        let button = self
+            .settings_ui
+            .as_mut()
+            .and_then(|draft| draft.field_action.take())
+            .unwrap_or(Button::Accept);
+        self.settings_button(button, layout);
     }
 
     pub(super) fn settings_button(&mut self, button: Button, layout: &LayoutSnapshot) {
@@ -677,179 +813,167 @@ impl AppState {
         };
         let writable = self.config_location.user_directory().is_some();
         let page = draft.page;
-        let visible = layout.contains(Control::SettingsButton(button));
+        let return_page = draft.return_page;
         let direct = match button {
-            B::Save | B::Reload | B::Restore => {
-                matches!(page, Page::List | Page::Binding | Page::Options)
-            }
+            B::Edit => page == Page::List,
+            B::Accept => draft.inline_scalar().is_some(),
+            B::Info | B::Reload | B::Restore => matches!(page, Page::List | Page::Binding),
             _ => false,
         };
-        if !visible && !direct {
+        if layout.overlay.is_none() || !layout.contains(Control::SettingsButton(button)) && !direct
+        {
             return;
         }
         if !writable
             && matches!(
                 button,
-                B::Add
-                    | B::Replace
-                    | B::Remove
-                    | B::Defaults
-                    | B::Save
-                    | B::Reload
-                    | B::Restore
-                    | B::Capture
+                B::Add | B::Replace | B::Remove | B::Defaults | B::Reload | B::Restore | B::Capture
             )
         {
             return;
         }
+        if matches!(button, B::Accept | B::Save | B::Exit)
+            && let Some(pending) = &mut self.field_paste
+        {
+            pending.submit = true;
+            draft.field_action = Some(button);
+            return;
+        }
         match button {
-            B::PreviousRow | B::PreviousKey => self.settings_adjacent(-1),
-            B::NextRow | B::NextKey => self.settings_adjacent(1),
-            B::Back if page == Page::Options => self.settings_page(Page::List, B::Edit),
-            B::Close | B::Back => self.settings_back(layout),
+            B::PreviousKey => self.settings_adjacent(-1),
+            B::NextKey => self.settings_adjacent(1),
+            B::Back | B::DiscardCapture => self.settings_back(layout),
             B::Edit => {
-                if draft.clipboard_row() {
-                    if writable {
-                        draft.revision.values.clipboard_override =
-                            Some(draft.revision.values.clipboard_mode().next());
-                        draft.validate();
-                        self.dirty = true;
-                    }
-                } else if let Some(scalar) = draft.scalar() {
+                if let Some(scalar) = Scalar::ALL.get(draft.selected).copied() {
                     if writable {
                         draft.field = draft.revision.values.get(scalar).to_string();
-                        self.switch_settings(
-                            Page::Edit(Operation::Scalar(scalar)),
-                            Control::SettingsField,
-                        );
+                        draft.feedback = None;
+                        self.switch_settings(Page::Edit(Operation::Scalar(scalar)));
+                    } else {
+                        draft.generation = draft.generation.wrapping_add(1);
+                        self.focus = Some(draft.focus());
+                        self.dirty = true;
                     }
                 } else {
-                    self.settings_page(Page::Binding, B::PreviousKey);
+                    self.switch_settings(Page::Binding);
                 }
             }
-            B::Options => {
-                let focus = if self.settings.base.is_some() {
-                    B::Save
-                } else if writable {
-                    B::Reload
-                } else {
-                    B::Info
-                };
-                self.settings_page(Page::Options, focus)
-            }
-            B::Info => self.settings_page(Page::Info, B::Back),
+            B::Info => self.switch_settings(Page::Info),
             B::Add | B::Replace => {
                 let operation = if button == B::Add {
+                    draft.field.clear();
                     Operation::Add
                 } else {
+                    draft.field =
+                        draft.revision.map.rows[draft.index()].keys()[draft.chord].to_string();
                     Operation::Replace
                 };
-                draft.field.clear();
                 draft.feedback = None;
-                self.switch_settings(Page::Edit(operation), Control::SettingsField);
+                self.switch_settings(Page::Edit(operation));
             }
-            B::Remove | B::Defaults => {
+            B::Remove => {
+                let _ = draft.update_keys(None);
+                self.focus = Some(draft.focus());
+                self.dirty = true;
+            }
+            B::Defaults => {
                 let index = draft.index();
-                let row = &mut draft.revision.map.rows[index];
-                if button == B::Remove {
-                    let keys = row
-                        .override_keys
-                        .get_or_insert_with(|| row.defaults.clone());
-                    if draft.chord < keys.len() {
-                        keys.remove(draft.chord);
-                        draft.chord = draft.chord.min(keys.len().saturating_sub(1));
-                    }
-                } else {
-                    row.override_keys = None;
-                    draft.chord = 0;
-                }
-                draft.validate();
+                draft.revision.map.rows[index].override_keys = None;
+                draft.chord = 0;
+                draft.revalidate();
+                self.focus = Some(draft.focus());
                 self.dirty = true;
             }
             B::Capture => {
                 if let Page::Edit(operation) = page {
                     draft.feedback = None;
-                    self.settings_page(Page::Capture(operation), B::Back);
+                    self.switch_settings(Page::Capture(operation));
                 }
             }
-            B::Discard => self.settings_back(layout),
-            B::KeepEditing => self.settings_page(Page::List, B::Edit),
-            B::Accept => {
-                if !matches!(page, Page::Edit(_) | Page::Preview(..)) {
-                    return;
-                }
-                if let Some(pending) = self.field_paste.as_mut() {
-                    pending.submit = true;
-                    return;
-                }
-                let result = match page {
-                    Page::Edit(Operation::Scalar(scalar)) => {
-                        scalar.validate(draft.field.parse().ok()).map(|value| {
-                            draft.revision.values.set(scalar, Some(value));
-                            draft.feedback = None;
-                        })
-                    }
-                    Page::Edit(operation) => draft
-                        .field
-                        .parse::<Chord>()
-                        .map_err(str::to_owned)
-                        .and_then(|chord| draft.bind(operation, chord)),
-                    Page::Preview(operation, chord) => draft.bind(operation, chord),
-                    _ => unreachable!(),
-                };
-                if let Err(error) = result {
+            B::Accept => match draft.accept_field() {
+                Ok(next) => self.switch_settings(next),
+                Err(error) => {
                     draft.feedback = Some(error);
+                    self.focus = Some(draft.focus());
                     self.dirty = true;
-                } else if matches!(page, Page::Edit(Operation::Scalar(_))) {
-                    self.settings_page(Page::List, B::Edit);
-                } else {
-                    self.settings_page(Page::Binding, B::Add);
                 }
-            }
+            },
             B::Restore => {
                 draft.revision = Revision::default();
                 draft.chord = 0;
-                draft.validate();
-                self.settings_page(Page::List, B::Edit);
+                draft.revalidate();
+                self.switch_settings(Page::List);
             }
-            B::Reload if draft.changed() => {
-                self.settings_page(Page::Confirm(Confirmation::Reload), B::KeepEditing)
+            B::Exit if !draft.dirty() => self.close_settings(),
+            B::Discard if !draft.dirty() && !matches!(page, Page::Confirm(_)) => {
+                draft.reset(&self.settings);
+                self.switch_settings(Page::List);
             }
-            B::Reload => {
+            B::Reload if !draft.dirty() => {
                 self.settings.reload();
-                self.settings_page(Page::List, B::Edit);
+                self.switch_settings(Page::List);
             }
-            B::Confirm => match page {
-                Page::Confirm(Confirmation::Close) => self.close_settings(false),
-                Page::Confirm(Confirmation::Reload) => {
-                    draft.reset(&self.settings);
+            B::KeepEditing => self.switch_settings(return_page),
+            B::DiscardAndExit => self.close_settings(),
+            B::Discard if matches!(page, Page::Confirm(_)) => {
+                if page == Page::Confirm(Confirmation::Reload) {
                     self.settings.reload();
-                    self.settings_page(Page::List, B::Edit);
                 }
-                _ => {}
-            },
-            B::Save => {
-                self.settings_saved = false;
-                let save = if let Some(error) = &draft.invalid {
-                    Err(error.clone())
-                } else if let Some(base) = draft.base.clone() {
-                    self.settings
-                        .save(&self.config_location, base, draft.revision.clone())
-                } else {
-                    Err("Reload a valid settings file before saving".into())
-                };
-                if let Err(error) = save {
-                    draft.feedback = Some(error);
-                    self.settings_page(Page::Options, B::Info);
-                } else {
-                    draft.feedback = None;
-                    self.settings_page(Page::Writing, B::CancelSave);
-                }
+                draft.reset(&self.settings);
+                self.switch_settings(Page::List);
             }
+            B::Exit | B::Discard | B::Reload => {
+                draft.return_page = page;
+                let confirmation = match button {
+                    B::Exit => Confirmation::Exit,
+                    B::Discard => Confirmation::Discard,
+                    _ => Confirmation::Reload,
+                };
+                self.switch_settings(Page::Confirm(confirmation));
+            }
+            B::Save | B::SaveAndExit => self.save_settings(button == B::SaveAndExit),
             B::CancelSave => {
-                if self.settings.cancel_save() {
-                    self.settings_page(Page::Options, B::Save);
+                self.settings.cancel_save();
+            }
+        }
+    }
+
+    /// Include typed edits in one draft, while a captured chord still requires explicit acceptance.
+    fn save_settings(&mut self, exit: bool) {
+        let Some(draft) = self.settings_ui.as_deref_mut() else {
+            return;
+        };
+        let page = if exit { draft.return_page } else { draft.page };
+        draft.page = page;
+        self.settings_saved = false;
+        let mut error_page = page;
+        let result = (|| {
+            if self.config_location.user_directory().is_none() {
+                return Err("Settings are read-only in this session".into());
+            }
+            match page {
+                Page::Preview(..) | Page::Capture(_) => {
+                    return Err("Accept or discard the captured shortcut first".into());
                 }
+                Page::Edit(_) => error_page = draft.accept_field()?,
+                _ => {}
+            }
+            draft.revision.map.revalidate()?;
+            let base = draft
+                .base
+                .clone()
+                .ok_or("Reload a valid settings file before saving")?;
+            self.settings
+                .save(&self.config_location, base, draft.revision.clone())
+        })();
+        match result {
+            Ok(()) => {
+                draft.feedback = None;
+                self.switch_settings(Page::Writing { exit });
+            }
+            Err(error) => {
+                draft.feedback = Some(error);
+                self.switch_settings(error_page);
             }
         }
     }
@@ -934,7 +1058,10 @@ mod tests {
             draft.page,
             Page::Preview(Operation::Add, "Escape".parse().unwrap())
         );
-        assert_eq!(app.focus, Some(Control::SettingsButton(Button::Discard)));
+        assert_eq!(
+            app.focus,
+            Some(Control::SettingsButton(Button::DiscardCapture))
+        );
         assert!(!draft.changed());
         app.input(escape(KeyEventKind::Release), &layout);
         app.input(escape(KeyEventKind::Press), &layout);
@@ -957,13 +1084,87 @@ mod tests {
     }
 
     #[test]
-    fn back_button_returns_from_options_to_list() {
+    fn back_button_returns_from_config_to_list() {
         let mut app = AppState::new();
         app.open_settings();
-        app.settings_ui.as_mut().unwrap().page = Page::Options;
+        app.settings_ui.as_mut().unwrap().page = Page::Info;
         let layout = LayoutSnapshot::for_app(Rect::new(0, 0, 40, 8), &app, 1);
         app.settings_button(Button::Back, &layout);
         assert!(matches!(app.modal, Some(Modal::Settings)));
         assert_eq!(app.settings_ui.as_ref().unwrap().page, Page::List);
+    }
+
+    /// Repeated legacy shortcuts cannot accept a discard while Keep Editing owns focus.
+    #[test]
+    fn remapped_discard_requires_focused_confirmation() {
+        let mut app = AppState::new();
+        app.settings
+            .applied
+            .map
+            .set_override(
+                Context::Settings,
+                "discard_draft",
+                vec!["F9".parse().unwrap()],
+            )
+            .unwrap();
+        app.settings.applied.map.revalidate().unwrap();
+        app.open_settings();
+        app.settings_ui
+            .as_mut()
+            .unwrap()
+            .revision
+            .values
+            .set(Scalar::Checkpoint, Some(31));
+        let area = Rect::new(0, 0, 40, 8);
+        let key = || Input::Key(KeyEvent::new(KeyCode::F(9), KeyModifiers::NONE));
+        let layout = LayoutSnapshot::for_app(area, &app, 1);
+        app.input(key(), &layout);
+        assert_eq!(
+            app.focus,
+            Some(Control::SettingsButton(Button::KeepEditing))
+        );
+        let layout = LayoutSnapshot::for_app(area, &app, 2);
+        app.input(key(), &layout);
+        assert_eq!(
+            app.settings_ui.as_ref().unwrap().page,
+            Page::Confirm(Confirmation::Discard)
+        );
+        assert_eq!(
+            app.settings_ui
+                .as_ref()
+                .unwrap()
+                .revision
+                .values
+                .get(Scalar::Checkpoint),
+            31
+        );
+        app.input(Input::Command(Command::FocusPrevious), &layout);
+        app.input(key(), &layout);
+        assert_eq!(app.settings_ui.as_ref().unwrap().page, Page::List);
+        assert_eq!(
+            app.settings_ui
+                .as_ref()
+                .unwrap()
+                .revision
+                .values
+                .get(Scalar::Checkpoint),
+            5
+        );
+    }
+
+    /// Exit protects typed input while a later capture is awaiting a key.
+    #[test]
+    fn capture_protects_pending_typed_shortcut() {
+        let mut app = AppState::new();
+        app.open_settings();
+        let draft = app.settings_ui.as_mut().unwrap();
+        draft.selected = GENERAL_ROWS;
+        draft.page = Page::Capture(Operation::Add);
+        draft.field = "F10".into();
+        let layout = LayoutSnapshot::for_app(Rect::new(0, 0, 40, 8), &app, 1);
+        app.settings_button(Button::Exit, &layout);
+        let draft = app.settings_ui.as_ref().unwrap();
+        assert_eq!(draft.page, Page::Confirm(Confirmation::Exit));
+        assert_eq!(draft.field, "F10");
     }
 }

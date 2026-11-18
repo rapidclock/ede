@@ -121,19 +121,25 @@ capture pauses capture for terminal-native selection; F2 gives a keyboard route
 to turn it back on. Native-selection modifiers depend on the terminal; use tmux's
 copy mode inside tmux.
 
-Choose **Internal**, **System**, or **Both** in the **Clipboard** row in
-Settings, then save. **Both** is the default.
+Click outside Actions to dismiss it while mouse capture is enabled. Click a
+tab name to switch or its × to close that tab. Each close uses the same save
+and discard checks as keyboard Close Tab. **Tabs** lists entries outside the header.
 
-- **Internal** keeps Copy and Cut in ede. Ctrl+V or a directly delivered Cmd+V
-  pastes from ede's private clipboard.
-- **System** sends Copy to the terminal's clipboard. Use the terminal's Paste
-  command. To Cut, switch to Internal or Both so ede can keep the removed text
-  recoverable even if the terminal does not update the clipboard.
-- **Both** keeps Copy and Cut in ede and also asks the terminal to update its
-  clipboard. Ctrl+V still pastes from ede.
+Copy retains the full selection for the session, including text outside the
+viewport. Copy and Cut use the desktop clipboard in an identified local GUI
+session. Cut waits for the desktop handoff before deleting the selection.
+Ctrl+V reads the current desktop clipboard on that route. Empty or unreadable
+clipboard data leaves the document intact.
 
-The terminal's Paste command works in every mode and sends system clipboard
-text through bracketed paste. Both paste paths
+SSH, tmux, other remote transports, and unidentified sessions send an OSC 52
+write and use ede's retained selection for Ctrl+V. Requests over 8,192 UTF-8 bytes
+are skipped, and the full selection remains available in ede. A sent request
+means the tty accepted the frame. The terminal decides whether to deliver it.
+The Ubuntu desktop route uses X11 CLIPBOARD through Xorg or through the GNOME
+Wayland session's Xwayland clipboard bridge.
+
+The terminal's own Paste command sends client text through bracketed paste.
+For example, on macOS Cmd+V typically belongs to the terminal. All paste paths
 support large contents using disk staging. A paste commits as one undoable edit
 or leaves the document unchanged on validation, staging, space, or pre-commit
 cancellation failure. Bytes within bracketed paste are always data, including
@@ -142,12 +148,10 @@ from another shell on the editor host to cancel reception. The reader discards
 the rest of that frame through its closing marker. Escape can cancel an admitted
 paste before it commits once the terminal has sent the closing marker.
 
-Set `clipboard.mode` to `"internal"`, `"system"`, or `"both"` in TOML.
-`--safe-config` uses Internal. Existing `copy_to_system = false` and `true`
-settings still mean Internal and Both, respectively. System copy requests
-use OSC 52 and are limited to 8 KiB. In Both, larger selections are still
-copied in full inside ede. **System copy sent | unconfirmed** means ede sent
-the request. The client controls whether it updates the clipboard.
+Set `clipboard.mode = "internal"` under `[clipboard]` to keep editor clipboard
+operations private. The legacy `copy_to_system = false` and `--safe-config`
+also select private operation. A missing setting, legacy `"system"` or
+`"both"`, or `copy_to_system = true` select automatic routing.
 
 For iTerm2, check its clipboard write permission. An intervening tmux server
 needs to accept writes from programs inside a pane and forward them to the
@@ -217,9 +221,6 @@ max_document_bytes = 20971520
 max_line_bytes = 65536
 parse_timeout_ms = 250
 
-[clipboard]
-mode = "both"
-
 [keybindings.global]
 save = ["Ctrl+S", "F9", "Cmd+S"]
 reload_settings = []
@@ -250,14 +251,19 @@ depend on terminal delivery. Legacy Ctrl+I is Tab, Ctrl+J and Ctrl+M are Enter,
 and byte 08 is Ctrl+H. A Backspace key must send DEL to work as Backspace on the
 legacy path. See [Cmd delivery](#cmd-delivery).
 
-Open **Actions → Settings** to browse the draft. Use the arrow keys or **Prev**
-and **Next** to select an entry. **Edit** opens the selected scalar or binding.
-Add or replace a chord by typing it or opening **Capture**. The preview starts
-with **Discard** focused. A mouse click on **Back** leaves capture. Keyboard
-users can press a different key and discard the preview. At smaller sizes the
-shown Cancel shortcut leaves obscured capture. **Options** contains **Save
-Settings**, **Reload Settings**, **Restore defaults**, and **Config info**.
-Restore defaults changes the draft. Save applies it to the running editor.
+Click **Settings** or press **F5**. **Actions → Settings** and keyboard focus
+also open it. Assigning F5 explicitly to another workspace command suppresses
+the inherited Settings shortcut until that conflict is removed. Explicit
+Settings bindings and unbindings take precedence.
+
+Scroll with the wheel, arrows, or Page Up and Page Down. Click a value or
+activate a focused row to edit it. Add or replace a chord by typing or by
+choosing **Capture** and accepting its preview. **Save** commits the current
+typed value with the draft. **Discard** restores the applied values.
+**Exit** closes the pane and offers Save and Exit, Discard and Exit, or Keep
+Editing when the draft has changes. **Config** shows the path and diagnostics.
+**Reload** reads the file and **Restore Defaults** drafts the bundled values,
+including removal of a clipboard opt-out. Changes apply when saved.
 
 Settings saves preserve unrelated TOML and comments. If the file changes
 externally, reload it before saving a new draft. Any noncooperating writer can
@@ -303,7 +309,7 @@ that a command starts unbound and is available when its surface permits it.
 | `global` | `retry_refresh` | — |
 | `global` | `save` | Ctrl+S / Cmd+S |
 | `global` | `save_as` | Shift+Cmd+S / F4 |
-| `global` | `settings` | — |
+| `global` | `settings` | F5 |
 | `global` | `suspend` | — |
 | `global` | `syntax_theme` | — |
 | `global` | `tab_details` | — |
