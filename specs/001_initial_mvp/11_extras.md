@@ -71,7 +71,7 @@ probe also passed when run explicitly.
 
 | ID | Evidence and remaining acceptance |
 | --- | --- |
-| E11-1 | **Partial.** The Ubuntu Wayland guest passed bidirectional Unicode and multi-MiB clipboard tests with real graphical apps, exact byte comparison, one-step Undo, and repeated reads after normal ede exit. Xvfb exercised X11 ownership, peer rejection, empty selection, Unicode/CRLF and incremental reads. Injected backend tests exercised empty and invalid text. Direct Apple Terminal and iTerm2 automation, the stock Ubuntu Xorg desktop, and the UTM sharing baseline remain open. |
+| E11-1 | **Partial.** The Ubuntu Wayland guest passed bidirectional Unicode and multi-MiB clipboard tests with real graphical apps, exact byte comparison, one-step Undo, and repeated reads after normal ede exit. UTM sharing passed a graphical baseline and byte-for-byte transfers between macOS and guest ede after the baseline. Xvfb exercised X11 ownership, peer rejection, empty selection, Unicode/CRLF and incremental reads. Injected backend tests exercised empty and invalid text. Direct Apple Terminal and iTerm2 automation and the stock Ubuntu Xorg desktop remain open. |
 | E11-2 | **Partial.** Real PTYs exercised OSC 52 framing, the 8,192-byte limit, retained 8,193-byte legacy System copies, terminal-owned bracketed paste, tty backpressure and signal restoration. Direct SSH and SSH with remote tmux 3.7b both produced the exact expected frame and saved exact retained bytes in another tab. A separate macOS tmux 3.8 session exercised retained Copy/Paste and suspension. Actual GUI client delivery and physical shortcut handling in both Mac terminals, and Windows Terminal with WSL and Notepad, remain open. |
 | E11-3 | **Partial.** Controlled tests exercised failed-write ordering, stale reads, superseding Copy, revocation after handoff and at storage commit, injected deletion failure, suspension waiting for a helper, and opt-out reload. The tests checked retained bytes, revision, selection and undo. PTYs confirmed cross-tab Cut and Paste with one Undo under the explicit opt-out and safe configuration. SSH still used the terminal route with matching guest display variables inherited. The alternate local-seat case and a full-disk native transfer still need validation. |
 | E11-4 | **Partial.** Real PTYs covered outside clicks over Quit, Settings and a tab close at the supported floor and regular size, popup border and crossing drags, and preservation of the active view. The full pointer case matrix remains open. |
@@ -90,8 +90,19 @@ file. ede saved the alternate marker exactly, and one Undo restored the
 original bytes. A 3,538,949-byte selection copied to the guest desktop and a
 3,407,877-byte selection pasted from Text Editor matched exactly. One Undo
 also restored the original large document. Two desktop reads after normal
-ede exit both matched the original small marker. The Mac locked before the
-separate host–guest sharing baseline was run.
+ede exit both matched the original small marker.
+
+**UTM clipboard sharing evidence.** UTM 5.0.8 had clipboard sharing enabled
+and the same Ubuntu Wayland guest ran `spice-vdagent` 0.23.0-4. The graphical
+baseline used distinct multiline Unicode markers in Sublime Text build 4215
+on macOS and Ubuntu Text Editor 50.1 in the guest. A guest copy appeared in
+the Mac editor. A fresh Mac copy reached the guest clipboard byte for byte
+and pasted into Ubuntu Text Editor, which added a trailing newline on save.
+In the Stage 11 test, Ctrl+V replaced a disposable ede buffer with the Mac
+marker and the saved file matched exactly. Ctrl+C in a second ede tab
+reported desktop copy success. After Ctrl+Q, Cmd+V on the Mac produced a
+35-byte file identical to the guest source, including its line break and
+Unicode character.
 
 **SSH evidence.** macOS OpenSSH used a real `xterm-256color` PTY to Ubuntu
 26.10. The remote command inherited the guest's Wayland and X11 display
