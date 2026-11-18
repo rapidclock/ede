@@ -1,7 +1,7 @@
 //! Keyboard- and mouse-operable editing of one settings revision and its disk base.
 
 use super::*;
-use crate::settings::{Base, Chord, Revision, SaveState, Scalar, Update};
+use crate::settings::{Base, Chord, ClipboardMode, Revision, SaveState, Scalar, Update};
 
 const GENERAL_ROWS: usize = Scalar::ALL.len() + 1;
 
@@ -136,16 +136,16 @@ impl Draft {
         self.original != self.revision
     }
 
-    fn row_label(&self) -> String {
+    fn row_label(&self, safe: bool) -> String {
         if let Some(scalar) = self.scalar() {
             format!("{} {}", scalar.label(), self.revision.values.get(scalar))
         } else if self.clipboard_row() {
-            let state = if self.revision.values.copy_to_system() {
-                "On"
+            let mode = if safe {
+                ClipboardMode::Internal
             } else {
-                "Off"
+                self.revision.values.clipboard_mode()
             };
-            format!("Copy to system clipboard [{state}]")
+            format!("Clipboard [{}]", mode.label())
         } else {
             self.revision.map.rows[self.index()].identifier()
         }
@@ -153,7 +153,7 @@ impl Draft {
 
     fn detail(&self) -> String {
         if self.clipboard_row() {
-            return "Edit toggles • default Off".into();
+            return "Edit cycles modes • default Both".into();
         }
         if let Some(scalar) = self.scalar() {
             return format!(
@@ -268,9 +268,9 @@ impl Draft {
                         GENERAL_ROWS + self.revision.map.rows.len()
                     ),
                 ),
-                (2, self.row_label()),
+                (2, self.row_label(location.safe())),
             ],
-            Page::Binding => vec![(0, self.row_label()), (1, self.detail())],
+            Page::Binding => vec![(0, self.row_label(location.safe())), (1, self.detail())],
             Page::Edit(op) => vec![
                 (
                     0,
@@ -710,8 +710,8 @@ impl AppState {
             B::Edit => {
                 if draft.clipboard_row() {
                     if writable {
-                        draft.revision.values.system_clipboard_override =
-                            Some(!draft.revision.values.copy_to_system());
+                        draft.revision.values.clipboard_override =
+                            Some(draft.revision.values.clipboard_mode().next());
                         draft.validate();
                         self.dirty = true;
                     }

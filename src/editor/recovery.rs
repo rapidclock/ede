@@ -1392,6 +1392,7 @@ pub(super) mod tests {
         worker
             .action(Action::Clipboard {
                 cut: true,
+                internal: true,
                 system: Some(1),
             })
             .unwrap();

@@ -14,7 +14,7 @@ mod values;
 pub(crate) use file::Base;
 pub(crate) use keys::{Chord, Context};
 pub(crate) use service::{SaveState, Service, Update};
-pub(crate) use values::{Scalar, SyntaxLimits, Values};
+pub(crate) use values::{ClipboardMode, Scalar, SyntaxLimits, Values};
 
 /// An indivisible set of effective settings plus the explicit overrides used by the UI.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -117,6 +117,7 @@ mod tests {
                 std::thread::yield_now();
             }
         };
+        apply(&mut app, false);
         let disabled_dispatch = app.system_clipboard_epoch();
         apply(&mut app, true);
         let enabled_dispatch = app.system_clipboard_epoch();

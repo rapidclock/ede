@@ -419,7 +419,9 @@ fn deliver_clipboard(
 ) -> ClipboardWrite {
     if app.system_clipboard_epoch() != Some(transfer.epoch) {
         if Some(transfer.sequence) == app.screen.clipboard_sequence {
-            let message = if transfer.cut {
+            let message = if !transfer.internal {
+                "System copy cancelled"
+            } else if transfer.cut {
                 "Cut internally | system request revoked"
             } else {
                 "Copied internally | system revoked"
@@ -430,7 +432,8 @@ fn deliver_clipboard(
     }
     let outcome = host.clipboard(&transfer);
     let message = match outcome {
-        ClipboardWrite::Sent => "Clipboard request sent",
+        ClipboardWrite::Sent => "System copy sent | unconfirmed",
+        ClipboardWrite::Unavailable if !transfer.internal => "System clipboard write failed",
         ClipboardWrite::Unavailable if transfer.cut => "Cut internally | system write failed",
         ClipboardWrite::Unavailable => "Copied internally | system write failed",
         ClipboardWrite::Lost => return outcome,
@@ -808,7 +811,7 @@ mod tests {
         };
         let mut host = Fake::new(Vec::new());
         let mut app = AppState::new();
-        app.settings.applied.values.system_clipboard_override = Some(true);
+        app.settings.applied.values.clipboard_override = Some(crate::settings::ClipboardMode::Both);
         let epoch = app.system_clipboard_epoch();
 
         assert!(editor.submit(Action::New));
@@ -817,6 +820,7 @@ mod tests {
         assert!(editor.submit(Action::Command(Command::SelectAll)));
         assert!(editor.submit(Action::Clipboard {
             cut: false,
+            internal: true,
             system: epoch
         }));
         let old_screen = ack(&editor);
@@ -834,6 +838,7 @@ mod tests {
         assert!(editor.submit(Action::Command(Command::SelectAll)));
         assert!(editor.submit(Action::Clipboard {
             cut: false,
+            internal: true,
             system: epoch
         }));
         let new_screen = ack(&editor);
@@ -852,7 +857,7 @@ mod tests {
     fn clipboard_feedback_survives_newer_layout_ack() {
         let mut host = Fake::new(Vec::new());
         let mut app = AppState::new();
-        app.settings.applied.values.system_clipboard_override = Some(true);
+        app.settings.applied.values.clipboard_override = Some(crate::settings::ClipboardMode::Both);
         let mut copied = app.screen.clone();
         copied.message = crate::editor::COPIED_INTERNALLY.into();
         copied.acknowledged = 12;
@@ -861,6 +866,7 @@ mod tests {
         let transfer = ClipboardTransfer {
             epoch: app.system_clipboard_epoch().unwrap(),
             cut: false,
+            internal: true,
             sequence: 11,
             frame: b"test frame".to_vec(),
             generation: 0,
@@ -871,14 +877,14 @@ mod tests {
             ClipboardWrite::Sent
         );
         assert_eq!(host.clipboard_frames, [b"test frame".to_vec()]);
-        assert_eq!(app.status.text(), "Clipboard request sent");
+        assert_eq!(app.status.text(), "System copy sent | unconfirmed");
         let mut resized = app.screen.clone();
         resized.acknowledged += 1;
         app.update(resized.clone(), false);
-        assert_eq!(app.status.text(), "Clipboard request sent");
+        assert_eq!(app.status.text(), "System copy sent | unconfirmed");
         resized.clipboard_sequence = Some(12);
         app.update(resized, false);
-        app.report_clipboard(11, "Clipboard request sent");
+        app.report_clipboard(11, "System copy sent | unconfirmed");
         assert_eq!(app.status.text(), crate::editor::COPIED_INTERNALLY);
     }
 
@@ -891,19 +897,21 @@ mod tests {
         copied.message = crate::editor::COPIED_INTERNALLY.into();
         copied.clipboard_sequence = Some(0);
         app.update(copied.clone(), false);
-        app.settings.applied.values.system_clipboard_override = Some(true);
+        app.settings.applied.values.clipboard_override = Some(crate::settings::ClipboardMode::Both);
         let epoch = app.system_clipboard_epoch().unwrap();
         let transfer = ClipboardTransfer {
             epoch,
             cut: false,
+            internal: true,
             sequence: 0,
             frame: b"pending".to_vec(),
             generation: 0,
             authority: std::sync::Arc::default(),
         };
-        app.settings.applied.values.system_clipboard_override = Some(false);
+        app.settings.applied.values.clipboard_override =
+            Some(crate::settings::ClipboardMode::Internal);
         app.revoke_clipboard();
-        app.settings.applied.values.system_clipboard_override = Some(true);
+        app.settings.applied.values.clipboard_override = Some(crate::settings::ClipboardMode::Both);
         assert_eq!(
             deliver_clipboard(&mut host, &mut app, transfer),
             ClipboardWrite::Unavailable
@@ -916,6 +924,7 @@ mod tests {
         let transfer = ClipboardTransfer {
             epoch: app.system_clipboard_epoch().unwrap(),
             cut: false,
+            internal: true,
             sequence: 0,
             frame: b"new".to_vec(),
             generation: 0,
@@ -942,6 +951,7 @@ mod tests {
         let transfer = ClipboardTransfer {
             epoch: app.system_clipboard_epoch().unwrap(),
             cut: false,
+            internal: true,
             sequence: 0,
             frame: b"still delivered".to_vec(),
             generation: 0,

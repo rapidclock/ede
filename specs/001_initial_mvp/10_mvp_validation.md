@@ -33,42 +33,48 @@ manual check leaves it open for Stage 10.
 
 The user reported that Copy in ede on Ubuntu left the Mac clipboard unchanged,
 both through their tmux pane and in Terminal.app over direct SSH. They proposed
-a Settings toggle to keep both clipboard workflows. They also reported that
+a Settings choice to keep both clipboard workflows. They also reported that
 physical Cmd shortcuts invoked Mac or terminal actions, including a dialog to
 export terminal output on Cmd+S. Stage 10 covers the clipboard and UI changes
 below and verifies the existing Cmd requirement at the end.
 
 ### Clipboard setting and client paste
 
-Stage 03 defines a private clipboard per running ede process. Add a
-**Copy to system clipboard** toggle to Settings. In `config.toml`, use the
-optional boolean `clipboard.copy_to_system` under `[clipboard]`. Omission,
-Restore Defaults, and `--safe-config` select `false`. Apply changes through the
-existing save/reload revision path and retain the last good revision on an
-invalid reload. An existing config needs no migration.
+Stage 03 defines a private clipboard per running ede process. Settings offers
+**Internal**, **System**, and **Both**. In `config.toml`, use `clipboard.mode`
+under `[clipboard]` with `"internal"`, `"system"`, or `"both"`. Omission and
+Restore Defaults select Both. `--safe-config` always uses Internal. Legacy
+`copy_to_system = false` means Internal and `true` means Both. A config may
+specify one key. Apply changes through the existing save/reload revision path
+and retain the last good revision on an invalid reload.
 
-- In either mode, explicit Copy and committed Cut populate ede's private
-  clipboard. `Ctrl+V` continues to paste that clipboard. The terminal's Paste
-  action supplies system clipboard text through normal terminal input. A
-  delivered Cmd+V shortcut continues to invoke ede's Paste command. If the
-  terminal handles Cmd+V itself, insert the received text once.
-- With the applied setting enabled at command dispatch and at output admission,
-  also send the captured text using one OSC 52 clipboard write. Do this only
-  after internal Copy succeeds or the Cut deletion commits. The destination is
+- **Internal** and **Both** retain explicit Copy and committed Cut in ede's
+  private clipboard. `Ctrl+V` and a directly delivered Cmd+V paste those bytes.
+- **System** copies only to the terminal. An existing private copy stays
+  available when switching back to Internal or Both. Ede's Paste shortcut
+  directs the user to the terminal Paste command. Cut leaves the document
+  intact and asks the user to switch to Internal or Both because a terminal
+  write cannot confirm that the cut text is recoverable.
+- In every mode, the terminal's Paste action supplies system clipboard text
+  through terminal input. If the terminal handles Cmd+V itself, insert the
+  received text once.
+- In System and Both, admit one OSC 52 clipboard write for a completed Copy or
+  eligible, committed Cut when the captured mode is still current. The destination is
   the client terminal's system clipboard, including when ede runs remotely.
   Use only the write operation. Reading system clipboard contents is outside
   this integration.
 - Limit outgoing selections to 8 KiB of UTF-8. Check exact round trips up to
   that limit on each supported path.
-  Leave larger selections available internally and report the reason they
-  were kept internal. Send one bounded base64 payload with terminal framing.
+  In Both, leave larger selections available internally and explain the
+  limit. In System, report that the selection was not copied. Send one bounded
+  base64 payload with terminal framing.
   Keep spool reads off the UI thread and serialize the frame with other tty
   output. Never emit raw selection bytes as terminal commands or write the
   sequence to redirected document output.
 - No selection, failed Copy, and failed or cancelled Cut send no clipboard
   write. A successful Cut whose external write fails leaves all cut text in
   the internal clipboard. Before transmission, retire a pending write if
-  overtaken by a newer successful Copy or Cut, a change back to internal-only,
+  overtaken by a newer completed Copy or Cut, a clipboard mode change,
   or terminal suspension or teardown. Re-enabling starts with future commands
   and cannot revive an older write. Serialize accepted writes so older data
   cannot follow a newer write.
@@ -79,10 +85,11 @@ invalid reload. An existing config needs no migration.
   indefinitely. Recoverable write failures preserve the internal clipboard and
   committed Cut state. A lost tty follows the existing interrupted-session
   recovery rules.
-- Report **Copied internally** or **Cut to internal clipboard** when no write
-  is sent. Include the reason when the requested write was skipped or failed.
-  When the frame has been sent, report that a system clipboard request was
-  sent. A successful tty write cannot confirm the client accepted it.
+- Report **Copied internally** or **Cut internally** when a private copy was
+  saved without a system write. Include the reason when the requested write
+  was skipped or failed. In System mode, report why a failed copy did not send.
+  When the frame has been sent, report **System copy sent | unconfirmed**.
+  A successful tty write cannot confirm the client accepted it.
 
 Document the terminal's clipboard write permission and tmux forwarding
 requirements for setups that pass. A tmux copy-mode selection reaching the Mac
@@ -277,11 +284,13 @@ catalog.
 
 [Stage 09 settings](09_configuration_and_keybindings.md#acceptance-criteria)
 
-### V08 — System clipboard toggle (FR-03 and FR-09)
+### V08 — Clipboard modes (FR-03 and FR-09)
 
-Use a disposable config to toggle, save, relaunch, reload, and restore defaults.
-Verify a changed or reset draft takes effect only after save. Test a malformed
-value and safe startup. A real PTY must emit no OSC 52 write in internal-only
+Use a disposable config to cycle and save modes, relaunch, reload, and restore
+Both. Verify a changed or reset draft takes effect only after save. Test a
+malformed value, the legacy booleans, and safe startup. Verify that a System
+copy doesn't replace existing private text, the terminal Paste action still
+works, and a blocked Cut emits no frame or deletion. A real PTY must emit no OSC 52 write in Internal
 mode, on an empty selection, or after a failed Copy or Cut. In enabled mode
 decode the frame and compare the bytes with a selection containing a wide
 character and newline. Check internal-only, request-sent, and skipped or
@@ -292,8 +301,8 @@ transmission and verify internal Paste still recovers the text. Inject failure
 after the OSC introducer and verify abort/recovery or terminal-loss handling
 before unrelated output. Exercise the
 payload limit at and above the boundary. Use controlled ordering to complete
-a Copy started while disabled after enabling the toggle. Then hold an enabled
-Copy while disabling and re-enabling. Neither held command may send a frame.
+a Copy started in Internal after selecting Both. Then hold a Both Copy while
+switching to Internal and back. Neither held command may send a frame.
 Exercise pending-write revocation on newer Copy and suspension. Run the client
 clipboard sequence below with the actual frontend and tmux/SSH path.
 
@@ -397,9 +406,9 @@ interruption. A version tested on one path establishes evidence for that path.
    Terminal.app over direct SSH to Ubuntu and in iTerm2 over direct SSH and
    through the reported tmux topology. Include an iTerm2 local baseline.
    Use distinct markers for the existing macOS clipboard and the selection
-   in ede. In internal-only mode, paste into a Mac GUI app to verify its old
-   clipboard and use Ctrl+V in ede to verify the new internal copy. With the
-   toggle enabled, verify exact pasted text in the Mac app on a supported
+   in ede. In Internal mode, paste into a Mac GUI app to verify its old
+   clipboard and use Ctrl+V in ede to verify the new internal copy. In Both,
+   verify exact pasted text in the Mac app on a supported
    direct SSH path and a supported tmux path, including a committed Cut and
    a selection at the documented limit. Use the terminal Paste action to
    send a new Mac marker to ede and verify that it inserts once. Where the
@@ -576,7 +585,7 @@ shortcuts in the earlier terminal checks with enhancements disabled.
 | MVP-03 | B10-1 through B10-4 have results with measured latency, memory and disk behavior. The 1 GiB / 8 GiB baseline and larger-than-RAM runs are evidenced independently. Missed goals or exceeded budgets are fixed and rechecked or resolved by user-approved requirement changes. |
 | MVP-04 | Native locked checks, opted-in regressions, and independent review for the candidate are recorded. Required failure and controlled ordering evidence is present. |
 | MVP-05 | A fresh source build and documented workflows work as described, and Cargo metadata, the executable and README agree on `0.0.1`. The validation record states supported paths, observed limitations, and approved dispositions. |
-| MVP-06 | Record candidate evidence for V08, V09, and the client clipboard sequence. The README covers the clipboard toggle, its default, tested paths, and fallbacks. |
+| MVP-06 | Record candidate evidence for V08, V09, and the client clipboard sequence. The README covers clipboard modes, the default, tested paths, and fallbacks. |
 
 ## Validation record
 
@@ -646,19 +655,73 @@ transport matrix remains open.
 
 | Row | Result |
 | --- | --- |
-| T10-1 and T10-2 | **Blocked** pending iTerm2 3.7.7 frontend and physical Cmd evidence. Native PTY and isolated local tmux input and suspension passed on macOS. |
+| T10-1 | **Partial**. Manual local iTerm2 copy and paste passed on retry as recorded below. The remaining base sequence and physical Cmd checks are open. |
+| T10-2 | **Partial**. Native PTY and isolated local tmux input and suspension passed on macOS. iTerm2 with local tmux and the physical Cmd checks are open. |
 | T10-3 | **Partial**. XTerm 379 under Xvfb on Debian copied the marker into the X11 system clipboard, resized, saved exact bytes with Ctrl+S and restored `stty -g` on Quit. The remaining base sequence is open. |
 | T10-4 | **Partial**. XTerm 379 with tmux 3.3a forwarded the exact marker to X11 PRIMARY with `set-clipboard on` and `xterm*:clipboard`. CLIPBOARD retained its previous value. Internal Ctrl+V worked, native tmux copy mode retained the exact marker in its buffer, and resize, Ctrl+S, exact saved bytes and tty restoration passed. The remainder of the graphical sequence is open. |
-| T10-5 | **Partial**. OpenSSH 10.5p1 on macOS allocated an Ubuntu PTY. Exact OSC 52 bytes crossed SSH. Ctrl+S saved exact bytes and Quit restored terminal modes. Killing a separate SSH client retired its editor. A fresh 96×32 PTY retained the last saved named-file bytes and reopened the last acknowledged scratch checkpoint, then restored its original termios on exit. Mac GUI paste and the full base sequence are open. |
-| T10-6 | **Partial**. Isolated remote tmux 3.7b forwarded the OSC 52 payload with `set-clipboard on` and `xterm*:clipboard`. A fresh SSH connection reattached at 96×32, retained the unsaved marker, saved exact bytes and restored the inner tty. Mac GUI paste and remaining base and tmux actions are open. |
+| T10-5 | **Partial**. OpenSSH 10.5p1 on macOS allocated an Ubuntu PTY. Exact OSC 52 bytes crossed SSH. Ctrl+S saved exact bytes and Quit restored terminal modes. Killing a separate SSH client retired its editor. A fresh 96×32 PTY retained the last saved named-file bytes and reopened the last acknowledged scratch checkpoint, then restored its original termios on exit. Manual clipboard results by client are below. The remaining base sequence is open. |
+| T10-6 | **Partial**. Isolated remote tmux 3.7b forwarded the OSC 52 payload with `set-clipboard on` and `xterm*:clipboard`. A fresh SSH connection reattached at 96×32, retained the unsaved marker, saved exact bytes and restored the inner tty. Manual iTerm2 clipboard checks passed as recorded below. The remaining base and tmux actions are open. |
 | T10-7 and T10-8 | **Partial**. Mosh 1.4.0 on macOS arm64 and Ubuntu arm64 resumed after a 12 s bidirectional UDP drop in an isolated loopback relay, both directly and through isolated tmux 3.7b. The client PTY changed from 80×24 to 96×32 during the interruption. The same editor retained the unsaved marker, accepted bracketed paste, saved exact bytes and restored the inner tty. Graphical frontend and remaining base actions are open. |
 | T10-9 and T10-10 | **Partial**. Eternal Terminal 7.1.1 on macOS arm64 used a checksum-verified Debian arm64 server package on Ubuntu after the Ubuntu package endpoint returned HTTP 503. The server and TCP relay were loopback-only, bridged by an isolated SSH tunnel. After a 12 s TCP disconnect and resize from 80×24 to 96×32, both the direct and remote tmux 3.7b paths retained unsaved text, accepted bracketed paste, saved exact bytes and restored the inner tty. Graphical frontend and remaining base actions are open. |
 
-Mac GUI clipboard and the final Cmd check remain open. Computer Use denied
-access to Terminal.app 2.15 and iTerm2 3.7.7. Physical Cmd delivery, Mac
-application paste and the per-path maximum clipboard payload require frontend
-evidence. A disposable clipboard fixture launched and exited cleanly through
-local macOS, direct SSH, and SSH with isolated remote tmux in the PTY harness.
+Manual Mac clipboard checks used the disposable fixture with system clipboard
+copy enabled. These results cover copy and paste only.
+
+| Path | Observed result |
+| --- | --- |
+| iTerm2 → local macOS, no tmux | Copy to TextEdit and paste from TextEdit via iTerm2 Edit → Paste passed on retry. The first copy attempt left the launcher command on the Mac clipboard. Cause unknown. |
+| iTerm2 → direct SSH → Ubuntu | Copy to TextEdit and paste from TextEdit passed. |
+| iTerm2 → SSH → isolated tmux on Ubuntu | Copy to TextEdit and paste from TextEdit passed. |
+| Apple Terminal → direct SSH → Ubuntu | **Copy to Mac failed.** ede showed `Clipboard request sent`, but TextEdit pasted the previous launcher command. Paste from TextEdit into ede passed via both Cmd+V and Edit → Paste. |
+
+A standalone OSC 52 write in the local Apple Terminal shell also failed to
+replace the Mac clipboard. This reproduced the failure without ede, SSH or
+tmux. An initial mouse-copy attempt with the local fixture rang the bell on
+Cmd+C and left the previous launcher command on the clipboard. After disabling
+Apple Terminal's Allow Mouse Reporting, mouse selection and Cmd+C copied the
+visible `ede-stage10-copy-界` text to TextEdit. The existing ede selection
+highlight remained visible in Terminal, and the pasted text retained the
+background color. Terminal's Copy Plain Text shortcut (Option+Shift+Cmd+C)
+passed locally without carrying over the background. The user also confirmed
+copy and paste with Cmd+C and Cmd+V using Terminal selection. With mouse
+reporting disabled, clicking ede's Quit button stopped working; re-enable
+reporting to restore editor mouse input, or use Ctrl+Q to quit. The editor's
+Ctrl+C failure remains open. Investigate whether Apple Terminal supports a way
+for a remote application to set the Mac clipboard. Apple's Terminal guide
+documents terminal selection and copy shortcuts but no application clipboard
+write setting. The README documents the verified mouse-copy fallback. Any MVP
+exception for direct editor copy requires explicit acceptance. The
+intermittent local iTerm2 failure also remains open.
+
+The user found it confusing that ede's Ctrl+V uses its internal clipboard
+while the terminal's Paste command uses the Mac clipboard. They approved the
+three clipboard modes above, with Both as the default.
+
+Physical Cmd shortcut checks, maximum clipboard payload by path and the
+remaining frontend workflows are still open.
+
+The follow-up changes the status shown after OSC 52 transmission to
+`System copy sent | unconfirmed`. The focused PTY test first failed on the
+old status and then passed with the new wording and the same UTF-8 frame.
+The paced-reader PTY test also passed with the new wording. Native macOS
+validation with an isolated config passed all 334 enabled tests. Formatting
+and Clippy passed. The README
+documents the existing F2 Actions mouse capture toggle as an alternative
+to changing the Terminal setting.
+
+The V08 clipboard mode follow-up first failed the default Both PTY check
+because the prior default sent no frame. It then passed with an exact frame
+and a private paste. The same PTY saved System and Internal through Settings,
+verified that System Copy left the prior private text available after returning
+to Internal, and exercised terminal Paste, the System Cut guard, and
+`--safe-config`. A separate PTY verified System's 8 KiB rejection and no
+frame for an oversized selection. Parser tests cover all modes, malformed
+values, conflicting keys, and legacy compatibility. An isolated deliberate
+break in the System Cut guard failed the intended assertion and showed the
+deleted text was no longer in the document. The independent reviewer
+rechecked the spool retention, oversized selection preflight, and footer
+fixes. Full native macOS validation passed 336 enabled tests with ten ignored.
+Formatting and Clippy passed. The Apple Terminal OSC 52 failure remains open.
 
 ### Performance and resources
 

@@ -1982,7 +1982,7 @@ fn enabled_system_copy_sends_terminal_clipboard_request() {
     process.expect_status("Ready");
     process.send(b"\x01\x03");
     process.expect_raw("\x1b]52;c;55WMCno=\x1b\\");
-    process.expect_status("Clipboard request sent");
+    process.expect_status("System copy sent | unconfirmed");
     process.send(b"\x11");
     assert!(process.wait().success());
     process.assert_restored();
@@ -2036,7 +2036,7 @@ fn maximum_clipboard_frame_survives_a_paced_terminal_reader() {
     process.output.extend_from_slice(&prefix);
     let payload = base64::engine::general_purpose::STANDARD.encode(&bytes);
     process.expect_raw(&format!("\x1b]52;c;{payload}\x1b\\"));
-    process.expect_status("Clipboard request sent");
+    process.expect_status("System copy sent | unconfirmed");
     process.send(b"\x16\x13");
     process.expect_status("Saved");
     assert_eq!(std::fs::read(file).unwrap(), bytes);
@@ -2134,6 +2134,35 @@ fn oversized_system_copy_is_internal_and_round_trips() {
     process.assert_restored();
 }
 
+/// System-only Copy rejects oversized text without sending an OSC 52 frame.
+#[test]
+fn oversized_system_only_copy_reports_failure() {
+    let directory = tempfile::tempdir().unwrap();
+    let config = directory.path().join("ede");
+    std::fs::create_dir(&config).unwrap();
+    std::fs::write(
+        config.join("config.toml"),
+        "[clipboard]\nmode = \"system\"\n",
+    )
+    .unwrap();
+    let file = directory.path().join("clip.txt");
+    std::fs::write(&file, "x".repeat(8193)).unwrap();
+    let mut process = PtyChild::editor_with_options(
+        Some("xterm-256color"),
+        [&file],
+        None,
+        Some(directory.path()),
+        None,
+    );
+    process.expect_status("Ready");
+    process.send(b"\x01\x03");
+    process.expect_status("Copy failed | system limit 8 KiB");
+    assert!(!process.output.windows(5).any(|bytes| bytes == b"\x1b]52;"));
+    process.send(b"\x11");
+    assert!(process.wait().success());
+    process.assert_restored();
+}
+
 /// Active stdin can copy by way of the controlling terminal, while Cut stays read-only.
 #[test]
 fn system_clipboard_uses_the_separate_tty_during_a_pipe() {
@@ -2162,7 +2191,7 @@ fn system_clipboard_uses_the_separate_tty_during_a_pipe() {
     process.assert_restored();
 }
 
-/// Apply the clipboard toggle only through saved Settings and default it off in safe mode.
+/// Apply clipboard modes through saved Settings while keeping safe mode internal.
 #[test]
 fn system_clipboard_settings_saves_and_safe_config_uses_internal_copy() {
     let directory = tempfile::tempdir().unwrap();
@@ -2181,18 +2210,24 @@ fn system_clipboard_settings_saves_and_safe_config_uses_internal_copy() {
     );
     process.expect_status("Ready");
     process.send(b"\x01\x03");
-    process.expect_status("Copied internally");
-    assert!(!process.output.windows(5).any(|bytes| bytes == b"\x1b]52;"));
+    process.expect_raw("\x1b]52;c;YWJj\x1b\\");
+    process.expect_status("System copy sent | unconfirmed");
+    process.send(b"\x1b[C\x16");
+    process.expect_body("abcabc", TIMEOUT);
+    process.send(b"\x1a");
+    process.expect_absent("abcabc");
     process.send(b"\x1b[20~");
     process.expect("Checkpoint interval (s)");
     process.send(&b"\x1b[B".repeat(4));
-    process.expect("Copy to system clipboard [Off]");
+    process.expect("Clipboard [Both]");
     process.send(b"\r");
-    process.expect("Copy to system clipboard [On]");
+    process.expect("Clipboard [Internal]");
+    process.send(b"\r");
+    process.expect("Clipboard [System]");
     assert!(
         !std::fs::read_to_string(&config_file)
             .unwrap()
-            .contains("copy_to_system")
+            .contains("[clipboard]")
     );
     process.send(b"\t\r");
     process.expect("Save Settings");
@@ -2201,13 +2236,49 @@ fn system_clipboard_settings_saves_and_safe_config_uses_internal_copy() {
     assert!(
         std::fs::read_to_string(&config_file)
             .unwrap()
-            .contains("copy_to_system = true")
+            .contains("mode = \"system\"")
     );
     process.send(b"\x1b");
-    process.expect_absent("Copy to system clipboard");
+    process.expect_absent("Clipboard [System]");
+    process.send(b"\x1b[Csystem");
+    process.expect_body("abcsystem", TIMEOUT);
     process.send(b"\x01\x03");
-    process.expect_raw("\x1b]52;c;YWJj\x1b\\");
+    process.expect_raw("\x1b]52;c;YWJjc3lzdGVt\x1b\\");
+    process.expect_status("System copy sent | unconfirmed");
+    process.output.clear();
+    process.send(b"\x18");
+    process.expect_status("Cut needs Internal or Both");
+    process.expect_body("abcsystem", TIMEOUT);
+    assert!(!process.output.windows(5).any(|bytes| bytes == b"\x1b]52;"));
+    process.send(b"\x16");
+    process.expect_status("Use the terminal Paste command");
+    process.send(b"\x1b[C\x1b[200~from Mac\x1b[201~");
+    process.expect_body("abcsystemfrom Mac", TIMEOUT);
+    process.send(b"\x1a");
+    process.expect_absent("abcsystemfrom Mac");
+    process.send(b"\x1b[20~");
+    process.expect("Checkpoint interval (s)");
+    process.send(&b"\x1b[B".repeat(4));
+    process.expect("Clipboard [System]");
+    process.send(b"\r\r");
+    process.expect("Clipboard [Internal]");
+    process.send(b"\t\r");
+    process.expect("Save Settings");
+    process.send(b"\r");
+    process.expect_status("Settings saved");
+    process.expect("Clipboard [Internal]");
+    process.send(b"\x1b");
+    process.expect_absent("Clipboard [Internal]");
+    process.send(b"\x01\x16");
+    process.expect_absent("abcsystem");
+    process.expect_body("abc", TIMEOUT);
+    process.output.clear();
+    process.send(b"\x01\x03");
+    process.expect_status("Copied internally");
+    assert!(!process.output.windows(5).any(|bytes| bytes == b"\x1b]52;"));
     process.send(b"\x11");
+    process.expect("Save your changes before continuing?");
+    process.send(b"\x1b[Z\r");
     assert!(process.wait().success());
     let mut safe = PtyChild::editor_with_options(
         Some("xterm-256color"),

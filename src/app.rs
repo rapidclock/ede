@@ -3,12 +3,12 @@ use crate::{
     command::{Command, Movement},
     document::{Cancellation, JobId},
     editor::{
-        Action, After, COPIED_INTERNALLY, CUT_INTERNALLY, Event, PointerGesture, SaveResult,
-        Screen, TabId,
+        Action, After, COPIED_INTERNALLY, CUT_INTERNALLY, Event, PointerGesture,
+        SYSTEM_COPY_FAILED, SYSTEM_COPY_PENDING, SaveResult, Screen, TabId,
     },
     input::Input,
     picker::{self, Browse},
-    settings::{self, Context},
+    settings::{self, ClipboardMode, Context},
     status::{Severity, StatusMessage},
     syntax::Choice,
     ui::{Control, LayoutSnapshot},
@@ -912,7 +912,7 @@ impl AppState {
 
     /// Reconcile the completed file operation, then enqueue its editor values before later input.
     pub(crate) fn poll_settings(&mut self, editor: Option<&mut crate::editor::Editor>) {
-        let clipboard_enabled = self.settings.applied.values.copy_to_system();
+        let clipboard_mode = self.clipboard_mode();
         if let Some(update) = self.settings.poll(&self.config_location) {
             self.settings_updated(update);
             self.dirty = true;
@@ -933,18 +933,23 @@ impl AppState {
             self.settings_save_state = save_state;
             self.dirty = true;
         }
-        if clipboard_enabled && !self.settings.applied.values.copy_to_system() {
+        if clipboard_mode != self.clipboard_mode() {
             self.revoke_clipboard();
         }
     }
 
-    /// Capture or validate the current opt-in at the terminal's dispatch boundary.
+    /// Safe configuration always keeps clipboard copies within ede.
+    fn clipboard_mode(&self) -> ClipboardMode {
+        if self.config_location.safe() {
+            ClipboardMode::Internal
+        } else {
+            self.settings.applied.values.clipboard_mode()
+        }
+    }
+
+    /// Capture or validate the current destination at the terminal's dispatch boundary.
     pub(crate) fn system_clipboard_epoch(&self) -> Option<u64> {
-        self.settings
-            .applied
-            .values
-            .copy_to_system()
-            .then_some(self.clipboard_epoch)
+        (self.clipboard_mode() != ClipboardMode::Internal).then_some(self.clipboard_epoch)
     }
 
     /// A disabled or suspended session cannot publish any previously queued write.
@@ -956,7 +961,10 @@ impl AppState {
     pub(crate) fn report_clipboard(&mut self, sequence: u64, message: &'static str) {
         let source = &self.screen.message;
         if Some(sequence) != self.screen.clipboard_sequence
-            || !matches!(source.as_str(), COPIED_INTERNALLY | CUT_INTERNALLY)
+            || !matches!(
+                source.as_str(),
+                COPIED_INTERNALLY | CUT_INTERNALLY | SYSTEM_COPY_PENDING
+            )
             || self.status.text() != source
         {
             return;
@@ -975,6 +983,7 @@ impl AppState {
         let status = self.status.text();
         status.starts_with(COPIED_INTERNALLY)
             || status.starts_with(CUT_INTERNALLY)
+            || status.starts_with(SYSTEM_COPY_FAILED)
             || self
                 .clipboard_feedback
                 .as_ref()
@@ -1642,8 +1651,13 @@ impl AppState {
             {
                 None
             }
+            Command::Paste if self.clipboard_mode() == ClipboardMode::System => {
+                self.message("Use the terminal Paste command");
+                None
+            }
             Command::Copy | Command::Cut => Some(Intent::Editor(Action::Clipboard {
                 cut: command == Command::Cut,
+                internal: self.clipboard_mode() != ClipboardMode::System,
                 system: self.system_clipboard_epoch(),
             })),
             _ => Some(Intent::Editor(Action::Command(command))),

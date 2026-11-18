@@ -65,7 +65,7 @@ struct ViewControl {
     streamed: AtomicBool,
     export: Mutex<Option<Cancellation>>,
     clipboard: Mutex<Option<ClipboardTransfer>>,
-    /// Serializes successful internal copies with the first nonblocking tty write.
+    /// Serializes successful copies with the first nonblocking tty write.
     clipboard_generation: Arc<Mutex<u64>>,
 }
 
@@ -73,6 +73,7 @@ struct ViewControl {
 pub(crate) struct ClipboardTransfer {
     pub epoch: u64,
     pub cut: bool,
+    pub internal: bool,
     pub sequence: u64,
     pub frame: Vec<u8>,
     pub generation: u64,
@@ -100,6 +101,8 @@ impl ClipboardTransfer {
 const SYSTEM_CLIPBOARD_LIMIT: u64 = 8 * 1024;
 pub(crate) const COPIED_INTERNALLY: &str = "Copied internally";
 pub(crate) const CUT_INTERNALLY: &str = "Cut internally";
+pub(crate) const SYSTEM_COPY_PENDING: &str = "System copy pending";
+pub(crate) const SYSTEM_COPY_FAILED: &str = "Copy failed";
 impl ViewControl {
     /// Bind a queued replacement to the current tab and the capabilities visible at dispatch.
     fn replacement_scope(&self) -> search::ReplacementScope {
@@ -217,6 +220,7 @@ pub(crate) enum Action {
     Command(Command),
     Clipboard {
         cut: bool,
+        internal: bool,
         system: Option<u64>,
     },
     Insert(String),
@@ -1278,7 +1282,7 @@ impl Coordinator {
         {
             // The deletion has committed even if a later layout/read fails.
             if let Some(clipboard) = self.cut_clipboard.take() {
-                self.commit_clipboard(clipboard);
+                self.commit_clipboard(Some(clipboard));
             }
             if revision != expected {
                 self.cache.edited(expected, revision, range.start);
@@ -1334,11 +1338,19 @@ impl Coordinator {
         self.tab.preferred = None;
         Ok(())
     }
-    /// Copy exact selection bytes to a private disk spool with fixed buffers.
-    fn copy(&mut self, cut: bool, system: Option<u64>) -> Result<(), Error> {
+    /// Copy exact selection bytes with fixed buffers. Cut requires a retained copy.
+    fn copy(&mut self, cut: bool, internal: bool, system: Option<u64>) -> Result<(), Error> {
+        if cut && !internal {
+            self.tab.screen.message = "Cut needs Internal or Both".into();
+            return Ok(());
+        }
         let range = self.tab.screen.position.selection();
         if range.is_empty() {
             self.tab.screen.message = "No selection".into();
+            return Ok(());
+        }
+        if !internal && range.end - range.start > SYSTEM_CLIPBOARD_LIMIT {
+            self.tab.screen.message = format!("{SYSTEM_COPY_FAILED} | system limit 8 KiB");
             return Ok(());
         }
         let snapshot = self.snapshot()?;
@@ -1362,32 +1374,36 @@ impl Coordinator {
             self.cut_clipboard = None;
             result
         } else {
-            self.commit_clipboard(spool.clone());
+            self.commit_clipboard(internal.then(|| spool.clone()));
             Ok(())
         };
-        if self
-            .clipboard
-            .as_ref()
-            .is_some_and(|current| Arc::ptr_eq(current, &spool))
+        if !cut
+            || self
+                .clipboard
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, &spool))
         {
-            let internal = if cut {
+            let status = if cut {
                 CUT_INTERNALLY
-            } else {
+            } else if internal {
                 COPIED_INTERNALLY
+            } else {
+                SYSTEM_COPY_PENDING
             };
-            let system_error =
-                system.and_then(|epoch| self.prepare_clipboard(&spool, epoch, cut).err());
-            self.tab.screen.message = match system_error {
-                Some(reason) => format!("{internal} | {reason}"),
-                None => internal.into(),
+            self.tab.screen.message = match system
+                .and_then(|epoch| self.prepare_clipboard(&spool, epoch, cut, internal).err())
+            {
+                Some(reason) if internal => format!("{status} | {reason}"),
+                Some(reason) => format!("{SYSTEM_COPY_FAILED} | {reason}"),
+                None => status.into(),
             };
             self.tab.screen.clipboard_sequence = Some(self.active_sequence);
         }
         result
     }
 
-    /// A newer successful internal copy or cut supersedes an unadmitted transfer.
-    fn commit_clipboard(&mut self, clipboard: Arc<Spool>) {
+    /// Supersede any unadmitted transfer and replace the retained copy if supplied.
+    fn commit_clipboard(&mut self, clipboard: Option<Arc<Spool>>) {
         let mut generation = self
             .view_cancel
             .clipboard_generation
@@ -1399,7 +1415,7 @@ impl Coordinator {
             .clipboard
             .lock()
             .unwrap_or_else(|err| err.into_inner());
-        let previous = self.clipboard.replace(clipboard);
+        let previous = clipboard.and_then(|clipboard| self.clipboard.replace(clipboard));
         *pending = None;
         drop(pending);
         drop(generation);
@@ -1407,7 +1423,13 @@ impl Coordinator {
     }
 
     /// Read and encode only bounded selections, on the coordinator thread.
-    fn prepare_clipboard(&self, spool: &Spool, epoch: u64, cut: bool) -> Result<(), &'static str> {
+    fn prepare_clipboard(
+        &self,
+        spool: &Spool,
+        epoch: u64,
+        cut: bool,
+        internal: bool,
+    ) -> Result<(), &'static str> {
         use base64::Engine;
 
         if spool.len > SYSTEM_CLIPBOARD_LIMIT {
@@ -1432,6 +1454,7 @@ impl Coordinator {
             .unwrap_or_else(|err| err.into_inner()) = Some(ClipboardTransfer {
             epoch,
             cut,
+            internal,
             sequence: self.active_sequence,
             frame,
             generation,
@@ -1828,7 +1851,11 @@ impl Coordinator {
                     self.tab.screen.message = "Selection ignored: view changed; retry".into();
                 }
             }
-            Action::Clipboard { cut, system } => self.copy(cut, system)?,
+            Action::Clipboard {
+                cut,
+                internal,
+                system,
+            } => self.copy(cut, internal, system)?,
             Action::Command(command) => match command {
                 Command::Move(movement, extend) => self.movement(movement, extend)?,
                 Command::SelectAll => {
@@ -1841,8 +1868,8 @@ impl Coordinator {
                     self.tab.preferred = None;
                     self.layout(true)?;
                 }
-                Command::Copy => self.copy(false, None)?,
-                Command::Cut => self.copy(true, None)?,
+                Command::Copy => self.copy(false, true, None)?,
+                Command::Cut => self.copy(true, true, None)?,
                 Command::Paste => {
                     if let Some(paste) = self.clipboard.clone() {
                         self.replace(None, Some(paste), self.tab.screen.position.selection())?;
@@ -1951,6 +1978,7 @@ mod tests {
         let transfer = ClipboardTransfer {
             epoch: 0,
             cut: false,
+            internal: true,
             sequence: 1,
             frame: b"first frame".to_vec(),
             generation: 1,

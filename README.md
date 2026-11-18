@@ -121,9 +121,19 @@ capture pauses capture for terminal-native selection; F2 gives a keyboard route
 to turn it back on. Native-selection modifiers depend on the terminal; use tmux's
 copy mode inside tmux.
 
-Copy and Cut use **ede's private internal clipboard**, retained until process
-exit. Ctrl+V or a directly delivered Cmd+V inserts that clipboard. The terminal's
-Paste command sends system clipboard text through bracketed paste. Both
+Choose **Internal**, **System**, or **Both** in the **Clipboard** row in
+Settings, then save. **Both** is the default.
+
+- **Internal** keeps Copy and Cut in ede. Ctrl+V or a directly delivered Cmd+V
+  pastes from ede's private clipboard.
+- **System** sends Copy to the terminal's clipboard. Use the terminal's Paste
+  command. To Cut, switch to Internal or Both so ede can keep the removed text
+  recoverable even if the terminal does not update the clipboard.
+- **Both** keeps Copy and Cut in ede and also asks the terminal to update its
+  clipboard. Ctrl+V still pastes from ede.
+
+The terminal's Paste command works in every mode and sends system clipboard
+text through bracketed paste. Both paste paths
 support large contents using disk staging. A paste commits as one undoable edit
 or leaves the document unchanged on validation, staging, space, or pre-commit
 cancellation failure. Bytes within bracketed paste are always data, including
@@ -132,13 +142,12 @@ from another shell on the editor host to cancel reception. The reader discards
 the rest of that frame through its closing marker. Escape can cancel an admitted
 paste before it commits once the terminal has sent the closing marker.
 
-To also copy to the client terminal's system clipboard, turn on **Copy to
-system clipboard** in Settings and choose **Save Settings**. The equivalent
-TOML setting is `clipboard.copy_to_system = true`. The default is Off, including
-under `--safe-config`. With it enabled, successful Copy and Cut send an OSC 52
-write request for selections up to 8 KiB. Larger copies stay available in full
-inside ede. A status message reports whether the request was sent. The client
-controls whether it accepts the write.
+Set `clipboard.mode` to `"internal"`, `"system"`, or `"both"` in TOML.
+`--safe-config` uses Internal. Existing `copy_to_system = false` and `true`
+settings still mean Internal and Both, respectively. System copy requests
+use OSC 52 and are limited to 8 KiB. In Both, larger selections are still
+copied in full inside ede. **System copy sent | unconfirmed** means ede sent
+the request. The client controls whether it updates the clipboard.
 
 For iTerm2, check its clipboard write permission. An intervening tmux server
 needs to accept writes from programs inside a pane and forward them to the
@@ -149,6 +158,15 @@ paused, or tmux copy mode as appropriate. See the
 [tested terminal and transport paths](specs/001_initial_mvp/10_mvp_validation.md#terminal-transport-and-client-clipboard-evidence).
 [iTerm2 clipboard settings](https://iterm2.com/documentation-preferences-general.html),
 [tmux clipboard documentation](https://github.com/tmux/tmux/wiki/Clipboard).
+
+In Apple Terminal, ede's system clipboard copy did not work in the tested SSH
+session. For text visible on screen, press **F2**, choose **Mouse capture:
+enabled (toggle)**, then drag to select the text and press
+**Option+Shift+Cmd+C** to copy it as plain text. Press **F2** and toggle capture
+back on to restore clicks in ede. The equivalent Terminal control is
+**View → Allow Mouse Reporting**. **Cmd+V** or **Edit → Paste** sends Mac
+clipboard text into ede. In iTerm2, copying from ede to the Mac clipboard
+passed over direct SSH and through remote tmux.
 
 Save As creates a new destination; it does not overwrite an existing path. Normal
 Save checks the previously acknowledged destination for external changes. Editing
@@ -200,7 +218,7 @@ max_line_bytes = 65536
 parse_timeout_ms = 250
 
 [clipboard]
-copy_to_system = false
+mode = "both"
 
 [keybindings.global]
 save = ["Ctrl+S", "F9", "Cmd+S"]
