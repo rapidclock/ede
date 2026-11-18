@@ -65,6 +65,8 @@ struct ViewControl {
     streamed: AtomicBool,
     export: Mutex<Option<Cancellation>>,
     clipboard: Mutex<Option<ClipboardTransfer>>,
+    /// Serializes successful internal copies with the first nonblocking tty write.
+    clipboard_generation: Arc<Mutex<u64>>,
 }
 
 /// One prepared terminal clipboard write, tied to the dispatch authorization.
@@ -73,6 +75,26 @@ pub(crate) struct ClipboardTransfer {
     pub cut: bool,
     pub sequence: u64,
     pub frame: Vec<u8>,
+    pub generation: u64,
+    pub authority: Arc<Mutex<u64>>,
+}
+
+impl ClipboardTransfer {
+    /// Admit the first byte only while this is still the newest successful copy.
+    /// The caller must perform one nonblocking write and release before waiting.
+    pub(crate) fn write_first(
+        &self,
+        write: impl FnOnce(&[u8]) -> std::io::Result<usize>,
+    ) -> std::io::Result<usize> {
+        let generation = self
+            .authority
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if *generation != self.generation {
+            return Err(std::io::ErrorKind::PermissionDenied.into());
+        }
+        write(&self.frame)
+    }
 }
 
 const SYSTEM_CLIPBOARD_LIMIT: u64 = 8 * 1024;
@@ -339,6 +361,8 @@ pub(crate) struct Screen {
     pub loading: bool,
     pub message: String,
     pub acknowledged: u64,
+    /// The Copy/Cut responsible for a retained clipboard status, independent of layout ACKs.
+    pub clipboard_sequence: Option<u64>,
     pub pointer_press: Option<u64>,
 }
 impl Default for Screen {
@@ -370,6 +394,7 @@ impl Default for Screen {
             loading: true,
             message: "Preparing document".into(),
             acknowledged: 0,
+            clipboard_sequence: None,
             pointer_press: None,
         }
     }
@@ -468,6 +493,25 @@ impl Editor {
         syntax_program: Option<PathBuf>,
         syntax_config_directory: Option<PathBuf>,
     ) -> std::io::Result<Self> {
+        Self::with_options(
+            launch_directory,
+            startup,
+            recovery,
+            syntax_program,
+            syntax_config_directory,
+            OpenOptions::default(),
+        )
+    }
+
+    /// Supply storage policy and fault boundaries while retaining the normal worker loop.
+    pub(crate) fn with_options(
+        launch_directory: PathBuf,
+        startup: crate::stream::Startup,
+        recovery: crate::recovery::Store,
+        syntax_program: Option<PathBuf>,
+        syntax_config_directory: Option<PathBuf>,
+        options: OpenOptions,
+    ) -> std::io::Result<Self> {
         let (sender, receiver) = mpsc::sync_channel(256);
         let (event_sender, events) = mpsc::sync_channel(16);
         let screen = Arc::new(Mutex::new(None));
@@ -483,8 +527,8 @@ impl Editor {
         let active = activity.clone();
         let worker = thread::Builder::new()
             .name("ede-editor".into())
-            .spawn(move || {
-                match StorageService::with_stop_flag(OpenOptions::default(), stopping.clone()) {
+            .spawn(
+                move || match StorageService::with_stop_flag(options, stopping.clone()) {
                     Ok(service) => {
                         let mut coordinator = Coordinator::new(
                             service,
@@ -508,8 +552,8 @@ impl Editor {
                             });
                         }
                     }
-                }
-            })?;
+                },
+            )?;
         Ok(Self {
             sender: Some(sender),
             events,
@@ -1337,12 +1381,19 @@ impl Coordinator {
                 Some(reason) => format!("{internal} | {reason}"),
                 None => internal.into(),
             };
+            self.tab.screen.clipboard_sequence = Some(self.active_sequence);
         }
         result
     }
 
     /// A newer successful internal copy or cut supersedes an unadmitted transfer.
     fn commit_clipboard(&mut self, clipboard: Arc<Spool>) {
+        let mut generation = self
+            .view_cancel
+            .clipboard_generation
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        *generation = generation.wrapping_add(1);
         let mut pending = self
             .view_cancel
             .clipboard
@@ -1351,6 +1402,7 @@ impl Coordinator {
         let previous = self.clipboard.replace(clipboard);
         *pending = None;
         drop(pending);
+        drop(generation);
         drop(previous);
     }
 
@@ -1368,6 +1420,11 @@ impl Coordinator {
             .map_err(|_| "system request prep failed")?;
         let data = base64::engine::general_purpose::STANDARD.encode(bytes);
         let frame = format!("\x1b]52;c;{data}\x1b\\").into_bytes();
+        let generation = *self
+            .view_cancel
+            .clipboard_generation
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         *self
             .view_cancel
             .clipboard
@@ -1377,6 +1434,8 @@ impl Coordinator {
             cut,
             sequence: self.active_sequence,
             frame,
+            generation,
+            authority: self.view_cancel.clipboard_generation.clone(),
         });
         Ok(())
     }
@@ -1883,6 +1942,41 @@ mod tests {
             offset += window.text().len() as u64;
         }
         result
+    }
+
+    /// A new internal copy cannot commit between authorization and the first tty byte.
+    #[test]
+    fn clipboard_first_write_serializes_authority_until_callback_returns() {
+        let authority = Arc::new(Mutex::new(1));
+        let transfer = ClipboardTransfer {
+            epoch: 0,
+            cut: false,
+            sequence: 1,
+            frame: b"first frame".to_vec(),
+            generation: 1,
+            authority: authority.clone(),
+        };
+        let (entered, reached) = mpsc::sync_channel(1);
+        let (release, held) = mpsc::sync_channel(1);
+        let writer = thread::spawn(move || {
+            transfer.write_first(|bytes| {
+                entered.send(()).unwrap();
+                held.recv_timeout(Duration::from_secs(5)).unwrap();
+                Ok(bytes.len())
+            })
+        });
+        reached.recv_timeout(Duration::from_secs(5)).unwrap();
+        let protected = matches!(
+            authority.try_lock(),
+            Err(std::sync::TryLockError::WouldBlock)
+        );
+        release.send(()).unwrap();
+        assert_eq!(writer.join().unwrap().unwrap(), b"first frame".len());
+        assert!(
+            protected,
+            "a newer copy could commit before the first byte was written"
+        );
+        *authority.lock().unwrap() = 2;
     }
     /// Pump an independent save to its acknowledged completion, with a finite deadline.
     fn saved(worker: &mut Coordinator) {

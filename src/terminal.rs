@@ -269,15 +269,26 @@ pub(crate) struct TerminalSession<D: TerminalDriver> {
 
 impl TerminalSession<UnixTerminal> {
     /// Send a prepared frame between renders, with a finite tty output deadline.
-    pub(crate) fn clipboard(&mut self, frame: &[u8]) -> ClipboardWrite {
+    pub(crate) fn clipboard(
+        &mut self,
+        transfer: &crate::editor::ClipboardTransfer,
+        interrupted: impl Fn() -> bool,
+    ) -> ClipboardWrite {
         let Ok(mut tty) = self.driver.clipboard_output() else {
             return ClipboardWrite::Unavailable;
         };
         let mut deadline = Instant::now() + Duration::from_millis(25);
         let mut started = false;
-        self.write_clipboard(frame, |remaining| {
+        self.write_clipboard(&transfer.frame, |remaining| {
             while let Some(wait) = deadline.checked_duration_since(Instant::now()) {
-                match tty.write(remaining) {
+                let result = if started {
+                    tty.write(remaining)
+                } else if interrupted() {
+                    return Err(io::ErrorKind::Interrupted.into());
+                } else {
+                    transfer.write_first(|bytes| tty.write(bytes))
+                };
+                match result {
                     Ok(count) if count > 0 && !started => {
                         // Before admission we can skip a busy tty. After a short write,
                         // the client needs time to drain the frame before output resumes.
@@ -486,6 +497,13 @@ impl Signals {
     pub(crate) fn termination(&self) -> Option<u8> {
         let signal = self.termination.swap(0, Ordering::Relaxed);
         (signal != 0).then_some(signal as u8)
+    }
+
+    /// Defer an unstarted clipboard frame to terminal lifecycle requests.
+    pub(crate) fn output_interrupted(&self) -> bool {
+        self.termination.load(Ordering::Relaxed) != 0
+            || self.suspend.load(Ordering::Relaxed)
+            || self.continued.load(Ordering::Relaxed)
     }
 
     /// Take a requested job-control suspension.

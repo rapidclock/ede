@@ -257,6 +257,8 @@ pub(crate) struct Dialog {
     pub directory: PathBuf,
     pub page: Option<Page>,
     pub highlight: usize,
+    /// First visible row, retained while the selection stays within the viewport.
+    pub top: usize,
     pub field: String,
     pub loading: bool,
     pub generation: u64,
@@ -281,6 +283,7 @@ impl Dialog {
             directory,
             page: None,
             highlight: 0,
+            top: 0,
             field: String::new(),
             loading: false,
             generation: 0,
@@ -296,6 +299,14 @@ impl Dialog {
 
     pub fn count(&self) -> usize {
         self.page.as_ref().map_or(0, |page| page.entries.len())
+    }
+
+    /// Reveal keyboard selection without moving rows after an in-viewport mouse click.
+    pub fn list_start(&self, rows: u16) -> usize {
+        self.top.min(self.highlight).max(
+            self.highlight
+                .saturating_sub(rows.saturating_sub(1) as usize),
+        )
     }
 
     /// Select a current row. Return true when a second complete click activates it.
@@ -368,6 +379,7 @@ impl Dialog {
         self.directory.clone_from(&page.directory);
         self.page = Some(page);
         self.highlight = 0;
+        self.top = 0;
         self.revision = self.revision.wrapping_add(1);
     }
 }

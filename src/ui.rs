@@ -508,7 +508,7 @@ impl LayoutSnapshot {
                     Control::PickerList,
                     Rect::new(overlay.x + 1, overlay.y + 2, overlay.width - 2, rows),
                 );
-                let start = list_start(dialog.highlight, rows);
+                let start = dialog.list_start(rows);
                 for (offset, row) in (start..dialog.count().min(start + rows as usize)).enumerate()
                 {
                     result.add(

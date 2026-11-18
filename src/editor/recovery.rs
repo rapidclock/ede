@@ -346,6 +346,13 @@ impl Coordinator {
             retiring: false,
             warning: None,
         });
+        // The catalog page and startup overflow can refer to the same entry.
+        // Once admitted here, only this tab may publish its persistent identity.
+        self.retention
+            .as_mut()
+            .unwrap()
+            .startup
+            .retain(|(entry, _)| entry.id != scratch);
         self.activate(id);
         Ok(())
     }
@@ -877,6 +884,107 @@ impl Coordinator {
 #[cfg(test)]
 pub(super) mod tests {
     //! Synchronized lifecycle checks exercise the same coordinator and storage workers as the TUI.
+
+    /// A manually recovered overflow entry and automatic refill must have one owner.
+    #[test]
+    fn manual_recovery_and_startup_refill_keep_one_scratch_owner() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut first, _events) = coordinator(root.path(), None);
+        first
+            .action(Action::Insert("original retained bytes".into()))
+            .unwrap();
+        first.retention.as_mut().unwrap().sweep = true;
+        poll_until(&mut first, |worker| {
+            worker.tab.scratch.as_ref().unwrap().retained.is_some()
+        });
+        let retained = first.tab.scratch.as_ref().unwrap().id;
+        shutdown(first);
+
+        let paths = (0..crate::TAB_LIMIT)
+            .map(|index| {
+                let path = root.path().join(format!("valid-{index}"));
+                std::fs::write(&path, "file").unwrap();
+                path
+            })
+            .collect();
+        let (mut worker, _events) = coordinator_with_paths(root.path(), None, None, paths);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while worker.opening.is_some() {
+            worker.receive().unwrap();
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(worker.tab.screen.document.is_some());
+        worker
+            .action(Action::RemoveTab(worker.tab.screen.tab.unwrap()))
+            .unwrap();
+        worker
+            .retention
+            .as_mut()
+            .unwrap()
+            .request_page(30, None, false);
+        poll_until(&mut worker, |worker| {
+            worker
+                .retention
+                .as_ref()
+                .unwrap()
+                .listing
+                .iter()
+                .any(|(entry, _)| entry.id == retained)
+        });
+        worker
+            .action(Action::OpenRetained {
+                generation: 30,
+                scratch: retained,
+            })
+            .unwrap();
+
+        let pending = worker.tabs[0].id;
+        worker.action(Action::Switch(pending)).unwrap();
+        assert!(worker.tab.screen.loading);
+        worker.action(Action::CancelOpen(pending)).unwrap();
+        let owners = worker
+            .tabs
+            .iter()
+            .filter(|tab| {
+                worker
+                    .state(tab.id)
+                    .and_then(|state| state.scratch.as_ref())
+                    .is_some_and(|scratch| scratch.id == retained)
+            })
+            .count();
+        assert_eq!(
+            owners, 1,
+            "both tabs claimed the same persistent scratch identity"
+        );
+        finish_opens(&mut worker);
+        worker.action(Action::New).unwrap();
+        worker
+            .action(Action::Insert("independent new scratch".into()))
+            .unwrap();
+        worker.begin_retained_quit(200);
+        poll_until(&mut worker, |worker| {
+            worker.retention.as_ref().unwrap().quitting.is_none()
+        });
+        shutdown(worker);
+        let store = recovery::Store::open(recovery::Options {
+            root: root.path().join("state"),
+            reserve_bytes: 0,
+            ..recovery::Options::default()
+        })
+        .unwrap();
+        let mut contents: Vec<_> = store
+            .page(None)
+            .unwrap()
+            .iter()
+            .map(|entry| std::fs::read_to_string(store.object_path(entry)).unwrap())
+            .collect();
+        contents.sort();
+        assert_eq!(
+            contents,
+            ["independent new scratch", "original retained bytes"]
+        );
+    }
 
     use super::*;
     use crate::document::{FaultInjector, IoPoint, StorageLimits};

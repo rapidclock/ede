@@ -31,6 +31,15 @@ pub(crate) struct Location {
 }
 
 impl Location {
+    /// Keep settings I/O isolated from process environment in integration-style unit tests.
+    #[cfg(test)]
+    pub(crate) fn isolated(directory: PathBuf) -> Self {
+        Self {
+            directory: Some(directory),
+            safe: false,
+        }
+    }
+
     /// Capture the process's configuration directory before starting workers.
     pub(crate) fn discover(safe: bool) -> Self {
         static DIRECTORY: OnceLock<Option<PathBuf>> = OnceLock::new();

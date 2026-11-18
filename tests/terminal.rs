@@ -821,9 +821,8 @@ exit "$result"
         env!("CARGO_BIN_EXE_ede"),
     ]);
     command.args(args);
-    if let Some(config) = config {
-        command.env("XDG_CONFIG_HOME", config);
-    }
+    let config_root = tempfile::tempdir().unwrap();
+    command.env("XDG_CONFIG_HOME", config.unwrap_or(config_root.path()));
     let mut process = PtyChild::spawn_with_input(&mut command, Some(input));
     process.keep_alive = true;
     process
@@ -2041,6 +2040,95 @@ fn maximum_clipboard_frame_survives_a_paced_terminal_reader() {
     process.send(b"\x16\x13");
     process.expect_status("Saved");
     assert_eq!(std::fs::read(file).unwrap(), bytes);
+    process.send(b"\x11");
+    assert!(process.wait().success());
+    process.assert_restored();
+}
+
+/// Backpressure during OSC delivery preserves external signal status and termios.
+#[test]
+fn clipboard_backpressure_preserves_signal_exit_status() {
+    for signal in [Signal::SIGINT, Signal::SIGTERM, Signal::SIGHUP] {
+        let directory = tempfile::tempdir().unwrap();
+        let config = directory.path().join("ede");
+        std::fs::create_dir(&config).unwrap();
+        std::fs::write(
+            config.join("config.toml"),
+            "[clipboard]\ncopy_to_system = true\n",
+        )
+        .unwrap();
+        let file = directory.path().join("clip.txt");
+        std::fs::write(&file, vec![b'x'; 8192]).unwrap();
+        let mut process = PtyChild::editor_with_options(
+            Some("xterm-256color"),
+            [&file],
+            None,
+            Some(directory.path()),
+            None,
+        );
+        process.resize(40, 8);
+        process.expect_status("Ready");
+        let pid = process.editor_pid();
+        process.send(b"\x01");
+        process.expect_status("Col 8193");
+        process.reset_output();
+        process.send(b"\x03");
+        let deadline = Instant::now() + TIMEOUT;
+        let mut prefix = Vec::new();
+        while !prefix.ends_with(b"\x1b]52;") {
+            let mut byte = [0];
+            match process.master.read(&mut byte) {
+                Ok(1) => prefix.push(byte[0]),
+                Ok(_) => thread::sleep(Duration::from_millis(1)),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                Err(error) => panic!("PTY read: {error}"),
+            }
+            assert!(Instant::now() < deadline, "clipboard frame did not begin");
+        }
+        kill(pid, signal).unwrap();
+        // Keep the tty open without draining it until the editor leaves the writer.
+        let deadline = Instant::now() + TIMEOUT;
+        while kill(pid, None).is_ok() {
+            assert!(Instant::now() < deadline, "signal did not stop the editor");
+            thread::sleep(Duration::from_millis(5));
+        }
+        process.parser.process(&prefix);
+        process.output.extend_from_slice(&prefix);
+        assert_eq!(process.wait().code(), Some(128 + signal as i32));
+        assert_eq!(process.restored.as_ref().unwrap(), &process.original);
+    }
+}
+
+/// An oversized system request retains the complete internal clipboard.
+#[test]
+fn oversized_system_copy_is_internal_and_round_trips() {
+    let directory = tempfile::tempdir().unwrap();
+    let config = directory.path().join("ede");
+    std::fs::create_dir(&config).unwrap();
+    std::fs::write(
+        config.join("config.toml"),
+        "[clipboard]\ncopy_to_system = true\n",
+    )
+    .unwrap();
+    let file = directory.path().join("clip.txt");
+    let text = "x".repeat(8193);
+    std::fs::write(&file, &text).unwrap();
+    let mut process = PtyChild::editor_with_options(
+        Some("xterm-256color"),
+        [&file],
+        None,
+        Some(directory.path()),
+        None,
+    );
+    process.expect_status("Ready");
+    process.send(b"\x01\x03");
+    process.expect_status("system limit 8 KiB");
+    assert!(!process.output.windows(5).any(|bytes| bytes == b"\x1b]52;"));
+    process.send(b"\x1b[1;5F\x16\x13");
+    process.expect_status("Saved");
+    assert_eq!(std::fs::read_to_string(file).unwrap(), text.repeat(2));
     process.send(b"\x11");
     assert!(process.wait().success());
     process.assert_restored();
@@ -3749,4 +3837,80 @@ fn syntax_color_yields_to_selection_and_current_match() {
     process.send(b"\x11");
     assert!(process.wait().success());
     process.assert_restored();
+}
+
+/// Mouse activation should keep the item under the first click at the same screen position.
+#[test]
+fn picker_double_click_keeps_scrolled_rows_stationary() {
+    let directory = tempfile::tempdir().unwrap();
+    let original = directory.path().join("original.txt");
+    std::fs::write(&original, "original").unwrap();
+    for index in 0..26 {
+        let path = directory.path().join(format!("entry-{index:02}.txt"));
+        std::fs::write(path, format!("unique document bytes {index}")).unwrap();
+    }
+    let mut process = PtyChild::editor_with_path(Some("xterm-256color"), Some(&original));
+    process.expect_status("Ready");
+    process.send(b"\x0f");
+    process.expect("entry-00.txt");
+    process.send(b"\x1b[B".repeat(20).as_slice());
+    process.expect("entry-20.txt");
+    process.click_label("entry-10.txt", 2);
+    process.expect_body("unique document bytes 10", TIMEOUT);
+    process.send(b"\x11");
+    assert!(process.wait().success());
+}
+
+/// A pointer release on another row interrupts the earlier click even without a drag event.
+#[test]
+fn picker_mismatched_release_interrupts_double_click() {
+    let directory = tempfile::tempdir().unwrap();
+    let original = directory.path().join("original.txt");
+    std::fs::write(&original, "original").unwrap();
+    std::fs::write(
+        directory.path().join("first.txt"),
+        "unexpected first file payload",
+    )
+    .unwrap();
+    std::fs::write(directory.path().join("second.txt"), "second file payload").unwrap();
+    let mut process = PtyChild::editor_with_path(Some("xterm-256color"), Some(&original));
+    process.expect_status("Ready");
+    process.send(b"\x0f");
+    process.expect("second.txt");
+    let coord = |label: &str| {
+        process
+            .parser
+            .screen()
+            .rows(0, 80)
+            .enumerate()
+            .find_map(|(row, text)| {
+                text.find(label).map(|start| {
+                    (
+                        unicode_width::UnicodeWidthStr::width(&text[..start]) + 1,
+                        row + 1,
+                    )
+                })
+            })
+            .unwrap()
+    };
+    let (x1, y1) = coord("first.txt");
+    let (x2, y2) = coord("second.txt");
+    let click = format!("\x1b[<0;{x1};{y1}M\x1b[<0;{x1};{y1}m");
+    let mismatch = format!("\x1b[<0;{x1};{y1}M\x1b[<0;{x2};{y2}m");
+    process.send(format!("{click}{mismatch}{click}").as_bytes());
+    let deadline = Instant::now() + Duration::from_millis(400);
+    while Instant::now() < deadline {
+        process.drain();
+        let screen = process.parser.screen().contents();
+        assert!(
+            !screen.contains("unexpected first file payload"),
+            "{screen}"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+    process.expect("Open file");
+    process.send(b"\x1b");
+    process.expect_absent("Open file");
+    process.send(b"\x11");
+    assert!(process.wait().success());
 }

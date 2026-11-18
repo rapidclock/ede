@@ -350,6 +350,9 @@ impl AppState {
     }
     /// Preserve valid focus and invalidate capture after geometry or overlay changes.
     pub fn sync_layout(&mut self, layout: &LayoutSnapshot) {
+        if let Some(Modal::Open(picker)) = &mut self.modal {
+            picker.top = picker.list_start(layout.list_rows());
+        }
         if let Some(Control::Search(index @ (0 | 1))) = self.focus {
             self.search.field = index;
         }
@@ -423,7 +426,7 @@ impl AppState {
             self.dirty = true;
         }
         self.clipboard_feedback = self.clipboard_feedback.take().filter(|feedback| {
-            feedback.sequence == screen.acknowledged
+            Some(feedback.sequence) == screen.clipboard_sequence
                 && feedback.tab == screen.tab
                 && feedback.source == screen.message
         });
@@ -952,7 +955,7 @@ impl AppState {
     /// Retain the delivery outcome when the coordinator republishes the same action.
     pub(crate) fn report_clipboard(&mut self, sequence: u64, message: &'static str) {
         let source = &self.screen.message;
-        if sequence != self.screen.acknowledged
+        if Some(sequence) != self.screen.clipboard_sequence
             || !matches!(source.as_str(), COPIED_INTERNALLY | CUT_INTERNALLY)
             || self.status.text() != source
         {
@@ -1795,6 +1798,13 @@ impl AppState {
                 }
             }
             MouseEventKind::Up(MouseButton::Left) => {
+                if self
+                    .capture
+                    .is_some_and(|capture| hit != Some(capture.control))
+                    && let Some(Modal::Open(picker)) = &mut self.modal
+                {
+                    picker.reset_click();
+                }
                 if let Some(capture) = self.capture.take()
                     && capture.generation == layout.generation
                 {

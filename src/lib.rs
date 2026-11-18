@@ -243,7 +243,7 @@ fn run_validated(
     });
     if session.output_lost() {
         // The client's parser may still be inside the abandoned control string.
-        return Ok(Exit { code: 1 });
+        return Ok(result.unwrap_or(Exit { code: 1 }));
     }
     result
 }
