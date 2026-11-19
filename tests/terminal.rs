@@ -1908,16 +1908,89 @@ fn real_shortcuts_paste_and_cleanup() {
     process.assert_restored();
 }
 
+/// Workspace controls have distinct colors, noninteractive gaps, and visible keyboard focus.
+#[test]
+fn workspace_header_buttons_are_spaced_colored_and_reachable() {
+    let header = "[Tabs]  [Settings]  [Menu]  [Quit]";
+    for (width, height) in [(80, 24), (40, 8)] {
+        let mut process = PtyChild::editor();
+        if width != 80 {
+            process.resize(width, height);
+            process.expect_status("Ready");
+        }
+        let start = width - header.len() as u16;
+        let row = process.parser.screen().rows(0, width).next().unwrap();
+        let Some(strip) = row.strip_suffix(header) else {
+            panic!("missing right-aligned header at {width} columns: {row}");
+        };
+        assert!(
+            strip.contains('×'),
+            "active tab lost its close button: {row}"
+        );
+        assert!(process.parser.screen().cell(0, 0).unwrap().inverse());
+        for (label, color) in [
+            ("[Tabs]", 6),
+            ("[Settings]", 3),
+            ("[Menu]", 5),
+            ("[Quit]", 1),
+        ] {
+            let x = start + header.find(label).unwrap() as u16;
+            assert_eq!(
+                process.parser.screen().cell(0, x).unwrap().fgcolor(),
+                vt100::Color::Idx(color),
+                "{label} at {width} columns"
+            );
+        }
+
+        for (offset, character) in header.bytes().enumerate() {
+            if character == b' ' {
+                let column = usize::from(start) + offset + 1;
+                process.send(format!("\x1b[<0;{column};1M\x1b[<0;{column};1m").as_bytes());
+                process.send(b"\x1b[17~"); // F6 moves focus from the editor to Tabs.
+                process.expect(">Tabs<");
+                let focus = process.parser.screen().cell(0, start).unwrap();
+                assert!(focus.bold());
+                assert_eq!(focus.fgcolor(), vt100::Color::Idx(6));
+                process.send(b"\x1b[Z"); // Shift+Tab returns focus to the editor.
+                process.expect_absent(">Tabs<");
+            }
+        }
+        process.click_label("[Tabs]", 1);
+        process.expect("Tabs — Enter to switch");
+        process.send(b"\x1b");
+        process.click_label("[Settings]", 1);
+        process.expect("Checkpoint interval");
+        process.send(b"\x1b");
+        process.click_label("[Menu]", 1);
+        process.expect("Actions (wheel/arrows)");
+        process.send(b"\x1b[F\x1b[C\r"); // Last category, first command.
+        process.expect("scroll help");
+        process.send(b"\x1b");
+        process.expect_absent("scroll help");
+        process.send(b"\x1bOP"); // F1.
+        process.expect("scroll help");
+        process.send(b"\x1b");
+        process.expect(">Menu<");
+        process.send(b"\t");
+        process.click_label(">Quit<", 1);
+        assert!(process.wait().success());
+        process.assert_restored();
+    }
+}
+
 /// Help is modal and mouse transitions use the rendered target rectangles after resize.
 #[test]
 fn real_mouse_overlay_and_resize() {
     let mut process = PtyChild::editor();
     process.expect("Ready");
+    let header = process.parser.screen().rows(0, 80).next().unwrap();
+    let quit = header.rfind("[Quit]").unwrap();
+    let column = unicode_width::UnicodeWidthStr::width(&header[..quit]) + 1;
     process.reset_output();
     process.send(b"\x1bOP");
     process.expect("Cmd aliases require");
     // Header Quit is underneath the overlay and must not be activated.
-    process.send(b"\x1b[<0;74;1M\x1b[<0;74;1m");
+    process.send(format!("\x1b[<0;{column};1M\x1b[<0;{column};1m").as_bytes());
     process.expect_absent("Cmd aliases require");
     assert!(process.child.try_wait().unwrap().is_none());
     process.send(b"\x1bOP");
@@ -1930,19 +2003,7 @@ fn real_mouse_overlay_and_resize() {
     process.resize(80, 24);
     process.expect("Cmd aliases require");
     process.send(b"\x1b");
-    // Wait for the overlay to disappear before sending another escape-prefixed sequence.
-    let deadline = Instant::now() + TIMEOUT;
-    while process
-        .parser
-        .screen()
-        .contents()
-        .contains("Cmd aliases require")
-    {
-        process.drain();
-        assert!(Instant::now() < deadline);
-        thread::sleep(Duration::from_millis(5));
-    }
-    process.send(b"\x1b[<0;74;1M\x1b[<0;74;1m");
+    process.click_label("[Quit]", 1);
     assert!(process.wait().success());
     process.assert_restored();
 }

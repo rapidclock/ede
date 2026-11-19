@@ -16,6 +16,10 @@ use ratatui::{
 };
 use std::ops::Range;
 use unicode_width::UnicodeWidthStr;
+
+/// Blank terminal cells between adjacent workspace buttons.
+const WORKSPACE_BUTTON_GAP: u16 = 2;
+
 /// Stable visible control; text byte positions live in the prepared document view.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Control {
@@ -33,7 +37,6 @@ pub(crate) enum Control {
     Menu,
     PaneOutside,
     WorkspaceSettings,
-    Help,
     Quit,
     Tabs,
     Tab(TabId),
@@ -106,7 +109,6 @@ impl Control {
             Self::Menu => Some(Command::Menu),
             Self::WorkspaceSettings => Some(Command::Settings),
             Self::SaveErrorAs => Some(Command::SaveAs),
-            Self::Help => Some(Command::Help),
             Self::Tabs => Some(Command::Tabs),
             Self::Quit | Self::HelpQuit => Some(Command::Quit),
             Self::HelpSuspend => Some(Command::Suspend),
@@ -160,7 +162,6 @@ impl Control {
             Self::PickerPrevious => "Prev",
             Self::PickerNext => "Next",
             Self::Menu => "Menu",
-            Self::Help => "Help",
             Self::Quit | Self::HelpQuit => "Quit",
             Self::HelpSuspend => "Suspend",
             Self::HelpClose | Self::DetailsClose => "Close",
@@ -251,18 +252,14 @@ impl LayoutSnapshot {
             result.add(Control::HelpSuspend, Rect::new(overlay.x + 9, y, 11, 1));
             result.add(Control::HelpClose, Rect::new(overlay.x + 22, y, 9, 1));
         } else {
-            let button_width = if area.width < 52 { 6 } else { 8 };
-            let mut x = area.right();
-            for (control, width) in [
-                (Control::Quit, button_width),
-                (Control::Help, button_width),
-                (Control::Menu, button_width),
-                (Control::WorkspaceSettings, 10),
-            ] {
-                x -= width;
+            let mut right = area.right();
+            for control in [Control::Quit, Control::Menu, Control::WorkspaceSettings] {
+                let width = control.label().width() as u16 + 2;
+                let x = right - width;
                 result.add(control, Rect::new(x, area.y, width, 1));
+                right = x - WORKSPACE_BUTTON_GAP;
             }
-            result.targets[0..3].reverse();
+            result.targets.swap(0, 1); // Keep Menu before Quit in keyboard focus order.
             result.add(
                 Control::Content,
                 Rect::new(area.x, area.y + 1, area.width, area.height - 2),
@@ -779,18 +776,20 @@ impl LayoutSnapshot {
     fn add_tab_strip(&mut self, app: &AppState) {
         let area = self.area;
         let tabs = &app.screen.tabs;
-        let right = self
+        let settings_x = self
             .targets
             .iter()
             .find(|target| target.control == Control::WorkspaceSettings)
             .expect("workspace Settings geometry")
             .area
             .x;
-        self.add(Control::Tabs, Rect::new(right - 6, area.y, 6, 1));
+        let button_width = Control::Tabs.label().width() as u16 + 2;
+        let button_x = settings_x - WORKSPACE_BUTTON_GAP - button_width;
+        self.add(Control::Tabs, Rect::new(button_x, area.y, button_width, 1));
         let Some(active) = tabs.iter().position(|t| Some(t.id) == app.screen.tab) else {
             return;
         };
-        let width = right - 6 - area.x;
+        let width = button_x - area.x;
         let count = (usize::from(width) / 12).max(1).min(tabs.len());
         let start = active.saturating_sub(count - 1).min(tabs.len() - count);
         let mut x = area.x;
@@ -1830,7 +1829,10 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &AppState, layout: &LayoutSnaps
             format!("[{title}]")
         };
         let color = match target.control {
-            Control::TabListClose => Some(Color::Red),
+            Control::Tabs => Some(Color::Cyan),
+            Control::WorkspaceSettings => Some(Color::Yellow),
+            Control::Menu => Some(Color::Magenta),
+            Control::Quit | Control::TabListClose => Some(Color::Red),
             Control::TabListSwitch => Some(Color::Green),
             _ if focused => Some(Color::Cyan),
             _ => None,

@@ -22,6 +22,13 @@ persistence errors, and Settings writes use their explicit controls.
 
 ## Actions and tab inspection
 
+Right-align **Tabs**, **Settings**, **Menu**, and **Quit** in the workspace
+header. Use two blank terminal cells between buttons and limit pointer targets
+to their labels. Color the buttons cyan, yellow, magenta, and red respectively.
+Keep bold text and `>Label<` markers for focused buttons. At 40×8, keep the
+active tab and its close control visible. Open Help from **Menu → Help → Help**
+or F1.
+
 Actions lists File, Edit, Search, Tabs, Highlighting, Streams, Settings, and
 Help at left and the active category's commands at right. Moving through or
 clicking categories changes the command list. Tab and Left/Right move between
@@ -77,6 +84,7 @@ details open About and return to the same draft.
 | P12-2 | Exercise clean and dirty Settings dismissal, outside clicks on the confirmation, Escape, Keep Editing, Save and Exit, and Discard and Exit. Verify pending text and persisted bytes. Test validation failures and keep existing write and discard safeguards. |
 | P12-3 | Navigate Actions and Settings by keyboard and mouse at both widths. Inspect rendered bounds, section isolation, color and monochrome focus, and right-aligned actions. Save a draft spanning scalar and shortcut changes. Verify About's version, resolved path, and legacy Settings binding. |
 | P12-4 | Inspect an inactive named tab and an inactive stream without changing the active document. Verify the active marker, selected-row highlight, return focus, and behavior when a target disappears. |
+| P12-5 | At 40×8 and 80×24, verify the right-aligned header, two-cell gaps, individual button colors, visible focus, active tab close control, and both Help routes. |
 
 ## Validation record
 
@@ -107,3 +115,13 @@ footer after resize. A unit check confirmed that compact command labels are
 distinct within each scope. Formatting, Clippy, and all 362 default workspace
 tests passed on the arm64 macOS host. The workspace also reported 10 ignored
 tests. The separate follow-up review found no remaining issues.
+
+**P12-5 — Workspace header and beta version.** The new PTY regression first
+failed on the uneven header. At 40×8 and 80×24 it now verifies the exact spacing,
+each button color, bold focus markers, inert gaps, the active tab's close
+control, each button action, and Help access from Menu and F1. The overlay and
+capture tests locate Quit from the rendered header or layout. `ede --version`
+reported `ede 0.0.1-beta1`. Formatting and Clippy passed on arm64 macOS 27.2.1
+with Rust 1.99.1. The locked workspace suite passed with 363 tests and 10
+ignored when run with controlling-terminal access. The sandbox denied access
+for eight existing piped-input tests.

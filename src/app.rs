@@ -2370,7 +2370,7 @@ mod tests {
         app.screen.tab = Some(TabId(1));
         app.screen.document = Some(crate::document::DocumentId(1));
         app.screen.loading = false;
-        app.focus = Some(Control::Help);
+        app.focus = Some(Control::Menu);
         let area = Rect::new(0, 0, 40, 8);
         let menu_layout = LayoutSnapshot::for_app(area, &app, 1);
         app.input(Input::Command(Command::Menu), &menu_layout);
@@ -2435,13 +2435,13 @@ mod tests {
                 assert!(intent.is_none());
             }
         }
-        assert_eq!(app.focus, Some(Control::Help));
+        assert_eq!(app.focus, Some(Control::Menu));
 
         let layout = LayoutSnapshot::for_app(area, &app, 31);
         app.input(Input::Command(Command::Language), &layout);
         assert!(app.input(Input::Command(Command::Cancel), &tiny).is_none());
         assert!(app.modal.is_none());
-        assert_eq!(app.focus, Some(Control::Help));
+        assert_eq!(app.focus, Some(Control::Menu));
     }
 
     /// Tab Details uses the committed, native filename even when its stem is not UTF-8.
@@ -2812,15 +2812,22 @@ mod tests {
     fn capture_and_stale_geometry_are_safe() {
         let mut app = AppState::new();
         let layout = LayoutSnapshot::for_app(Rect::new(0, 0, 80, 24), &app, 1);
+        let column = (0..layout.area.width)
+            .find(|&column| layout.hit(column, 0) == Some(Control::Quit))
+            .expect("Quit target in the workspace header");
         let pointer = |kind| {
             Input::Pointer(MouseEvent {
                 kind,
-                column: 73,
+                column,
                 row: 0,
                 modifiers: KeyModifiers::NONE,
             })
         };
         app.input(pointer(MouseEventKind::Down(MouseButton::Left)), &layout);
+        assert_eq!(
+            app.capture.map(|capture| capture.control),
+            Some(Control::Quit)
+        );
         app.input(Input::FocusLost, &layout);
         assert!(
             app.input(pointer(MouseEventKind::Up(MouseButton::Left)), &layout)
