@@ -41,7 +41,7 @@ Pipe, FIFO, and regular-file stdin open a read-only **Stdin** tab ahead of any
 named files. Use a foreground controlling terminal and leave stdout attached to
 a terminal. A clean text EOF converts the same tab into an editable, recoverable
 scratch. `--follow FILE` requires terminal stdin and accepts exactly one path.
-Actions → Follow File opens the same kind of read-only follower from the picker.
+**Menu → Streams → Follow File** opens the same kind of read-only follower from the picker.
 
 Live tabs open at the tail. **Pause View** keeps the current viewport while
 ingestion continues. **Resume Follow** returns to the tail. Find searches the
@@ -83,14 +83,20 @@ binary data report errors.
 
 Buttons and the action menu provide alternatives for shortcuts intercepted by a
 terminal. Tab cycles controls in dialogs/help and inserts text in the editor.
-Help scrolls with Up/Down or the wheel; the action menu also scrolls with the wheel. Suspend is available through Help or Actions; resume
-with the shell's `fg` command.
+Help scrolls with Up/Down or the wheel. **Menu** (F2) opens Actions with categories
+on the left and commands on the right. Use Left/Right or Tab to move between
+columns, Up/Down to navigate, and Enter to activate. The wheel scrolls the
+column under the pointer. Suspend is under **Menu → Help** and in the Help pane.
+Resume with the shell's `fg` command.
 
 New and Open add tabs, and switching restores each tab's caret, selection,
-scrolling, and undo history. Use the Tabs button or Actions → Tabs to select or
-close a tab outside the strip. Actions → Tab details shows the active file's
-path. Brackets separate tabs and reverse video marks the active tab. The strip
-also marks modified (`*`), waiting (`…`), loading
+scrolling, and undo history. Use the Tabs button or **Menu → Tabs → Tabs** to
+switch to or close a tab outside the strip. In the Tabs pane, `>` marks the active
+tab and highlighting follows the selected row. **Details** inspects the selected
+tab without switching. **Close Selected Tab** starts the normal close checks for
+the selected row. **Back** dismisses the pane. **Menu → Tabs → Tab details** opens
+details for the active tab. Dividers separate tabs in the strip, where reverse
+video marks the active tab. The strip also marks modified (`*`), waiting (`…`), loading
 (`↓`), queued save (`⇡`), saving (`↑`), scratch (`~`), and attention (`!`).
 
 Find and Replace search the current document or all open tabs, including unsaved
@@ -116,14 +122,16 @@ listing includes hidden entries.
 
 Click to place the caret, Shift-click to extend, or drag to select. Dragging beyond
 the text area autoscrolls while the terminal continues reporting pointer events.
-The wheel scrolls the view without moving the caret. Actions → Toggle mouse
-capture pauses capture for terminal-native selection; F2 gives a keyboard route
+The wheel scrolls the view without moving the caret. **Menu → Settings → Toggle mouse
+capture** pauses capture for terminal-native selection; F2 gives a keyboard route
 to turn it back on. Native-selection modifiers depend on the terminal; use tmux's
 copy mode inside tmux.
 
-Click outside Actions to dismiss it while mouse capture is enabled. Click a
-tab name to switch or its × to close that tab. Each close uses the same save
-and discard checks as keyboard Close Tab. **Tabs** lists entries outside the header.
+With mouse capture enabled, click outside a pane to dismiss it. This includes
+docked Find/Replace. The click leaves the editor caret and underlying controls
+alone. Confirmations and guarded Save As require an explicit choice. Click a tab
+name in the header to switch or its × to close that tab. Each close uses the same
+save and discard checks as keyboard Close Tab.
 
 Copy retains the full selection for the session, including text outside the
 viewport. Copy and Cut use the desktop clipboard in an identified local GUI
@@ -184,7 +192,7 @@ Scratches checkpoint every five seconds and flush their final contents on normal
 Quit. Relaunch restores text, tab order, active scratch, caret, selection, and
 viewport with fresh undo history. Each running instance owns a separate scratch
 set; a new instance claims scratches from exited or crashed instances. Excess
-entries beyond 64 open tabs remain in Actions → Recovery, with Open, Retry,
+entries beyond 64 open tabs remain in **Menu → File → Recovery**, with Open, Retry,
 Discard, and paging. A crash restores the last complete checkpoint; unsaved
 named-file edits are outside this recovery scope.
 
@@ -201,7 +209,7 @@ tabs and rename saves. Local edits and paste reception prevent replacement;
 guarded Save still checks for conflicts. Refresh preserves the latest view and
 adds one undo step within the 256 MiB history budget. If the previous text exceeds
 that budget, refresh resets history and reports it. Missing or invalid sources
-leave the last good text intact and retry with backoff. Actions → Retry refresh
+leave the last good text intact and retry with backoff. **Menu → File → Retry refresh**
 and Tab details provide an immediate retry.
 
 ## Configuration and keybindings
@@ -251,19 +259,34 @@ depend on terminal delivery. Legacy Ctrl+I is Tab, Ctrl+J and Ctrl+M are Enter,
 and byte 08 is Ctrl+H. A Backspace key must send DEL to work as Backspace on the
 legacy path. See [Cmd delivery](#cmd-delivery).
 
-Click **Settings** or press **F5**. **Actions → Settings** and keyboard focus
+Click **Settings** or press **F5**. **Menu → Settings → Settings** and keyboard focus
 also open it. Assigning F5 explicitly to another workspace command suppresses
 the inherited Settings shortcut until that conflict is removed. Explicit
 Settings bindings and unbindings take precedence.
 
-Scroll with the wheel, arrows, or Page Up and Page Down. Click a value or
-activate a focused row to edit it. Add or replace a chord by typing or by
-choosing **Capture** and accepting its preview. **Save** commits the current
-typed value with the draft. **Discard** restores the applied values.
-**Exit** closes the pane and offers Save and Exit, Discard and Exit, or Keep
-Editing when the draft has changes. **Config** shows the path and diagnostics.
-**Reload** reads the file and **Restore Defaults** drafts the bundled values,
-including removal of a clipboard opt-out. Changes apply when saved.
+Choose **Recovery**, **Highlighting Limits**, or **Keyboard Shortcuts** in the
+sidebar. Narrow terminals use **Recovery**, **Limits**, and **Keys** above the
+list. Use Tab or Shift+Tab to focus the section selectors or rows. Move between
+sections with Up/Down in the sidebar and Left/Right in the compact layout.
+
+**Keyboard Shortcuts** expands into groups for the screen or control that has
+focus. **App commands** covers workspace actions such as Open file and Open
+Settings. **Focused buttons** covers keys such as Enter and Tab when a workspace
+button has focus. **While in Settings** covers actions within the Settings pane
+itself. At narrow sizes, use the arrows beside the group name to change groups.
+The **Command** and **Shortcut** columns show each binding. Click a row or press
+Enter on it to edit. Type a chord or choose **Capture** and accept the preview.
+The binding editor title shows the configuration ID. All sections share one
+draft. At 40×8, Reload and Restore Defaults are available from the Recovery
+and Limits sections.
+
+The bottom-right **Save** includes the current typed value. **Discard** restores
+applied values. **Exit** or an outside click opens a confirmation when the draft
+has changes. **Keep Editing** or Escape returns to the draft. **Reload** reads
+the file and **Restore Defaults** drafts the bundled values, including removal
+of a clipboard opt-out. Changes apply when saved. Settings shows the active
+configuration source and diagnostics. Open **Details** when a diagnostic is
+truncated. **Menu → Help → About** shows the app version and configuration file path.
 
 Settings saves preserve unrelated TOML and comments. If the file changes
 externally, reload it before saving a new draft. Any noncooperating writer can
@@ -281,6 +304,7 @@ that a command starts unbound and is available when its surface permits it.
 <!-- keymap-defaults:start -->
 | Context | Command ID | Defaults |
 | --- | --- | --- |
+| `global` | `about` | — |
 | `global` | `actions` | F2 |
 | `global` | `cancel_search` | — |
 | `global` | `close_tab` | Ctrl+W / Cmd+W |

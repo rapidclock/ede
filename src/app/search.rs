@@ -76,6 +76,19 @@ pub(crate) fn display(text: &str) -> String {
 }
 
 impl AppState {
+    /// Retire the docked panel and its pending work before returning focus to the editor.
+    pub(crate) fn close_search(&mut self) {
+        self.revoke_native_clipboard();
+        self.search.open = false;
+        self.field_generation = self.field_generation.wrapping_add(1);
+        self.field_paste = None;
+        self.field_submit = None;
+        self.search_submit_field = None;
+        self.focus = Some(Control::Content);
+        self.capture = None;
+        self.dirty = true;
+    }
+
     pub(super) fn search_field_changed(&self) -> Intent {
         Intent::Editor(if self.search.field == 1 {
             Action::InvalidateReplacement
@@ -218,14 +231,7 @@ impl AppState {
             if self.screen.search.busy {
                 return Some(Some(Intent::Editor(Action::CancelSearch)));
             }
-            self.search.open = false;
-            self.field_generation = self.field_generation.wrapping_add(1);
-            self.field_paste = None;
-            self.field_submit = None;
-            self.search_submit_field = None;
-            self.focus = Some(Control::Content);
-            self.dirty = true;
-            return Some(Some(Intent::Editor(Action::InvalidateSearch)));
+            return Some(Some(Intent::DismissSearch));
         }
         if command == Command::FocusEditor && matches!(self.focus, Some(Control::Search(_))) {
             self.focus = Some(Control::Content);
@@ -311,12 +317,7 @@ impl AppState {
             6 => self.search_command(Command::FindNext, layout).flatten(),
             8 => self.search_command(Command::ReplaceAll, layout).flatten(),
             9 => Some(Intent::Editor(Action::CancelSearch)),
-            10 => {
-                self.search.open = false;
-                self.focus = Some(Control::Content);
-                self.dirty = true;
-                Some(Intent::Editor(Action::InvalidateSearch))
-            }
+            10 => Some(Intent::DismissSearch),
             11..=13 => {
                 let field = self.search.field;
                 self.search_focus(field);
@@ -331,10 +332,12 @@ impl AppState {
                 Some(self.search_field_changed())
             }
             14 => {
+                self.opener = self.focus;
                 self.modal = Some(Modal::Details(
                     self.screen.search.summary(&self.screen.tabs),
                 ));
                 self.focus = Some(Control::DetailsClose);
+                self.help_scroll = 0;
                 self.dirty = true;
                 Some(Intent::Editor(Action::RevokeSearch))
             }

@@ -20,7 +20,7 @@ use std::path::Path;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct Language {
     pub(crate) id: &'static str,
-    label: &'static str,
+    pub(crate) label: &'static str,
     extensions: &'static [&'static str],
 }
 

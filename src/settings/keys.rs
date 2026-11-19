@@ -244,6 +244,7 @@ impl Default for Keymap {
             C::ExportRetained,
             C::Tabs,
             C::TabDetails,
+            C::About,
             C::Language,
             C::SyntaxTheme,
             C::ReloadHighlighting,
