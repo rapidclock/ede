@@ -39,6 +39,9 @@ disappears, report that it is unavailable. Any Retry refresh action targets the
 displayed ID. A parked tab shows its language under the current configuration
 and indicates when highlighting analysis is deferred. Actions → Tabs → Tab
 details continues to open the active tab.
+**Close Selected Tab** invokes the guarded close for the selected row and is
+red. **Switch** is green and **Back** dismisses the pane. At 40×8, use two
+action rows to keep the full labels visible.
 
 ## Settings
 
@@ -47,6 +50,17 @@ Shortcuts** at 64 columns and wider. Use compact selectors above the content
 at smaller supported widths. Each section shows its own rows. The entire pane
 shares one draft. Section selection accepts valid inline scalar input into the
 draft, and leaves invalid input or pending field paste in place for resolution.
+
+Keyboard Shortcuts expands into scopes in the sidebar. **App commands** covers
+workspace actions. **Focused buttons** covers navigation and activation when a
+workspace button has focus. **While in Settings** covers controls within that
+pane. The other groups are **Editing text**, **Find & Replace**, **File picker**,
+and **Dialogs**. The right pane shows task headings where space permits, with
+clearly styled **Command** and **Shortcut** columns. Use a group selector above
+the columns at narrow sizes. Present human-readable action names, keep existing
+configuration IDs in binding editor titles and diagnostics, and retain one
+draft across all shortcut groups. At 40×8, Recovery and Limits provide access
+to Reload and Restore Defaults.
 
 Place Save, Discard, and Exit at the bottom right. Save is green, Discard red,
 and Exit and Keep Editing neutral. Preserve readable labels and focus indicators
@@ -84,3 +98,12 @@ assertion for the confirmation. Closing Find/Replace after denied cancellation
 failed the queue-saturation assertion. A separate implementation review and
 follow-up checks found no remaining issues. Linux and graphical terminal
 smoke tests were outside this local validation run.
+
+**Shortcut and Tabs follow-up.** The 40×8 PTY test initially failed because the
+shortcut list had no column headers. After the change, PTYs verified the compact
+selector and wide sidebar, the exact saved `controls.activate` override, binding
+IDs alongside diagnostics, and the colors and guarded behavior of the Tabs
+footer after resize. A unit check confirmed that compact command labels are
+distinct within each scope. Formatting, Clippy, and all 362 default workspace
+tests passed on the arm64 macOS host. The workspace also reported 10 ignored
+tests. The separate follow-up review found no remaining issues.

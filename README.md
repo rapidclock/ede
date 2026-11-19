@@ -93,9 +93,10 @@ New and Open add tabs, and switching restores each tab's caret, selection,
 scrolling, and undo history. Use the Tabs button or **Menu → Tabs → Tabs** to
 switch to or close a tab outside the strip. In the Tabs pane, `>` marks the active
 tab and highlighting follows the selected row. **Details** inspects the selected
-tab without switching. **Menu → Tabs → Tab details** opens details for the active
-tab. Dividers separate tabs in the strip, where reverse video marks the active tab. The strip
-also marks modified (`*`), waiting (`…`), loading
+tab without switching. **Close Selected Tab** starts the normal close checks for
+the selected row. **Back** dismisses the pane. **Menu → Tabs → Tab details** opens
+details for the active tab. Dividers separate tabs in the strip, where reverse
+video marks the active tab. The strip also marks modified (`*`), waiting (`…`), loading
 (`↓`), queued save (`⇡`), saving (`↑`), scratch (`~`), and attention (`!`).
 
 Find and Replace search the current document or all open tabs, including unsaved
@@ -267,8 +268,17 @@ Choose **Recovery**, **Highlighting Limits**, or **Keyboard Shortcuts** in the
 sidebar. Narrow terminals use **Recovery**, **Limits**, and **Keys** above the
 list. Use Tab or Shift+Tab to focus the section selectors or rows. Move between
 sections with Up/Down in the sidebar and Left/Right in the compact layout.
-Click a value or activate a focused row to edit it. Type a chord or choose
-**Capture** and accept the preview. All sections share one draft.
+
+**Keyboard Shortcuts** expands into groups for the screen or control that has
+focus. **App commands** covers workspace actions such as Open file and Open
+Settings. **Focused buttons** covers keys such as Enter and Tab when a workspace
+button has focus. **While in Settings** covers actions within the Settings pane
+itself. At narrow sizes, use the arrows beside the group name to change groups.
+The **Command** and **Shortcut** columns show each binding. Click a row or press
+Enter on it to edit. Type a chord or choose **Capture** and accept the preview.
+The binding editor title shows the configuration ID. All sections share one
+draft. At 40×8, Reload and Restore Defaults are available from the Recovery
+and Limits sections.
 
 The bottom-right **Save** includes the current typed value. **Discard** restores
 applied values. **Exit** or an outside click opens a confirmation when the draft

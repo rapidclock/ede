@@ -2,6 +2,11 @@
 
 use super::*;
 use crate::settings::{Base, Chord, Revision, SaveState, Scalar, Update};
+use unicode_width::UnicodeWidthStr;
+
+mod shortcuts;
+pub(crate) use shortcuts::group_label;
+use shortcuts::{Category, command_label};
 
 const GENERAL_ROWS: usize = Scalar::ALL.len();
 
@@ -125,12 +130,19 @@ impl Button {
     }
 }
 
+/// Category labels occupy a display row without becoming editable targets.
+pub(crate) enum ListEntry {
+    Heading(&'static str),
+    Row(usize),
+}
+
 /// One working revision and its publication base, including unaccepted field text.
 #[derive(Debug)]
 pub(crate) struct Draft {
     base: Option<Base>,
     original: Revision,
     revision: Revision,
+    shortcut_order: Vec<usize>,
     page: Page,
     return_page: Page,
     selected: usize,
@@ -144,10 +156,21 @@ pub(crate) struct Draft {
 
 impl Draft {
     fn new(settings: &settings::Service) -> Self {
+        let rows = &settings.applied.map.rows;
+        let mut shortcut_order: Vec<_> = (GENERAL_ROWS..GENERAL_ROWS + rows.len()).collect();
+        shortcut_order.sort_by_key(|index| {
+            let row = &rows[index - GENERAL_ROWS];
+            (
+                row.context as usize,
+                Category::for_command(row.context, row.command),
+                row.command.id(),
+            )
+        });
         Self {
             base: settings.base.clone(),
             original: settings.applied.clone(),
             revision: settings.applied.clone(),
+            shortcut_order,
             page: Page::List,
             return_page: Page::List,
             selected: 0,
@@ -197,38 +220,94 @@ impl Draft {
             }
     }
 
-    /// Label and effective contents of a logical row, including inherited bindings.
+    /// Describe a scalar row with its current value and source.
     pub(crate) fn row_label(&self, index: usize) -> String {
-        if let Some(scalar) = Scalar::ALL.get(index).copied() {
-            let source = if self.revision.values.override_value(scalar).is_some() {
-                "override"
-            } else {
-                "default"
-            };
-            format!(
-                "{} {} ({source})",
-                scalar.label(),
-                self.revision.values.get(scalar)
-            )
+        let scalar = Scalar::ALL[index];
+        let source = if self.revision.values.override_value(scalar).is_some() {
+            "override"
         } else {
-            let row = &self.revision.map.rows[index - GENERAL_ROWS];
-            let keys = row
-                .keys()
-                .iter()
+            "default"
+        };
+        format!(
+            "{} {} ({source})",
+            scalar.label(),
+            self.revision.values.get(scalar)
+        )
+    }
+
+    /// Format a shortcut row for the two display columns.
+    pub(crate) fn shortcut_columns(&self, index: usize, width: u16) -> (&'static str, String) {
+        let row = &self.revision.map.rows[index - GENERAL_ROWS];
+        let keys = row.keys();
+        let mut shortcut = if keys.is_empty() {
+            "Unbound".to_owned()
+        } else {
+            keys.iter()
                 .map(ToString::to_string)
-                .collect::<Vec<_>>();
-            let source = if row.override_keys.is_some() {
-                "override"
-            } else {
-                "default"
-            };
-            let value = if keys.is_empty() {
-                "Unbound".into()
-            } else {
-                keys.join(" / ")
-            };
-            format!("{} · {value} ({source})", row.identifier())
+                .collect::<Vec<_>>()
+                .join(" / ")
+        };
+        if keys.len() > 1 && shortcut.width() > usize::from(width) {
+            shortcut = format!("{} +{}", keys[0], keys.len() - 1);
         }
+        let sourced = format!(
+            "{shortcut} · {}",
+            if row.override_keys.is_some() {
+                "Custom"
+            } else {
+                "Default"
+            }
+        );
+        if sourced.width() <= usize::from(width) {
+            shortcut = sourced;
+        }
+        (command_label(row.context, row.command), shortcut)
+    }
+
+    /// Expose the exact config key when a binding is open.
+    pub(crate) fn binding_id(&self) -> Option<String> {
+        if self.section() == Section::Keyboard
+            && matches!(
+                self.page,
+                Page::Binding | Page::Edit(_) | Page::Capture(_) | Page::Preview(..)
+            )
+        {
+            Some(self.revision.map.rows[self.index()].identifier())
+        } else {
+            None
+        }
+    }
+
+    /// The displayed group and its visible focus exist only in the shortcut list.
+    pub(crate) fn shortcut_group(&self) -> Option<Context> {
+        (self.page == Page::List && self.section() == Section::Keyboard)
+            .then(|| self.revision.map.rows[self.index()].context)
+    }
+
+    fn group_rows(&self, context: Context) -> &[usize] {
+        let compare = |index: &usize| self.revision.map.rows[index - GENERAL_ROWS].context as usize;
+        let id = context as usize;
+        let start = self
+            .shortcut_order
+            .partition_point(|index| compare(index) < id);
+        let end = self
+            .shortcut_order
+            .partition_point(|index| compare(index) <= id);
+        &self.shortcut_order[start..end]
+    }
+
+    fn row_start(&self) -> usize {
+        self.shortcut_group().map_or_else(
+            || self.section_rows(self.section()).start,
+            |context| self.group_rows(context)[0],
+        )
+    }
+
+    fn section_focus(&self) -> Control {
+        self.shortcut_group().map_or(
+            Control::SettingsSection(self.section()),
+            Control::SettingsGroup,
+        )
     }
 
     /// Resolve the category of the selected logical row.
@@ -260,8 +339,17 @@ impl Draft {
         &self,
         settings: &settings::Service,
         location: &settings::Location,
-        compact: bool,
+        width: u16,
     ) -> String {
+        let dirty = if self.dirty() { " *" } else { "" };
+        if let Some(id) = self.binding_id() {
+            let title = format!(" Binding · {id}{dirty} ");
+            return if title.width() <= usize::from(width - 2) {
+                title
+            } else {
+                format!(" {id}{dirty} ")
+            };
+        }
         let state = if location.safe() {
             "Safe config"
         } else if settings.user_config {
@@ -269,11 +357,10 @@ impl Draft {
         } else {
             "Defaults"
         };
-        let context = self.section().label(compact);
-        format!(
-            " Settings · {context} · {state}{} ",
-            if self.dirty() { " *" } else { "" }
-        )
+        let context = self
+            .section()
+            .label(width < crate::ui::SETTINGS_SPLIT_WIDTH);
+        format!(" Settings · {context} · {state}{dirty} ")
     }
 
     pub(crate) fn feedback<'a>(&'a self, settings: &'a settings::Service) -> Option<&'a str> {
@@ -296,19 +383,35 @@ impl Draft {
         matches!(self.page, Page::Capture(_))
     }
 
-    /// Keep the selected logical row in the viewport independent of terminal size.
-    pub(crate) fn rows(&self, capacity: u16) -> std::ops::Range<usize> {
-        if !self.show_sections() {
-            return 0..0;
-        }
+    /// Keep the selected command visible, including categories when the pane has room.
+    pub(crate) fn entries(&self, capacity: u16) -> Vec<ListEntry> {
         let capacity = usize::from(capacity);
-        let section = self.section_rows(self.section());
-        let start = self
-            .selected
+        if capacity == 0 || !self.show_sections() {
+            return Vec::new();
+        }
+        let mut entries = Vec::new();
+        if let Some(context) = self.shortcut_group() {
+            let mut last = None;
+            for &index in self.group_rows(context) {
+                let row = &self.revision.map.rows[index - GENERAL_ROWS];
+                let heading = Category::for_command(context, row.command).label();
+                if capacity > 1 && Some(heading) != last {
+                    entries.push(ListEntry::Heading(heading));
+                    last = Some(heading);
+                }
+                entries.push(ListEntry::Row(index));
+            }
+        } else {
+            entries.extend(self.section_rows(self.section()).map(ListEntry::Row));
+        }
+        let selected = entries
+            .iter()
+            .position(|entry| matches!(entry, ListEntry::Row(row) if *row == self.selected))
+            .unwrap_or(0);
+        let start = selected
             .saturating_sub(capacity / 2)
-            .min(section.end.saturating_sub(capacity))
-            .max(section.start);
-        start..(start + capacity).min(section.end)
+            .min(entries.len().saturating_sub(capacity));
+        entries.into_iter().skip(start).take(capacity).collect()
     }
 
     /// Row numbers are relative to the pane interior.
@@ -318,6 +421,7 @@ impl Draft {
         save_state: Option<SaveState>,
         writable: bool,
         compact: bool,
+        show_utilities: bool,
     ) -> Vec<(u16, Vec<Button>)> {
         use Button as B;
         let footer = height - 1;
@@ -347,7 +451,7 @@ impl Draft {
         }
         let mut result = vec![(footer, vec![B::Save, B::Discard, B::Exit])];
         match self.page {
-            Page::List if writable => {
+            Page::List if writable && show_utilities => {
                 let row = if compact { footer - 1 } else { footer };
                 result.push((row, vec![B::Reload, B::Restore]));
             }
@@ -385,11 +489,14 @@ impl Draft {
                     |chord| format!("{}/{} {chord}", self.chord + 1, row.keys().len()),
                 );
                 let source = if row.override_keys.is_some() {
-                    "override"
+                    "Custom"
                 } else {
-                    "default"
+                    "Default"
                 };
-                vec![(0, row.identifier()), (1, format!("{value} ({source})"))]
+                vec![
+                    (0, command_label(row.context, row.command).into()),
+                    (1, format!("{value} ({source})")),
+                ]
             }
             Page::Edit(Operation::Scalar(scalar)) => vec![(
                 0,
@@ -400,7 +507,10 @@ impl Draft {
                 ),
             )],
             Page::Edit(op) => vec![
-                (0, self.revision.map.rows[self.index()].identifier()),
+                (0, {
+                    let row = &self.revision.map.rows[self.index()];
+                    command_label(row.context, row.command).into()
+                }),
                 (
                     1,
                     match op {
@@ -448,11 +558,20 @@ impl Draft {
     fn adjacent(&mut self, delta: isize) {
         match self.page {
             Page::List => {
-                let rows = self.section_rows(self.section());
-                self.selected = self
-                    .selected
-                    .saturating_add_signed(delta)
-                    .clamp(rows.start, rows.end - 1);
+                if let Some(context) = self.shortcut_group() {
+                    let rows = self.group_rows(context);
+                    let index = rows
+                        .iter()
+                        .position(|row| *row == self.selected)
+                        .unwrap_or(0);
+                    self.selected = rows[index.saturating_add_signed(delta).min(rows.len() - 1)];
+                } else {
+                    let rows = self.section_rows(self.section());
+                    self.selected = self
+                        .selected
+                        .saturating_add_signed(delta)
+                        .clamp(rows.start, rows.end - 1);
+                }
                 self.chord = 0;
             }
             Page::Binding => {
@@ -694,6 +813,7 @@ impl AppState {
                     self.focus,
                     command == Command::FocusPrevious,
                     draft.section(),
+                    draft.shortcut_group(),
                     draft.focus(),
                 );
                 self.dirty = true;
@@ -701,7 +821,35 @@ impl AppState {
             }
             Command::Move(movement, _) => {
                 let compact = area.width < crate::ui::SETTINGS_SPLIT_WIDTH;
+                if let Some(Control::SettingsGroup(_)) = self.focus {
+                    let step = match movement {
+                        Movement::Up if !compact => -1,
+                        Movement::Down if !compact => 1,
+                        Movement::Left if compact => -1,
+                        Movement::Right if compact => 1,
+                        Movement::Home | Movement::Start => -(Context::ALL.len() as isize),
+                        Movement::End | Movement::Finish => Context::ALL.len() as isize,
+                        Movement::Left | Movement::Up => {
+                            self.focus = Some(Control::SettingsSection(Section::Keyboard));
+                            self.dirty = true;
+                            return None;
+                        }
+                        Movement::Right | Movement::Down => {
+                            self.focus = Some(draft.focus());
+                            self.dirty = true;
+                            return None;
+                        }
+                        _ => return None,
+                    };
+                    self.settings_group_adjacent(step);
+                    return None;
+                }
                 if let Some(Control::SettingsSection(section)) = self.focus {
+                    if section == Section::Keyboard && !compact && movement == Movement::Down {
+                        self.focus = Some(draft.section_focus());
+                        self.dirty = true;
+                        return None;
+                    }
                     let delta = match movement {
                         Movement::Up if !compact => -1,
                         Movement::Down if !compact => 1,
@@ -710,7 +858,11 @@ impl AppState {
                         Movement::Home | Movement::Start => -3,
                         Movement::End | Movement::Finish => 3,
                         Movement::Right | Movement::Down => {
-                            self.focus = Some(draft.focus());
+                            self.focus = Some(
+                                draft
+                                    .shortcut_group()
+                                    .map_or(draft.focus(), Control::SettingsGroup),
+                            );
                             self.dirty = true;
                             return None;
                         }
@@ -724,9 +876,9 @@ impl AppState {
                     && (movement == Movement::Left && !compact
                         || movement == Movement::Up
                             && compact
-                            && draft.selected == draft.section_rows(draft.section()).start)
+                            && draft.selected == draft.row_start())
                 {
-                    self.focus = Some(Control::SettingsSection(draft.section()));
+                    self.focus = Some(draft.section_focus());
                     self.dirty = true;
                     return None;
                 }
@@ -758,6 +910,17 @@ impl AppState {
                 }
                 Some(Control::SettingsSection(section))
                     if layout.contains(Control::SettingsSection(section)) =>
+                {
+                    self.focus = Some(
+                        draft
+                            .shortcut_group()
+                            .map_or(draft.focus(), Control::SettingsGroup),
+                    );
+                    self.dirty = true;
+                    return None;
+                }
+                Some(Control::SettingsGroup(group))
+                    if layout.contains(Control::SettingsGroup(group)) =>
                 {
                     self.focus = Some(draft.focus());
                     self.dirty = true;
@@ -811,6 +974,37 @@ impl AppState {
         }
     }
 
+    /// Select a shortcut group without changing any bindings in the working draft.
+    pub(super) fn settings_group(&mut self, group: Context) {
+        let Some(draft) = self.settings_ui.as_deref_mut() else {
+            return;
+        };
+        if let Some(active) = draft.shortcut_group() {
+            if active != group {
+                draft.selected = draft.group_rows(group)[0];
+                draft.chord = 0;
+                draft.generation = draft.generation.wrapping_add(1);
+            }
+            self.focus = Some(Control::SettingsGroup(group));
+            self.capture = None;
+            self.dirty = true;
+        }
+    }
+
+    /// Move through scopes in the same order for arrow keys, wheels, and the compact buttons.
+    pub(super) fn settings_group_adjacent(&mut self, step: isize) {
+        if let Some(group) = self
+            .settings_ui
+            .as_ref()
+            .and_then(|draft| draft.shortcut_group())
+        {
+            let index = (group as usize)
+                .saturating_add_signed(step)
+                .min(Context::ALL.len() - 1);
+            self.settings_group(Context::ALL[index]);
+        }
+    }
+
     /// Change sections after validating any pending inline scalar edit.
     pub(super) fn settings_section(&mut self, section: Section, layout: &LayoutSnapshot) {
         let Some(draft) = self.settings_ui.as_deref_mut() else {
@@ -834,7 +1028,11 @@ impl AppState {
             draft.feedback = None;
         }
         if section != draft.section() {
-            draft.selected = draft.section_rows(section).start;
+            draft.selected = if section == Section::Keyboard {
+                draft.group_rows(Context::Global)[0]
+            } else {
+                draft.section_rows(section).start
+            };
             draft.chord = 0;
         }
         self.switch_settings(Page::List);

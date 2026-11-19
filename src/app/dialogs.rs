@@ -406,7 +406,7 @@ impl AppState {
             | Command::SelectRow
             | Command::CloseSelectedTab => {
                 let target = requested.or(self.focus)?;
-                if target == Control::PathCancel {
+                if target == Control::TabListBack {
                     return self.command(Command::Cancel, layout);
                 }
                 let id = highlight.filter(|id| self.screen.tabs.iter().any(|tab| tab.id == *id))?;

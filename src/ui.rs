@@ -23,6 +23,8 @@ pub(crate) enum Control {
     SettingsField,
     SettingsRow(usize),
     SettingsSection(settings_ui::Section),
+    SettingsGroup(Context),
+    SettingsGroupStep(bool),
     UseDefaults,
     Search(u8),
     Content,
@@ -40,6 +42,7 @@ pub(crate) enum Control {
     TabList,
     TabListRow(TabId),
     TabListClose,
+    TabListBack,
     TabListSwitch,
     TabListDetails,
     RecoveryList,
@@ -82,6 +85,8 @@ impl Control {
             | Self::SettingsField
             | Self::SettingsRow(_)
             | Self::SettingsSection(_)
+            | Self::SettingsGroup(_)
+            | Self::SettingsGroupStep(_)
             | Self::PaneOutside
             | Self::TabClose(_)
             | Self::TabDivider => None,
@@ -105,7 +110,9 @@ impl Control {
             Self::Tabs => Some(Command::Tabs),
             Self::Quit | Self::HelpQuit => Some(Command::Quit),
             Self::HelpSuspend => Some(Command::Suspend),
-            Self::HelpClose | Self::PathCancel | Self::DetailsClose => Some(Command::Cancel),
+            Self::HelpClose | Self::PathCancel | Self::DetailsClose | Self::TabListBack => {
+                Some(Command::Cancel)
+            }
             _ => Some(Command::Activate),
         }
     }
@@ -114,6 +121,9 @@ impl Control {
         match self {
             Self::SettingsButton(button) => button.label(),
             Self::SettingsField | Self::SettingsRow(_) | Self::SettingsSection(_) => "",
+            Self::SettingsGroup(group) => settings_ui::group_label(group),
+            Self::SettingsGroupStep(false) => "‹",
+            Self::SettingsGroupStep(true) => "›",
             Self::UseDefaults => "Use defaults for this session",
             Self::WelcomeOpen => "Open File",
             Self::WelcomeNew => "New Scratch",
@@ -141,7 +151,8 @@ impl Control {
             Self::TabDivider => "│",
             Self::PaneOutside => "",
             Self::WorkspaceSettings => "Settings",
-            Self::TabListClose => "Close",
+            Self::TabListClose => "Close Selected Tab",
+            Self::TabListBack => "Back",
             Self::TabListSwitch => "Switch",
             Self::TabListDetails => "Details",
             Self::PickerUp => "Up",
@@ -429,14 +440,19 @@ impl LayoutSnapshot {
                                 x += width + 1;
                             }
                         }
-                        let reserved = u16::from(inline.is_some())
-                            + u16::from(compact && writable && draft.show_utilities());
-                        result.list_rows = body.height.saturating_sub(reserved);
-                        for (offset, row) in draft.rows(result.list_rows).enumerate() {
-                            let y = body.y + u16::from(inline.is_some()) + offset as u16;
+                        if let Some(group) = draft.shortcut_group() {
+                            result.add_shortcut_groups(overlay, body, group, compact);
+                        }
+                        let rows = settings_entries_area(overlay, body, draft, writable);
+                        result.list_rows = rows.height;
+                        for (offset, entry) in draft.entries(rows.height).into_iter().enumerate() {
+                            let settings_ui::ListEntry::Row(row) = entry else {
+                                continue;
+                            };
+                            let y = rows.y + offset as u16;
                             result.add(
                                 Control::SettingsRow(row),
-                                Rect::new(body.x, y, body.width, 1),
+                                Rect::new(rows.x, y, rows.width, 1),
                             );
                             if let Some((index, scalar)) = inline
                                 && row == index
@@ -459,6 +475,7 @@ impl LayoutSnapshot {
                         app.settings_save_state,
                         writable,
                         compact,
+                        settings_utilities(overlay, draft),
                     ) {
                         let mut x = overlay.x + 1;
                         if buttons[0].align_right() {
@@ -589,17 +606,28 @@ impl LayoutSnapshot {
                 result.add(Control::ConfirmCancel, Rect::new(overlay.x + 13, y, 10, 1));
             }
             Some(Modal::Tabs(selected)) => {
-                let rows = overlay.height.saturating_sub(3);
-                result.list_rows = rows;
-                result.add(
-                    Control::TabList,
-                    Rect::new(overlay.x + 1, overlay.y + 1, overlay.width - 2, rows),
-                );
                 let highlight = app
                     .screen
                     .tabs
                     .iter()
                     .position(|tab| Some(tab.id) == *selected);
+                let actions = [
+                    Control::TabListClose,
+                    Control::TabListBack,
+                    Control::TabListSwitch,
+                    Control::TabListDetails,
+                ];
+                let buttons_width: u16 = actions
+                    .iter()
+                    .map(|control| control.label().width() as u16 + 3)
+                    .sum();
+                let wrap = highlight.is_some() && buttons_width - 1 > overlay.width - 2;
+                let rows = overlay.height - 3 - u16::from(wrap);
+                result.list_rows = rows;
+                result.add(
+                    Control::TabList,
+                    Rect::new(overlay.x + 1, overlay.y + 1, overlay.width - 2, rows),
+                );
                 for (row, tab) in app
                     .screen
                     .tabs
@@ -618,13 +646,19 @@ impl LayoutSnapshot {
                         ),
                     );
                 }
-                if highlight.is_some() {
-                    result.add(Control::TabListClose, Rect::new(overlay.x + 1, y, 7, 1));
-                }
-                result.add(Control::PathCancel, Rect::new(overlay.x + 9, y, 6, 1));
-                if highlight.is_some() {
-                    result.add(Control::TabListSwitch, Rect::new(overlay.x + 16, y, 8, 1));
-                    result.add(Control::TabListDetails, Rect::new(overlay.x + 25, y, 9, 1));
+                if highlight.is_none() {
+                    result.add(Control::TabListBack, Rect::new(overlay.x + 1, y, 6, 1));
+                } else {
+                    let mut x = overlay.x + 1;
+                    for (index, control) in actions.into_iter().enumerate() {
+                        let row = if wrap && index == 0 { y - 1 } else { y };
+                        if wrap && index == 1 {
+                            x = overlay.x + 1;
+                        }
+                        let width = control.label().width() as u16 + 2;
+                        result.add(control, Rect::new(x, row, width, 1));
+                        x += width + 1;
+                    }
                 }
             }
             Some(Modal::Open(dialog)) => {
@@ -700,6 +734,47 @@ impl LayoutSnapshot {
         }
         result
     }
+    /// Wide panes show a sidebar list. Compact panes show clickable previous and next controls.
+    fn add_shortcut_groups(&mut self, overlay: Rect, body: Rect, group: Context, compact: bool) {
+        if compact {
+            let mut x = body.x;
+            let group_width = Context::ALL
+                .into_iter()
+                .map(|context| settings_ui::group_label(context).width() as u16 + 2)
+                .max()
+                .expect("at least one shortcut context");
+            for control in [
+                Control::SettingsGroupStep(false),
+                Control::SettingsGroup(group),
+                Control::SettingsGroupStep(true),
+            ] {
+                let width = match control {
+                    Control::SettingsGroup(_) => group_width,
+                    _ => control.label().width() as u16 + 2,
+                };
+                self.add(control, Rect::new(x, body.y, width, 1));
+                x += width + 1;
+            }
+        } else {
+            let y = overlay.y + 4;
+            let rows = overlay.bottom() - 2 - y;
+            let start = list_start(group as usize, rows);
+            for (offset, context) in Context::ALL
+                .into_iter()
+                .skip(start)
+                .take(usize::from(rows))
+                .enumerate()
+            {
+                let control = Control::SettingsGroup(context);
+                let width = control.label().width() as u16 + 2;
+                self.add(
+                    control,
+                    Rect::new(overlay.x + 2, y + offset as u16, width, 1),
+                );
+            }
+        }
+    }
+
     /// Allocate a compact first-row strip around the active tab.
     fn add_tab_strip(&mut self, app: &AppState) {
         let area = self.area;
@@ -802,10 +877,13 @@ impl LayoutSnapshot {
         current: Option<Control>,
         backwards: bool,
         section: settings_ui::Section,
+        group: Option<Context>,
         row: Control,
     ) -> Option<Control> {
         self.next_when(current, backwards, |control| match control {
             Control::SettingsSection(active) => active == section,
+            Control::SettingsGroup(active) => Some(active) == group,
+            Control::SettingsGroupStep(_) => false,
             Control::SettingsField | Control::SettingsRow(_) => control == row,
             _ => true,
         })
@@ -861,6 +939,45 @@ fn settings_body(overlay: Rect, draft: &settings_ui::Draft) -> Rect {
         overlay.y + 1 + header,
         overlay.width - 2 - sidebar,
         overlay.height - 3 - header,
+    )
+}
+
+/// Leave room for one shortcut below the group selector and headings at 40×8.
+fn settings_utilities(overlay: Rect, draft: &settings_ui::Draft) -> bool {
+    draft.show_utilities()
+        && (draft.shortcut_group().is_none()
+            || overlay.width >= SETTINGS_SPLIT_WIDTH
+            || overlay.height > 7)
+}
+
+/// Account for group selectors, column headings, and any utility row.
+fn settings_entries_area(
+    overlay: Rect,
+    body: Rect,
+    draft: &settings_ui::Draft,
+    writable: bool,
+) -> Rect {
+    let compact = overlay.width < SETTINGS_SPLIT_WIDTH;
+    let before = if draft.shortcut_group().is_some() {
+        1 + u16::from(compact)
+    } else {
+        u16::from(draft.inline_scalar().is_some())
+    };
+    let after = u16::from(compact && writable && settings_utilities(overlay, draft));
+    Rect::new(
+        body.x,
+        body.y + before,
+        body.width,
+        body.height.saturating_sub(before + after),
+    )
+}
+
+/// Split shortcut cells at the same position used by their headings.
+fn shortcut_columns(row: Rect) -> (Rect, Rect) {
+    let command = (row.width / 2).min(36);
+    (
+        Rect::new(row.x, row.y, command, 1),
+        Rect::new(row.x + command + 1, row.y, row.width - command - 1, 1),
     )
 }
 
@@ -1706,24 +1823,19 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &AppState, layout: &LayoutSnaps
             continue;
         }
         let focused = app.focus == Some(target.control);
-        let title =
-            if target.control == Control::PathCancel && matches!(app.modal, Some(Modal::Tabs(_))) {
-                "Back"
-            } else {
-                target.control.label()
-            };
+        let title = target.control.label();
         let label = if focused {
             format!(">{title}<")
         } else {
             format!("[{title}]")
         };
-        let style = if focused {
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default()
+        let color = match target.control {
+            Control::TabListClose => Some(Color::Red),
+            Control::TabListSwitch => Some(Color::Green),
+            _ if focused => Some(Color::Cyan),
+            _ => None,
         };
+        let style = button_style(color, focused);
         frame.render_widget(Paragraph::new(label).style(style), target.area);
     }
 }
@@ -1801,6 +1913,18 @@ fn render_actions(
     );
 }
 
+/// Preserve button meaning and a distinct focus indicator in any terminal palette.
+fn button_style(color: Option<Color>, focused: bool) -> Style {
+    let mut style = Style::default();
+    if let Some(color) = color {
+        style = style.fg(color);
+    }
+    if focused {
+        style = style.add_modifier(Modifier::BOLD);
+    }
+    style
+}
+
 /// Display the right end of an editable field using the prepared hit geometry.
 fn render_settings(frame: &mut Frame<'_>, app: &AppState, layout: &LayoutSnapshot, overlay: Rect) {
     let Some(draft) = &app.settings_ui else {
@@ -1810,7 +1934,7 @@ fn render_settings(frame: &mut Frame<'_>, app: &AppState, layout: &LayoutSnapsho
     frame.render_widget(Clear, overlay);
     frame.render_widget(
         Block::default()
-            .title(draft.title(&app.settings, &app.config_location, compact))
+            .title(draft.title(&app.settings, &app.config_location, overlay.width))
             .borders(Borders::ALL),
         overlay,
     );
@@ -1818,6 +1942,21 @@ fn render_settings(frame: &mut Frame<'_>, app: &AppState, layout: &LayoutSnapsho
     if draft.show_sections() && !compact {
         for y in body.y..body.bottom() {
             frame.render_widget(Paragraph::new("│"), Rect::new(body.x - 1, y, 1, 1));
+        }
+    }
+    if draft.shortcut_group().is_some() {
+        let y = body.y + u16::from(compact);
+        let (command, shortcut) = shortcut_columns(Rect::new(body.x, y, body.width, 1));
+        let header = Style::default().add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
+        frame.render_widget(Paragraph::new("Command").style(header), command);
+        frame.render_widget(Paragraph::new("Shortcut").style(header), shortcut);
+        for (offset, entry) in draft.entries(layout.list_rows()).into_iter().enumerate() {
+            if let settings_ui::ListEntry::Heading(heading) = entry {
+                frame.render_widget(
+                    Paragraph::new(heading).style(Style::default().add_modifier(Modifier::BOLD)),
+                    Rect::new(body.x, y + 1 + offset as u16, body.width, 1),
+                );
+            }
         }
     }
     for (row, text) in draft.lines(&app.settings) {
@@ -1856,15 +1995,9 @@ fn render_settings(frame: &mut Frame<'_>, app: &AppState, layout: &LayoutSnapsho
                     B::Discard | B::DiscardAndExit | B::DiscardCapture => Some(Color::Red),
                     _ => None,
                 };
-                let mut button_style = Style::default();
-                if let Some(color) = foreground {
-                    button_style = button_style.fg(color);
-                }
-                if focus {
-                    button_style = button_style.add_modifier(Modifier::BOLD);
-                }
                 frame.render_widget(
-                    Paragraph::new(format!("{open}{}{close}", button.label())).style(button_style),
+                    Paragraph::new(format!("{open}{}{close}", button.label()))
+                        .style(button_style(foreground, focus)),
                     target.area,
                 );
             }
@@ -1880,6 +2013,31 @@ fn render_settings(frame: &mut Frame<'_>, app: &AppState, layout: &LayoutSnapsho
                     target.area,
                 );
             }
+            Control::SettingsGroup(group) => {
+                let active = draft.shortcut_group() == Some(group);
+                let style = if active {
+                    style.add_modifier(Modifier::REVERSED)
+                } else {
+                    style
+                };
+                let (open, close) = if focus {
+                    ('>', '<')
+                } else if compact {
+                    ('[', ']')
+                } else {
+                    (' ', ' ')
+                };
+                frame.render_widget(
+                    Paragraph::new(format!("{open}{}{close}", target.control.label())).style(style),
+                    target.area,
+                );
+            }
+            Control::SettingsGroupStep(_) => {
+                frame.render_widget(
+                    Paragraph::new(format!("[{}]", target.control.label())),
+                    target.area,
+                );
+            }
             Control::SettingsField => {
                 let text = tail_cells(&safe(&draft.field), target.area.width);
                 frame.render_widget(Clear, target.area);
@@ -1888,6 +2046,16 @@ fn render_settings(frame: &mut Frame<'_>, app: &AppState, layout: &LayoutSnapsho
                     frame.set_cursor_position((target.area.x + column, target.area.y));
                 }
                 frame.render_widget(Paragraph::new(text).style(style), target.area);
+            }
+            Control::SettingsRow(index) if draft.shortcut_group().is_some() => {
+                let (command, shortcut) = shortcut_columns(target.area);
+                let (title, value) = draft.shortcut_columns(index, shortcut.width);
+                let marker = if focus { '>' } else { ' ' };
+                frame.render_widget(
+                    Paragraph::new(format!("{marker}{title}")).style(style),
+                    command,
+                );
+                frame.render_widget(Paragraph::new(value).style(style), shortcut);
             }
             Control::SettingsRow(index) => {
                 let label = match draft.inline_scalar() {

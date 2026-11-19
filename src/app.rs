@@ -1844,11 +1844,19 @@ impl AppState {
                 MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
             )
         {
-            self.settings_adjacent(if mouse.kind == MouseEventKind::ScrollUp {
-                -3
+            let step = if mouse.kind == MouseEventKind::ScrollUp {
+                -1
             } else {
-                3
-            });
+                1
+            };
+            if matches!(
+                hit,
+                Some(Control::SettingsGroup(_) | Control::SettingsGroupStep(_))
+            ) {
+                self.settings_group_adjacent(step);
+            } else {
+                self.settings_adjacent(step * 3);
+            }
             return None;
         }
         if self.search.open
@@ -2025,6 +2033,10 @@ impl AppState {
                             self.settings_button(button, layout);
                         } else if let Control::SettingsSection(section) = capture.control {
                             self.settings_section(section, layout);
+                        } else if let Control::SettingsGroup(group) = capture.control {
+                            self.settings_group(group);
+                        } else if let Control::SettingsGroupStep(next) = capture.control {
+                            self.settings_group_adjacent(if next { 1 } else { -1 });
                         } else if let Control::SettingsRow(row) = capture.control {
                             self.settings_row(row, layout);
                         } else if let Some(Modal::Menu(menu)) = &mut self.modal {
