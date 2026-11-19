@@ -15,6 +15,7 @@ pub(crate) struct Dialog {
 
 impl AppState {
     pub(super) fn open_recovery(&mut self) -> Option<Intent> {
+        self.opener = self.focus;
         self.picker_generation = self.picker_generation.wrapping_add(1);
         let generation = self.picker_generation;
         self.modal = Some(Modal::Recovery(Box::new(Dialog {

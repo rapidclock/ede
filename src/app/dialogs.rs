@@ -3,6 +3,86 @@
 use super::*;
 
 impl AppState {
+    /// Open a details dialog without changing the active document or its viewport.
+    pub(super) fn open_tab_details(&mut self, tab: Option<TabId>, from_tabs: bool) {
+        self.modal = Some(Modal::TabDetails { tab, from_tabs });
+        self.focus_details();
+    }
+
+    /// Open About, carrying the Settings control to restore for legacy bindings.
+    pub(super) fn open_about(&mut self, settings_focus: Option<Control>) {
+        self.modal = Some(Modal::About { settings_focus });
+        self.focus_details();
+    }
+
+    /// Let a user read a full diagnostic without leaving the current Settings draft.
+    pub(super) fn open_settings_diagnostic(&mut self, text: String, settings_focus: Control) {
+        self.modal = Some(Modal::SettingsDiagnostic {
+            text,
+            settings_focus,
+        });
+        self.focus_details();
+    }
+
+    fn focus_details(&mut self) {
+        self.focus = Some(Control::DetailsClose);
+        self.help_scroll = 0;
+        self.capture = None;
+        self.dirty = true;
+    }
+
+    /// Restore the parent of a child dialog without consuming the workspace opener.
+    pub(super) fn return_to_parent(&mut self) -> bool {
+        (self.modal, self.focus) = match &self.modal {
+            Some(Modal::TabDetails {
+                tab,
+                from_tabs: true,
+            }) => (Some(Modal::Tabs(*tab)), Some(Control::TabListDetails)),
+            Some(
+                Modal::About {
+                    settings_focus: Some(focus),
+                }
+                | Modal::SettingsDiagnostic {
+                    settings_focus: focus,
+                    ..
+                },
+            ) => (Some(Modal::Settings), Some(*focus)),
+            _ => return false,
+        };
+        self.capture = None;
+        self.dirty = true;
+        true
+    }
+
+    /// Details can refresh only the named, non-streaming tab they describe.
+    pub(crate) fn details_refresh_target(&self) -> Option<TabId> {
+        let tab = match self.modal {
+            Some(Modal::TabDetails { tab, .. }) => tab?,
+            Some(Modal::Details(_)) => self.screen.tab?,
+            _ => return None,
+        };
+        if self.screen.tab == Some(tab) {
+            return (self.screen.path.is_some() && self.screen.stream.is_none()).then_some(tab);
+        }
+        self.screen.tabs.iter().find_map(|entry| {
+            (entry.id == tab && entry.path_hint.is_some() && entry.stream.is_none()).then_some(tab)
+        })
+    }
+
+    /// Display the running package version and the resolved configuration path safely.
+    pub(crate) fn about(&self) -> String {
+        let location = self.config_location.display_file().map_or_else(
+            || "Configuration path unavailable".into(),
+            |path| format!("Configuration file\n{path}"),
+        );
+        let suffix = if self.config_location.safe() {
+            "\nSafe config uses bundled settings."
+        } else {
+            ""
+        };
+        format!("ede {}\n{location}{suffix}", env!("CARGO_PKG_VERSION"))
+    }
+
     /// Apply a choice to the tab the picker was opened for, or keep it pending at tiny sizes.
     pub(super) fn syntax_picker_command(
         &mut self,
@@ -72,6 +152,7 @@ impl AppState {
 
     pub(super) fn tab_change(&mut self, action: Action) -> Option<Intent> {
         self.capture = None;
+        self.opener = None;
         self.focus = Some(Control::Content);
         self.dirty = true;
         Some(Intent::Editor(action))
@@ -324,12 +405,21 @@ impl AppState {
             | Command::Newline
             | Command::SelectRow
             | Command::CloseSelectedTab => {
-                let action = match requested.or(self.focus) {
-                    Some(Control::TabList | Control::TabListSwitch) => {
-                        Action::Switch((*highlight)?)
+                let target = requested.or(self.focus)?;
+                if target == Control::PathCancel {
+                    return self.command(Command::Cancel, layout);
+                }
+                let id = highlight.filter(|id| self.screen.tabs.iter().any(|tab| tab.id == *id))?;
+                if !layout.contains(target) {
+                    return None;
+                }
+                let action = match target {
+                    Control::TabList | Control::TabListSwitch => Action::Switch(id),
+                    Control::TabListClose => Action::Guard(After::Close(id)),
+                    Control::TabListDetails => {
+                        self.open_tab_details(Some(id), true);
+                        return None;
                     }
-                    Some(Control::TabListClose) => Action::Guard(After::Close((*highlight)?)),
-                    Some(Control::PathCancel) => return self.command(Command::Cancel, layout),
                     _ => return None,
                 };
                 self.modal = None;

@@ -2934,7 +2934,7 @@ mod ordering_tests {
     use super::*;
     use std::io::Read;
     /// A detached bridge lets tests hold its input queue full without timing races.
-    fn bridge() -> (Editor, Receiver<Envelope>) {
+    pub(super) fn bridge() -> (Editor, Receiver<Envelope>) {
         let (sender, inbox) = mpsc::sync_channel(256);
         let (_, events) = mpsc::sync_channel(16);
         (
@@ -3206,6 +3206,16 @@ mod ordering_tests {
             .unwrap();
         assert_eq!(clipboard, "old clipboard");
     }
+}
+
+/// Hold a full queue until the test explicitly releases one entry.
+#[cfg(test)]
+pub(crate) fn saturated_input_queue() -> (Editor, impl FnMut()) {
+    let (mut editor, inbox) = ordering_tests::bridge();
+    for _ in 0..256 {
+        assert!(editor.submit(Action::ClearSelection));
+    }
+    (editor, move || drop(inbox.try_recv().unwrap()))
 }
 
 #[cfg(test)]

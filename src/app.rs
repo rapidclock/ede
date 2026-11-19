@@ -24,6 +24,7 @@ use std::{
     time::{Duration, Instant},
 };
 mod dialogs;
+pub(crate) mod menu;
 pub(crate) mod recovery;
 pub(crate) mod search;
 pub(crate) mod settings_ui;
@@ -39,6 +40,7 @@ pub(crate) enum Intent {
     CancelWork,
     Picker(picker::Request),
     CancelPicker,
+    DismissSearch,
 }
 /// Direct-path dialog intent; paths remain separate from safe display labels.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -51,7 +53,7 @@ pub(crate) enum PathKind {
 #[derive(Clone, Debug)]
 pub(crate) enum Modal {
     ReplaceAll(crate::editor::search::SearchRequest),
-    Menu(usize),
+    Menu(menu::Menu),
     Language {
         tab: TabId,
         selected: Choice,
@@ -65,7 +67,17 @@ pub(crate) enum Modal {
     Open(Box<picker::Dialog>),
     Tabs(Option<TabId>),
     Confirm(After, Option<JobId>),
-    TabDetails,
+    TabDetails {
+        tab: Option<TabId>,
+        from_tabs: bool,
+    },
+    About {
+        settings_focus: Option<Control>,
+    },
+    SettingsDiagnostic {
+        text: String,
+        settings_focus: Control,
+    },
     Details(String),
     SaveError(String),
     PersistenceError(String),
@@ -165,46 +177,6 @@ pub(crate) struct AppState {
     pub field_error: Option<String>,
     pub stream_confirmation: Option<String>,
 }
-/// Discoverable menu actions; every item shares keyboard command dispatch.
-pub(crate) const MENU: &[Command] = &[
-    Command::New,
-    Command::Open,
-    Command::Save,
-    Command::SaveAs,
-    Command::Undo,
-    Command::Redo,
-    Command::Cut,
-    Command::Copy,
-    Command::Paste,
-    Command::SelectAll,
-    Command::GoTo,
-    Command::MouseCapture,
-    Command::Help,
-    Command::Suspend,
-    Command::Quit,
-    Command::Tabs,
-    Command::CloseTab,
-    Command::TabDetails,
-    Command::Recovery,
-    Command::RetryRefresh,
-    Command::Find,
-    Command::Replace,
-    Command::FindNext,
-    Command::FindPrevious,
-    Command::ReplaceNext,
-    Command::ReplaceAll,
-    Command::CancelSearch,
-    Command::Language,
-    Command::SyntaxTheme,
-    Command::ReloadHighlighting,
-    Command::RetryHighlighting,
-    Command::FollowFile,
-    Command::ToggleFollow,
-    Command::RetryFinish,
-    Command::ExportRetained,
-    Command::Settings,
-    Command::ReloadSettings,
-];
 impl AppState {
     /// Begin with text focus and a visible asynchronous preparation state.
     pub fn new() -> Self {
@@ -280,18 +252,28 @@ impl AppState {
         !self.screen.loading && self.switching.is_none() && self.screen.document.is_some()
     }
 
-    /// Read live tab metadata so ordered editor replies can update an open Details dialog.
+    /// Read metadata for the dialog's stable tab ID, including a parked tab.
     pub(crate) fn tab_details(&self) -> String {
-        let mut label = self.screen.path.as_ref().map_or_else(
-            || self.tab_label(self.screen.tab).to_owned(),
-            |path| crate::text::safe(&path.to_string_lossy()),
-        );
-        if let Some(tab) = self
-            .screen
-            .tabs
-            .iter()
-            .find(|tab| Some(tab.id) == self.screen.tab)
-        {
+        let id = match self.modal {
+            Some(Modal::TabDetails { tab, .. }) => tab,
+            _ => self.screen.tab,
+        };
+        let active = id == self.screen.tab;
+        let summary = self.screen.tabs.iter().find(|tab| Some(tab.id) == id);
+        if !active && summary.is_none() {
+            return "Tab is no longer available".into();
+        }
+        let mut label = if active {
+            self.screen.path.as_ref().map_or_else(
+                || self.tab_label(id).to_owned(),
+                |path| crate::text::safe(&path.to_string_lossy()),
+            )
+        } else {
+            self.tab_path_hint(id)
+                .unwrap_or_else(|| self.tab_label(id))
+                .to_owned()
+        };
+        if let Some(tab) = summary {
             if tab.scratch {
                 label.push_str(&format!("\nScratch — {}", tab.retention));
             }
@@ -299,9 +281,26 @@ impl AppState {
                 label.push('\n');
                 label.push_str(&crate::text::safe(warning));
             }
+            if tab.waiting || tab.loading {
+                label.push_str(if tab.waiting {
+                    "\nWaiting to load"
+                } else {
+                    "\nLoading"
+                });
+            }
         }
-        let choice = self.screen.syntax_language;
-        if let Some(stream) = &self.screen.stream {
+        let (stream, language, auto) = match summary.filter(|_| !active) {
+            Some(tab) => (tab.stream.as_ref(), tab.language, tab.language_auto),
+            None => {
+                let choice = self.screen.syntax_language;
+                (
+                    self.screen.stream.as_ref(),
+                    choice.effective(self.screen.path.as_deref(), &self.screen.syntax_config),
+                    choice == Choice::Auto,
+                )
+            }
+        };
+        if let Some(stream) = stream {
             let following = if stream.following {
                 "following"
             } else {
@@ -318,17 +317,31 @@ impl AppState {
                 label.push_str(&format!("\n{}", crate::text::safe(detail)));
             }
         }
-        let language = choice.name(self.screen.path.as_deref(), &self.screen.syntax_config);
-        let mode = if choice == Choice::Auto {
-            "Auto"
+        let mode = if auto { "Auto" } else { "Manual" };
+        let name = language.map_or("Plain Text", |language| language.label);
+        label.push_str(&format!("\nLanguage: {name} ({mode})"));
+        let syntax = if active {
+            self.active_highlighting_status()
+        } else if language.is_some() {
+            "analysis runs when the tab is active".into()
         } else {
-            "Manual"
+            "Plain Text".into()
         };
-        label.push_str(&format!("\nLanguage: {language} ({mode})"));
+        label.push_str(&format!("\nHighlighting: {syntax}"));
+        if let Some(error) = &self.screen.syntax_notice {
+            label.push_str(&format!(
+                "\nHighlighting configuration: {}",
+                crate::text::safe(error)
+            ));
+        }
+        label
+    }
+
+    fn active_highlighting_status(&self) -> String {
         let limits = self.settings.applied.values.syntax();
         let defaults = settings::SyntaxLimits::default();
         use crate::syntax::{Fallback, Status};
-        let syntax = match self.screen.syntax_status {
+        match self.screen.syntax_status {
             Status::Fallback(Fallback::Size) if limits.document != defaults.document => {
                 format!("document exceeds {} bytes", limits.document)
             }
@@ -339,15 +352,7 @@ impl AppState {
                 format!("analysis exceeded {} ms", limits.timeout.as_millis())
             }
             status => status.message().to_owned(),
-        };
-        label.push_str(&format!("\nHighlighting: {syntax}"));
-        if let Some(error) = &self.screen.syntax_notice {
-            label.push_str(&format!(
-                "\nHighlighting configuration: {}",
-                crate::text::safe(error)
-            ));
         }
-        label
     }
 
     fn field_open(&self) -> bool {
@@ -371,10 +376,12 @@ impl AppState {
             self.capture = None;
             return;
         }
-        if let Some(Modal::Menu(index)) = self.modal
-            && layout.contains(Control::MenuItem(index))
-        {
-            self.focus = Some(Control::MenuItem(index));
+        if let Some(Modal::Menu(menu)) = self.modal {
+            self.focus = Some(if menu.commands_focused {
+                Control::MenuItem(menu.row)
+            } else {
+                Control::MenuCategory(menu.category)
+            });
         }
         if !self.focus.is_some_and(|focus| layout.contains(focus)) {
             self.focus = if layout.contains(Control::Content) {
@@ -688,6 +695,9 @@ impl AppState {
     }
     /// Open a path field with no shell interpretation.
     fn path(&mut self, kind: PathKind) {
+        if self.modal.is_none() && self.guard_request.is_none() {
+            self.opener = self.focus;
+        }
         self.field_generation = self.field_generation.wrapping_add(1);
         self.field_paste = None;
         self.field_submit = None;
@@ -708,6 +718,7 @@ impl AppState {
             && !self.help
             && let Some(error) = self.open_errors.pop_front()
         {
+            self.opener = self.focus;
             self.modal = Some(Modal::Details(error));
             self.focus = Some(Control::DetailsClose);
             self.help_scroll = 0;
@@ -1104,7 +1115,10 @@ impl AppState {
                 | Command::DialogRetry
                 | Command::ConfirmReplaceAll
         ) || command == Command::RetryRefresh
-            && matches!(self.modal, Some(Modal::Details(_) | Modal::TabDetails))
+            && matches!(
+                self.modal,
+                Some(Modal::Details(_) | Modal::TabDetails { .. })
+            )
         {
             let target = match (&self.modal, command) {
                 (Some(Modal::Confirm(..)), Command::DialogSave) => Control::ConfirmSave,
@@ -1115,7 +1129,7 @@ impl AppState {
                     Control::RecoveryErrorRetry
                 }
                 (
-                    Some(Modal::Details(_) | Modal::TabDetails),
+                    Some(Modal::Details(_) | Modal::TabDetails { .. }),
                     Command::DialogRetry | Command::RetryRefresh,
                 ) => Control::RetryRefresh,
                 (Some(Modal::ReplaceAll(_)), Command::ConfirmReplaceAll) => Control::Search(15),
@@ -1145,11 +1159,19 @@ impl AppState {
             self.field_submit = None;
             self.search_submit_field = None;
             self.save_dialog = None;
+            if self.return_to_parent() {
+                return None;
+            }
             let guarded = self.guard_request.is_some();
             let picker = matches!(self.modal, Some(Modal::Open(_)));
             if self.modal.take().is_some() || self.help || guarded {
                 self.help = false;
-                self.focus = self.opener.take().or(Some(Control::Content));
+                let opener = if guarded && self.guard_return.is_some() {
+                    self.opener
+                } else {
+                    self.opener.take()
+                };
+                self.focus = opener.or(Some(Control::Content));
                 if guarded {
                     self.restore_guard_surface();
                 } else {
@@ -1404,7 +1426,15 @@ impl AppState {
             }
             return None;
         }
-        if matches!(self.modal, Some(Modal::Details(_) | Modal::TabDetails)) {
+        if matches!(
+            self.modal,
+            Some(
+                Modal::Details(_)
+                    | Modal::TabDetails { .. }
+                    | Modal::About { .. }
+                    | Modal::SettingsDiagnostic { .. }
+            )
+        ) {
             if matches!(
                 command,
                 Command::Tab | Command::FocusNext | Command::FocusPrevious
@@ -1417,10 +1447,13 @@ impl AppState {
                 || (matches!(command, Command::Activate | Command::Newline)
                     && self.focus == Some(Control::RetryRefresh))
             {
-                self.modal = None;
-                self.focus = Some(Control::Content);
-                self.dirty = true;
-                return Some(Intent::Editor(Action::RetryRefresh(self.screen.tab?)));
+                if !layout.contains(Control::RetryRefresh) {
+                    return None;
+                }
+                let tab = self.details_refresh_target()?;
+                return self
+                    .command(Command::Cancel, layout)
+                    .or(Some(Intent::Editor(Action::RetryRefresh(tab))));
             }
             if matches!(command, Command::Move(..)) {
                 self.help_scroll =
@@ -1431,42 +1464,46 @@ impl AppState {
                     };
                 self.dirty = true;
             }
-            if matches!(command, Command::Activate | Command::Newline) {
-                self.modal = None;
-                self.focus = self.opener.take().or(Some(Control::Content));
-                self.dirty = true;
-                self.show_open_error();
+            if matches!(command, Command::Activate | Command::Newline)
+                && self.focus == Some(Control::DetailsClose)
+                && layout.contains(Control::DetailsClose)
+            {
+                return self.command(Command::Cancel, layout);
             }
             return None;
         }
-        if let Some(Modal::Menu(index)) = &mut self.modal {
-            match command {
-                Command::Move(Movement::Up, _) => {
-                    *index = index.saturating_sub(1);
-                    self.dirty = true;
-                    return None;
+        if let Some(Modal::Menu(menu)) = &mut self.modal {
+            layout.overlay?;
+            let selected = match command {
+                Command::Move(Movement::Left, _) => {
+                    menu.commands_focused = false;
+                    None
                 }
-                Command::Move(Movement::Down, _) => {
-                    *index = (*index + 1).min(MENU.len() - 1);
-                    self.dirty = true;
-                    return None;
+                Command::Move(Movement::Right, _) => {
+                    menu.commands_focused = true;
+                    None
                 }
-                Command::Newline | Command::Activate | Command::SelectRow => {
-                    command = MENU[*index];
+                Command::Move(movement, _) => {
+                    menu.move_in(menu.commands_focused, movement, layout.list_rows());
+                    None
                 }
                 Command::FocusNext | Command::FocusPrevious | Command::Tab => {
-                    *index = (*index
-                        + if command == Command::FocusPrevious {
-                            MENU.len() - 1
-                        } else {
-                            1
-                        })
-                        % MENU.len();
-                    self.dirty = true;
-                    return None;
+                    menu.commands_focused = !menu.commands_focused;
+                    None
+                }
+                Command::Newline | Command::Activate | Command::SelectRow
+                    if menu.commands_focused =>
+                {
+                    Some(menu.commands()[menu.row])
+                }
+                Command::Newline | Command::Activate | Command::SelectRow => {
+                    menu.commands_focused = true;
+                    None
                 }
                 _ => return None,
-            }
+            };
+            self.dirty = true;
+            command = selected?;
             if matches!(
                 command,
                 Command::ReloadHighlighting | Command::ReloadSettings
@@ -1481,7 +1518,19 @@ impl AppState {
             }
             self.focus = if matches!(
                 command,
-                Command::Language | Command::SyntaxTheme | Command::Settings
+                Command::Language
+                    | Command::SyntaxTheme
+                    | Command::Settings
+                    | Command::About
+                    | Command::TabDetails
+                    | Command::Tabs
+                    | Command::Open
+                    | Command::FollowFile
+                    | Command::Recovery
+                    | Command::GoTo
+                    | Command::SaveAs
+                    | Command::ExportRetained
+                    | Command::Help
             ) {
                 self.opener.take().or(Some(Control::Content))
             } else {
@@ -1559,11 +1608,13 @@ impl AppState {
             }
             Command::CloseTab => self.close_tab(self.screen.tab?),
             Command::TabDetails => {
-                self.modal = Some(Modal::TabDetails);
-                self.focus = Some(Control::DetailsClose);
-                self.help_scroll = 0;
-                self.capture = None;
-                self.dirty = true;
+                self.opener = self.focus;
+                self.open_tab_details(self.screen.tab, false);
+                None
+            }
+            Command::About => {
+                self.opener = self.focus;
+                self.open_about(None);
                 None
             }
             Command::Language if self.ready() => {
@@ -1679,7 +1730,7 @@ impl AppState {
                 self.save_dialog = None;
                 self.help = false;
                 self.opener = self.focus;
-                self.modal = Some(Modal::Menu(0));
+                self.modal = Some(Modal::Menu(menu::Menu::default()));
                 self.capture = None;
                 self.dirty = true;
                 None
@@ -1763,16 +1814,18 @@ impl AppState {
         if !self.mouse_capture {
             return None;
         }
-        let hit = match layout.hit(mouse.column, mouse.row) {
-            None if matches!(self.modal, Some(Modal::Menu(_)))
-                && layout
-                    .overlay
-                    .is_some_and(|area| !area.contains((mouse.column, mouse.row).into())) =>
-            {
-                Some(Control::MenuOutside)
-            }
-            Some(Control::TabDivider) => None,
-            hit => hit,
+        let hit = if matches!(
+            mouse.kind,
+            MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Up(MouseButton::Left)
+        ) && self.dismissible_bounds(layout).is_some_and(|area| {
+            !area.contains((mouse.column, mouse.row).into())
+                && layout.area.contains((mouse.column, mouse.row).into())
+        }) {
+            Some(Control::PaneOutside)
+        } else {
+            layout
+                .hit(mouse.column, mouse.row)
+                .filter(|control| *control != Control::TabDivider)
         };
         if let Some(Modal::Open(picker)) = &mut self.modal {
             match (mouse.kind, hit) {
@@ -1836,18 +1889,19 @@ impl AppState {
                     layout,
                 );
             }
-            if let Some(Modal::Menu(index)) = &mut self.modal {
-                *index = if up {
-                    index.saturating_sub(1)
-                } else {
-                    (*index + 1).min(MENU.len() - 1)
-                };
+            if let Some(Modal::Menu(menu)) = &mut self.modal {
+                if let Some(commands) = layout.menu_column(mouse.column, mouse.row) {
+                    let movement = if up { Movement::Up } else { Movement::Down };
+                    menu.move_in(commands, movement, layout.list_rows());
+                }
             } else if self.help
                 || matches!(
                     self.modal,
                     Some(
                         Modal::Details(_)
-                            | Modal::TabDetails
+                            | Modal::TabDetails { .. }
+                            | Modal::About { .. }
+                            | Modal::SettingsDiagnostic { .. }
                             | Modal::SaveError(_)
                             | Modal::ReplaceAll(_)
                     )
@@ -1876,7 +1930,7 @@ impl AppState {
                     y: mouse.row,
                 });
                 if let Some(control) = hit.filter(|control| {
-                    !matches!(control, Control::MenuOutside | Control::TabClose(_))
+                    !matches!(control, Control::PaneOutside | Control::TabClose(_))
                 }) {
                     self.focus = Some(control);
                     self.dirty = true;
@@ -1901,7 +1955,8 @@ impl AppState {
                         capture.control,
                         Control::PickerRow(_)
                             | Control::MenuItem(_)
-                            | Control::MenuOutside
+                            | Control::MenuCategory(_)
+                            | Control::PaneOutside
                             | Control::TabClose(_)
                     )
                 }) {
@@ -1945,8 +2000,8 @@ impl AppState {
                             );
                         }
                     } else if hit == Some(capture.control) {
-                        if capture.control == Control::MenuOutside {
-                            return self.command(Command::Cancel, layout);
+                        if capture.control == Control::PaneOutside {
+                            return self.dismiss_outside(layout);
                         }
                         if let (Control::PickerRow(row), Some(Modal::Open(picker))) =
                             (capture.control, &mut self.modal)
@@ -1968,13 +2023,24 @@ impl AppState {
                         }
                         if let Control::SettingsButton(button) = capture.control {
                             self.settings_button(button, layout);
+                        } else if let Control::SettingsSection(section) = capture.control {
+                            self.settings_section(section, layout);
                         } else if let Control::SettingsRow(row) = capture.control {
                             self.settings_row(row, layout);
-                        } else if let Control::MenuItem(clicked) = capture.control
-                            && let Some(Modal::Menu(index)) = &mut self.modal
-                        {
-                            *index = clicked;
-                            return self.command(Command::Activate, layout);
+                        } else if let Some(Modal::Menu(menu)) = &mut self.modal {
+                            match capture.control {
+                                Control::MenuCategory(category) => {
+                                    menu.select(category);
+                                    menu.commands_focused = false;
+                                    self.dirty = true;
+                                }
+                                Control::MenuItem(row) => {
+                                    menu.row = row;
+                                    menu.commands_focused = true;
+                                    return self.command(Command::Activate, layout);
+                                }
+                                _ => {}
+                            }
                         } else if let Control::Tab(tab) = capture.control {
                             if self.guard_request.is_none() {
                                 return self.tab_change(Action::Switch(tab));
@@ -2006,6 +2072,48 @@ impl AppState {
             _ => {}
         }
         None
+    }
+
+    /// Confirmation and publication surfaces retain their explicit action targets.
+    fn dismissible_bounds(&self, layout: &LayoutSnapshot) -> Option<ratatui::layout::Rect> {
+        if self.guard_request.is_some() || self.settings.starting {
+            return None;
+        }
+        match &self.modal {
+            Some(
+                Modal::Menu(_)
+                | Modal::Language { .. }
+                | Modal::SyntaxTheme { .. }
+                | Modal::Tabs(_)
+                | Modal::Open(_)
+                | Modal::Recovery(_)
+                | Modal::Path(..)
+                | Modal::Details(_)
+                | Modal::TabDetails { .. }
+                | Modal::About { .. }
+                | Modal::SettingsDiagnostic { .. },
+            ) => layout.overlay,
+            Some(Modal::Settings)
+                if layout.contains(Control::SettingsButton(settings_ui::Button::Exit)) =>
+            {
+                layout.overlay
+            }
+            None if self.help => layout.overlay,
+            None if self.search.open => layout.search_bounds(),
+            _ => None,
+        }
+    }
+
+    /// Close only the pane that owned the gesture, following its ordinary exit path.
+    fn dismiss_outside(&mut self, layout: &LayoutSnapshot) -> Option<Intent> {
+        if matches!(self.modal, Some(Modal::Settings)) {
+            self.settings_button(settings_ui::Button::Exit, layout);
+            None
+        } else if self.modal.is_none() && !self.help && self.search.open {
+            Some(Intent::DismissSearch)
+        } else {
+            self.command(Command::Cancel, layout)
+        }
     }
     /// Hit only the exact displayed revision/geometry; stale input is visibly rejected.
     fn hit(
@@ -2254,17 +2362,22 @@ mod tests {
         let area = Rect::new(0, 0, 40, 8);
         let menu_layout = LayoutSnapshot::for_app(area, &app, 1);
         app.input(Input::Command(Command::Menu), &menu_layout);
-        let language = MENU
+        let menu_layout = LayoutSnapshot::for_app(area, &app, 2);
+        let highlighting = menu::GROUPS
             .iter()
-            .position(|command| *command == Command::Language)
+            .position(|(label, _)| *label == "Highlighting")
             .unwrap();
-        for _ in 0..language {
+        for _ in 0..highlighting {
             app.input(
                 Input::Command(Command::Move(Movement::Down, false)),
                 &menu_layout,
             );
         }
         let menu_layout = LayoutSnapshot::for_app(area, &app, 2);
+        app.input(
+            Input::Command(Command::Move(Movement::Right, false)),
+            &menu_layout,
+        );
         app.input(
             Input::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
             &menu_layout,
@@ -2334,7 +2447,7 @@ mod tests {
         ] {
             app.screen.path = name.map(|bytes| PathBuf::from(OsStr::from_bytes(bytes)));
             app.input(Input::Command(Command::TabDetails), &layout);
-            assert!(matches!(app.modal, Some(Modal::TabDetails)));
+            assert!(matches!(app.modal, Some(Modal::TabDetails { .. })));
             assert!(
                 app.tab_details()
                     .lines()
@@ -2342,6 +2455,94 @@ mod tests {
             );
             app.input(Input::Command(Command::Cancel), &layout);
         }
+    }
+
+    /// A tab that disappears while Details is open cannot redirect refresh to the active tab.
+    #[test]
+    fn unavailable_tab_details_keeps_its_identity() {
+        let mut app = AppState::new();
+        app.screen.tab = Some(TabId(1));
+        app.screen.path = Some(PathBuf::from("active.txt"));
+        let missing = TabId(2);
+        app.open_tab_details(Some(missing), true);
+        let area = Rect::new(0, 0, 80, 24);
+        let layout = LayoutSnapshot::for_app(area, &app, 1);
+        assert_eq!(app.tab_details(), "Tab is no longer available");
+        assert!(!layout.contains(Control::RetryRefresh));
+        assert!(
+            app.input(Input::Command(Command::RetryRefresh), &layout)
+                .is_none()
+        );
+        app.input(Input::Command(Command::Cancel), &layout);
+        assert!(matches!(app.modal, Some(Modal::Tabs(Some(tab))) if tab == missing));
+        let layout = LayoutSnapshot::for_app(area, &app, 2);
+        assert!(!layout.contains(Control::TabListDetails));
+        assert!(!layout.contains(Control::TabListClose));
+        assert!(!layout.contains(Control::TabListSwitch));
+        assert_eq!(app.screen.tab, Some(TabId(1)));
+    }
+
+    /// Cancelling a guarded close restores Tabs and retains its workspace opener.
+    #[test]
+    fn dismissing_restored_tabs_focuses_its_opener() {
+        let mut app = AppState::new();
+        let tab = TabId(1);
+        app.modal = Some(Modal::Confirm(After::Close(tab), None));
+        app.opener = Some(Control::Tabs);
+        app.guard_return = Some(Modal::Tabs(Some(tab)));
+        app.guard_request = Some(10);
+        let area = Rect::new(0, 0, 80, 24);
+        let layout = LayoutSnapshot::for_app(area, &app, 1);
+        assert!(matches!(
+            app.input(Input::Command(Command::Cancel), &layout),
+            Some(Intent::Editor(Action::CancelGuard))
+        ));
+        assert!(matches!(app.modal, Some(Modal::Tabs(Some(id))) if id == tab));
+        let layout = LayoutSnapshot::for_app(area, &app, 2);
+        app.input(Input::Command(Command::Cancel), &layout);
+        assert!(app.modal.is_none());
+        assert_eq!(app.focus, Some(Control::Tabs));
+    }
+
+    /// Outside gestures cannot cancel a picker after resize or with mouse capture disabled.
+    #[test]
+    fn outside_picker_dismissal_requires_current_capture() {
+        let mut app = AppState::new();
+        app.focus = Some(Control::WorkspaceSettings);
+        let area = Rect::new(0, 0, 80, 24);
+        let layout = LayoutSnapshot::for_app(area, &app, 1);
+        assert!(matches!(
+            app.input(Input::Command(Command::Open), &layout),
+            Some(Intent::Picker(_))
+        ));
+        let layout = LayoutSnapshot::for_app(area, &app, 2);
+        let outside = |kind| {
+            Input::Pointer(MouseEvent {
+                kind,
+                column: 0,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+        let down = MouseEventKind::Down(MouseButton::Left);
+        let up = MouseEventKind::Up(MouseButton::Left);
+        app.input(outside(down), &layout);
+        let resized = LayoutSnapshot::for_app(Rect::new(0, 0, 40, 8), &app, 3);
+        app.sync_layout(&resized);
+        assert!(app.input(outside(up), &resized).is_none());
+        assert!(matches!(app.modal, Some(Modal::Open(_))));
+        app.mouse_capture = false;
+        app.input(outside(down), &resized);
+        assert!(app.input(outside(up), &resized).is_none());
+        assert!(matches!(app.modal, Some(Modal::Open(_))));
+        app.mouse_capture = true;
+        app.input(outside(down), &resized);
+        assert!(matches!(
+            app.input(outside(up), &resized),
+            Some(Intent::CancelPicker)
+        ));
+        assert!(app.modal.is_none());
+        assert_eq!(app.focus, Some(Control::WorkspaceSettings));
     }
 
     /// Field paste is asynchronous, ordered with typing/submit, revocable, and cannot leak to text.
@@ -2450,6 +2651,23 @@ mod tests {
         let mut app = AppState::new();
         app.screen.tab = Some(TabId(1));
         let selected = TabId(5);
+        app.screen.tabs = Arc::from([crate::editor::TabSummary {
+            id: selected,
+            label: Arc::from("selected"),
+            path_hint: None,
+            modified: false,
+            waiting: false,
+            loading: false,
+            saving: false,
+            queued_save: false,
+            attention: false,
+            scratch: true,
+            retention: "",
+            warning: None,
+            language: None,
+            language_auto: true,
+            stream: None,
+        }]);
         app.modal = Some(Modal::Tabs(Some(selected)));
         let area = Rect::new(0, 0, 80, 24);
         let layout = LayoutSnapshot::for_app(area, &app, 1);
@@ -2644,13 +2862,13 @@ mod settings_guard_tests {
         let layout = LayoutSnapshot::for_app(area, &app, 2);
         assert!(
             app.input(
-                Input::Key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)),
+                Input::Key(KeyEvent::new(KeyCode::F(9), KeyModifiers::NONE)),
                 &layout
             )
             .is_none(),
             "a local command unavailable in Actions must not reach the document",
         );
-        assert!(matches!(app.modal, Some(Modal::Menu(0))));
+        assert!(matches!(app.modal, Some(Modal::Menu(menu)) if menu == menu::Menu::default()));
         app.command(Command::Cancel, &layout);
         let layout = LayoutSnapshot::for_app(area, &app, 3);
         app.command(Command::Help, &layout);

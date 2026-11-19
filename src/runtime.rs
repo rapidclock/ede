@@ -492,6 +492,20 @@ fn effect(
                 picker.cancel();
             }
         }
+        Intent::DismissSearch => {
+            if editor.is_none_or(|editor| {
+                let admitted = editor.submit(Action::InvalidateSearch);
+                app.pending |= admitted;
+                admitted
+            }) {
+                app.close_search();
+            } else {
+                app.notify(StatusMessage::new(
+                    Severity::Warning,
+                    "Busy: retry closing Find/Replace",
+                ));
+            }
+        }
         Intent::CancelWork => {
             if let Some(editor) = editor {
                 editor.cancel();
@@ -1118,6 +1132,46 @@ mod tests {
         assert_eq!(event_loop(&mut host, inbox).unwrap().code, 143);
         assert_eq!(host.frames.len(), 1);
         assert_eq!(host.now(), Duration::from_millis(100));
+    }
+
+    /// Closing a busy search requires admission, even if another operation filled the queue.
+    #[test]
+    fn search_dismissal_waits_for_cancellation_admission() {
+        let (mut editor, mut release_entry) = crate::editor::saturated_input_queue();
+        let mut app = AppState::new();
+        let mut host = Fake::new(vec![]);
+        let area = Rect::new(0, 0, 80, 24);
+        let layout = LayoutSnapshot::for_app(area, &app, 1);
+        app.input(Input::Command(Command::Find), &layout);
+        app.screen.search = std::sync::Arc::new(crate::editor::search::Status {
+            busy: true,
+            ..Default::default()
+        });
+        let layout = LayoutSnapshot::for_app(area, &app, 2);
+        let outside = |kind| {
+            Input::Pointer(MouseEvent {
+                kind,
+                column: 0,
+                row: 1,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+        for admitted in [false, true] {
+            use crossterm::event::MouseButton;
+            assert!(
+                app.input(outside(MouseEventKind::Down(MouseButton::Left)), &layout)
+                    .is_none()
+            );
+            let intent = app
+                .input(outside(MouseEventKind::Up(MouseButton::Left)), &layout)
+                .unwrap();
+            assert!(matches!(intent, Intent::DismissSearch));
+            effect(intent, &mut host, &mut app, Some(&mut editor), None).unwrap();
+            assert_eq!(app.search.open, !admitted);
+            if !admitted {
+                release_entry();
+            }
+        }
     }
 
     /// Motion floods cannot starve quit, signals, or a fresh layout before the next pointer.

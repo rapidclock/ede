@@ -27,8 +27,35 @@ enum Page {
     Capture(Operation),
     Preview(Operation, Chord),
     Confirm(Confirmation),
-    Info,
     Writing { exit: bool },
+}
+
+/// Settings categories share a draft while exposing disjoint editor rows.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Section {
+    Recovery,
+    Highlighting,
+    Keyboard,
+}
+
+impl Section {
+    pub(crate) const ALL: [Self; 3] = [Self::Recovery, Self::Highlighting, Self::Keyboard];
+
+    pub(crate) const fn label(self, compact: bool) -> &'static str {
+        match (self, compact) {
+            (Self::Recovery, _) => "Recovery",
+            (Self::Highlighting, true) => "Limits",
+            (Self::Highlighting, false) => "Highlighting Limits",
+            (Self::Keyboard, true) => "Keys",
+            (Self::Keyboard, false) => "Keyboard Shortcuts",
+        }
+    }
+
+    fn adjacent(self, delta: isize) -> Self {
+        Self::ALL[(self as usize)
+            .saturating_add_signed(delta)
+            .min(Self::ALL.len() - 1)]
+    }
 }
 
 /// Stable targets for pane-local actions.
@@ -53,11 +80,25 @@ pub(crate) enum Button {
     DiscardAndExit,
     Reload,
     Restore,
-    Info,
     CancelSave,
+    Diagnostic,
 }
 
 impl Button {
+    /// Primary and confirmation controls align together at the right of the pane.
+    pub(crate) fn align_right(self) -> bool {
+        matches!(
+            self,
+            Self::Save
+                | Self::Discard
+                | Self::Exit
+                | Self::SaveAndExit
+                | Self::DiscardAndExit
+                | Self::KeepEditing
+                | Self::CancelSave
+        )
+    }
+
     pub(crate) fn label(self) -> &'static str {
         match self {
             Self::PreviousKey => "Prev",
@@ -78,8 +119,8 @@ impl Button {
             Self::DiscardAndExit => "Discard and Exit",
             Self::Reload => "Reload",
             Self::Restore => "Restore Defaults",
-            Self::Info => "Config",
             Self::CancelSave => "Cancel Save",
+            Self::Diagnostic => "Details",
         }
     }
 }
@@ -96,7 +137,6 @@ pub(crate) struct Draft {
     chord: usize,
     pub(crate) generation: u64,
     pub(crate) field: String,
-    pub(crate) info_scroll: u16,
     feedback: Option<String>,
     blocked: Option<Chord>,
     field_action: Option<Button>,
@@ -114,7 +154,6 @@ impl Draft {
             chord: 0,
             generation: 0,
             field: String::new(),
-            info_scroll: 0,
             feedback: None,
             blocked: None,
             field_action: None,
@@ -192,18 +231,36 @@ impl Draft {
         }
     }
 
-    fn section(&self) -> &'static str {
+    /// Resolve the category of the selected logical row.
+    pub(crate) fn section(&self) -> Section {
         match self.selected {
-            0 => "Recovery",
-            1..GENERAL_ROWS => "Highlighting limits",
-            _ => "Keyboard shortcuts",
+            0 => Section::Recovery,
+            1..GENERAL_ROWS => Section::Highlighting,
+            _ => Section::Keyboard,
         }
+    }
+
+    fn section_rows(&self, section: Section) -> std::ops::Range<usize> {
+        match section {
+            Section::Recovery => 0..1,
+            Section::Highlighting => 1..GENERAL_ROWS,
+            Section::Keyboard => GENERAL_ROWS..self.count(),
+        }
+    }
+
+    pub(crate) fn show_sections(&self) -> bool {
+        self.page == Page::List || self.inline_scalar().is_some()
+    }
+
+    pub(crate) fn show_utilities(&self) -> bool {
+        self.page == Page::List
     }
 
     pub(crate) fn title(
         &self,
         settings: &settings::Service,
         location: &settings::Location,
+        compact: bool,
     ) -> String {
         let state = if location.safe() {
             "Safe config"
@@ -212,11 +269,7 @@ impl Draft {
         } else {
             "Defaults"
         };
-        let context = if self.page == Page::Info {
-            "Config"
-        } else {
-            self.section()
-        };
+        let context = self.section().label(compact);
         format!(
             " Settings · {context} · {state}{} ",
             if self.dirty() { " *" } else { "" }
@@ -243,21 +296,19 @@ impl Draft {
         matches!(self.page, Page::Capture(_))
     }
 
-    pub(crate) fn info(&self) -> bool {
-        self.page == Page::Info
-    }
-
     /// Keep the selected logical row in the viewport independent of terminal size.
     pub(crate) fn rows(&self, capacity: u16) -> std::ops::Range<usize> {
-        if self.page != Page::List && self.inline_scalar().is_none() {
+        if !self.show_sections() {
             return 0..0;
         }
         let capacity = usize::from(capacity);
+        let section = self.section_rows(self.section());
         let start = self
             .selected
             .saturating_sub(capacity / 2)
-            .min(self.count().saturating_sub(capacity));
-        start..(start + capacity).min(self.count())
+            .min(section.end.saturating_sub(capacity))
+            .max(section.start);
+        start..(start + capacity).min(section.end)
     }
 
     /// Row numbers are relative to the pane interior.
@@ -266,15 +317,23 @@ impl Draft {
         height: u16,
         save_state: Option<SaveState>,
         writable: bool,
+        compact: bool,
     ) -> Vec<(u16, Vec<Button>)> {
         use Button as B;
         let footer = height - 1;
         match self.page {
             Page::Confirm(Confirmation::Exit) => {
-                return vec![
-                    (2, vec![B::SaveAndExit, B::DiscardAndExit]),
-                    (footer, vec![B::KeepEditing]),
-                ];
+                return if compact {
+                    vec![
+                        (footer - 1, vec![B::SaveAndExit, B::DiscardAndExit]),
+                        (footer, vec![B::KeepEditing]),
+                    ]
+                } else {
+                    vec![(
+                        footer,
+                        vec![B::SaveAndExit, B::DiscardAndExit, B::KeepEditing],
+                    )]
+                };
             }
             Page::Confirm(_) => return vec![(footer, vec![B::Discard, B::KeepEditing])],
             Page::Writing { .. } => {
@@ -288,12 +347,9 @@ impl Draft {
         }
         let mut result = vec![(footer, vec![B::Save, B::Discard, B::Exit])];
         match self.page {
-            Page::List => {
-                let mut header = vec![B::Info];
-                if writable {
-                    header.extend([B::Reload, B::Restore]);
-                }
-                result.insert(0, (0, header));
+            Page::List if writable => {
+                let row = if compact { footer - 1 } else { footer };
+                result.push((row, vec![B::Reload, B::Restore]));
             }
             Page::Binding if writable => {
                 let mut keys = vec![B::PreviousKey, B::NextKey, B::Add];
@@ -309,17 +365,17 @@ impl Draft {
             Page::Edit(_) => result.push((3, vec![B::Capture, B::Accept, B::Back])),
             Page::Capture(_) => result.push((3, vec![B::Back])),
             Page::Preview(..) => result.push((3, vec![B::DiscardCapture, B::Accept])),
-            Page::Info => result.push((0, vec![B::Back])),
             _ => {}
         }
         result
     }
 
-    pub(crate) fn lines(
-        &self,
-        settings: &settings::Service,
-        location: &settings::Location,
-    ) -> Vec<(u16, String)> {
+    /// Confirmation and write status reserve the pane for their own actions.
+    pub(crate) fn show_diagnostic(&self) -> bool {
+        !matches!(self.page, Page::Confirm(_) | Page::Writing { .. })
+    }
+
+    pub(crate) fn lines(&self, settings: &settings::Service) -> Vec<(u16, String)> {
         match self.page {
             Page::List => Vec::new(),
             Page::Binding => {
@@ -369,23 +425,6 @@ impl Draft {
                 }
                 .into(),
             )],
-            Page::Info => vec![(
-                1,
-                format!(
-                    "{}\n{}",
-                    location
-                        .display_file()
-                        .unwrap_or_else(|| "Configuration path unavailable".into()),
-                    self.feedback(settings)
-                        .unwrap_or(if location.user_directory().is_none() {
-                            "Saving and reloading are disabled."
-                        } else if settings.base.is_none() {
-                            "Reload a valid file before saving."
-                        } else {
-                            "No configuration errors."
-                        })
-                ),
-            )],
             Page::Writing { .. } => vec![(
                 0,
                 match settings.save_state() {
@@ -409,10 +448,11 @@ impl Draft {
     fn adjacent(&mut self, delta: isize) {
         match self.page {
             Page::List => {
+                let rows = self.section_rows(self.section());
                 self.selected = self
                     .selected
                     .saturating_add_signed(delta)
-                    .min(self.count() - 1);
+                    .clamp(rows.start, rows.end - 1);
                 self.chord = 0;
             }
             Page::Binding => {
@@ -422,11 +462,6 @@ impl Draft {
                         .len()
                         .saturating_sub(1),
                 );
-            }
-            Page::Info => {
-                self.info_scroll = self
-                    .info_scroll
-                    .saturating_add_signed(delta.clamp(-16, 16) as i16);
             }
             _ => {}
         }
@@ -502,12 +537,19 @@ impl Draft {
 }
 
 impl AppState {
+    /// Inline feedback takes precedence over a service diagnostic.
+    pub(crate) fn settings_feedback(&self) -> Option<&str> {
+        self.field_error
+            .as_deref()
+            .or_else(|| self.settings_ui.as_ref()?.feedback(&self.settings))
+    }
+
     pub(super) fn open_settings(&mut self) {
         self.settings_saved = false;
         let draft = self
             .settings_ui
             .get_or_insert_with(|| Box::new(Draft::new(&self.settings)));
-        self.opener = self.opener.or(self.focus);
+        self.opener = self.focus;
         self.help = false;
         self.modal = Some(Modal::Settings);
         self.focus = Some(draft.focus());
@@ -535,8 +577,7 @@ impl AppState {
         };
         match update {
             Update::ReadApplied
-                if !draft.dirty()
-                    && matches!(draft.page, Page::List | Page::Binding | Page::Info) =>
+                if !draft.dirty() && matches!(draft.page, Page::List | Page::Binding) =>
             {
                 let page = draft.page;
                 draft.reset(&self.settings);
@@ -565,9 +606,6 @@ impl AppState {
             draft.page = page;
             draft.generation = draft.generation.wrapping_add(1);
             draft.field_action = None;
-            if page == Page::Info {
-                draft.info_scroll = 0;
-            }
             self.focus = Some(draft.focus());
         }
         self.capture = None;
@@ -651,37 +689,48 @@ impl AppState {
         }
         let area = layout.overlay?;
         let button = match command {
-            Command::FocusNext | Command::FocusPrevious => {
-                let backwards = command == Command::FocusPrevious;
-                self.focus = match self.focus {
-                    Some(Control::SettingsRow(_)) if !backwards => {
-                        Some(Control::SettingsButton(B::Save))
-                    }
-                    Some(Control::SettingsRow(_)) if backwards => {
-                        Some(Control::SettingsButton(B::Restore))
-                            .filter(|button| layout.contains(*button))
-                            .or(Some(Control::SettingsButton(B::Info)))
-                    }
-                    Some(Control::SettingsField) if draft.inline_scalar().is_some() => {
-                        Some(Control::SettingsButton(if backwards {
-                            B::Exit
-                        } else {
-                            B::Save
-                        }))
-                    }
-                    _ => match layout.next(self.focus, backwards) {
-                        Some(Control::SettingsRow(_)) if draft.inline_scalar().is_some() => {
-                            Some(Control::SettingsField)
-                        }
-                        Some(Control::SettingsRow(_)) => Some(Control::SettingsRow(draft.selected)),
-                        next => next,
-                    },
-                };
+            Command::Tab | Command::FocusNext | Command::FocusPrevious => {
+                self.focus = layout.next_setting(
+                    self.focus,
+                    command == Command::FocusPrevious,
+                    draft.section(),
+                    draft.focus(),
+                );
                 self.dirty = true;
                 return None;
             }
             Command::Move(movement, _) => {
-                let page = (area.height - 4) as isize;
+                let compact = area.width < crate::ui::SETTINGS_SPLIT_WIDTH;
+                if let Some(Control::SettingsSection(section)) = self.focus {
+                    let delta = match movement {
+                        Movement::Up if !compact => -1,
+                        Movement::Down if !compact => 1,
+                        Movement::Left if compact => -1,
+                        Movement::Right if compact => 1,
+                        Movement::Home | Movement::Start => -3,
+                        Movement::End | Movement::Finish => 3,
+                        Movement::Right | Movement::Down => {
+                            self.focus = Some(draft.focus());
+                            self.dirty = true;
+                            return None;
+                        }
+                        _ => return None,
+                    };
+                    self.settings_section(section.adjacent(delta), layout);
+                    return None;
+                }
+                if draft.page == Page::List
+                    && matches!(self.focus, Some(Control::SettingsRow(_)))
+                    && (movement == Movement::Left && !compact
+                        || movement == Movement::Up
+                            && compact
+                            && draft.selected == draft.section_rows(draft.section()).start)
+                {
+                    self.focus = Some(Control::SettingsSection(draft.section()));
+                    self.dirty = true;
+                    return None;
+                }
+                let page = layout.list_rows().max(1) as isize;
                 let step = match movement {
                     Movement::Up | Movement::Left => -1,
                     Movement::Down | Movement::Right => 1,
@@ -707,6 +756,13 @@ impl AppState {
                     self.settings_row(row, layout);
                     return None;
                 }
+                Some(Control::SettingsSection(section))
+                    if layout.contains(Control::SettingsSection(section)) =>
+                {
+                    self.focus = Some(draft.focus());
+                    self.dirty = true;
+                    return None;
+                }
                 Some(Control::SettingsField) => B::Accept,
                 _ => return None,
             },
@@ -728,7 +784,12 @@ impl AppState {
                 (Page::Confirm(_), _) => return None,
                 _ => B::Discard,
             },
-            Command::SettingsOptions | Command::SettingsInfo => B::Info,
+            Command::SettingsOptions | Command::SettingsInfo => {
+                if matches!(draft.page, Page::List | Page::Binding) {
+                    self.open_about(self.focus.or(Some(draft.focus())));
+                }
+                return None;
+            }
             Command::ReloadSettings => B::Reload,
             Command::SaveSettings => B::Save,
             Command::CancelSave => B::CancelSave,
@@ -748,6 +809,36 @@ impl AppState {
             self.capture = None;
             self.dirty = true;
         }
+    }
+
+    /// Change sections after validating any pending inline scalar edit.
+    pub(super) fn settings_section(&mut self, section: Section, layout: &LayoutSnapshot) {
+        let Some(draft) = self.settings_ui.as_deref_mut() else {
+            return;
+        };
+        if !layout.contains(Control::SettingsSection(section)) || !draft.show_sections() {
+            return;
+        }
+        if draft.inline_scalar().is_some() {
+            if self.field_paste.is_some() {
+                self.focus = Some(Control::SettingsField);
+                self.dirty = true;
+                return;
+            }
+            if let Err(error) = draft.accept_field() {
+                draft.feedback = Some(error);
+                self.focus = Some(Control::SettingsField);
+                self.dirty = true;
+                return;
+            }
+            draft.feedback = None;
+        }
+        if section != draft.section() {
+            draft.selected = draft.section_rows(section).start;
+            draft.chord = 0;
+        }
+        self.switch_settings(Page::List);
+        self.focus = Some(Control::SettingsSection(section));
     }
 
     pub(super) fn settings_row(&mut self, row: usize, layout: &LayoutSnapshot) {
@@ -783,9 +874,7 @@ impl AppState {
         match draft.page {
             Page::List if !draft.dirty() => self.close_settings(),
             Page::List => self.settings_button(Button::Exit, layout),
-            Page::Binding | Page::Info | Page::Edit(Operation::Scalar(_)) => {
-                self.switch_settings(Page::List)
-            }
+            Page::Binding | Page::Edit(Operation::Scalar(_)) => self.switch_settings(Page::List),
             Page::Edit(_) => self.switch_settings(Page::Binding),
             Page::Capture(operation) | Page::Preview(operation, _) => {
                 self.switch_settings(Page::Edit(operation))
@@ -817,7 +906,7 @@ impl AppState {
         let direct = match button {
             B::Edit => page == Page::List,
             B::Accept => draft.inline_scalar().is_some(),
-            B::Info | B::Reload | B::Restore => matches!(page, Page::List | Page::Binding),
+            B::Reload | B::Restore => matches!(page, Page::List | Page::Binding),
             _ => false,
         };
         if layout.overlay.is_none() || !layout.contains(Control::SettingsButton(button)) && !direct
@@ -858,7 +947,6 @@ impl AppState {
                     self.switch_settings(Page::Binding);
                 }
             }
-            B::Info => self.switch_settings(Page::Info),
             B::Add | B::Replace => {
                 let operation = if button == B::Add {
                     draft.field.clear();
@@ -934,6 +1022,16 @@ impl AppState {
             B::Save | B::SaveAndExit => self.save_settings(button == B::SaveAndExit),
             B::CancelSave => {
                 self.settings.cancel_save();
+            }
+            B::Diagnostic if self.field_paste.is_none() => {
+                let focus = self.focus.unwrap_or(Control::SettingsButton(B::Diagnostic));
+                if let Some(text) = self.settings_feedback() {
+                    self.open_settings_diagnostic(text.to_owned(), focus);
+                }
+            }
+            B::Diagnostic => {
+                self.focus = Some(draft.focus());
+                self.dirty = true;
             }
         }
     }
@@ -1084,14 +1182,47 @@ mod tests {
     }
 
     #[test]
-    fn back_button_returns_from_config_to_list() {
+    fn legacy_config_shortcut_opens_about_and_returns_to_the_draft() {
         let mut app = AppState::new();
         app.open_settings();
-        app.settings_ui.as_mut().unwrap().page = Page::Info;
-        let layout = LayoutSnapshot::for_app(Rect::new(0, 0, 40, 8), &app, 1);
-        app.settings_button(Button::Back, &layout);
+        let draft = app.settings_ui.as_mut().unwrap();
+        draft.revision.values.set(Scalar::Checkpoint, Some(17));
+        let original_focus = app.focus;
+        let area = Rect::new(0, 0, 40, 8);
+        let layout = LayoutSnapshot::for_app(area, &app, 1);
+        app.settings_command(Command::SettingsInfo, &layout);
+        assert!(matches!(app.modal, Some(Modal::About { .. })));
+        let layout = LayoutSnapshot::for_app(area, &app, 2);
+        app.command(Command::Cancel, &layout);
         assert!(matches!(app.modal, Some(Modal::Settings)));
-        assert_eq!(app.settings_ui.as_ref().unwrap().page, Page::List);
+        assert_eq!(app.focus, original_focus);
+        let draft = app.settings_ui.as_ref().unwrap();
+        assert_eq!(draft.page, Page::List);
+        assert_eq!(draft.revision.values.get(Scalar::Checkpoint), 17);
+    }
+
+    /// Opening a diagnostic waits for an admitted field paste to settle.
+    #[test]
+    fn diagnostics_preserve_pending_settings_field_paste() {
+        let mut app = AppState::new();
+        app.open_settings();
+        app.settings.diagnostic = Some("Long configuration diagnostic ".repeat(4));
+        app.switch_settings(Page::Edit(Operation::Scalar(Scalar::Checkpoint)));
+        app.field_paste = Some(super::super::FieldPaste {
+            generation: 10,
+            search_field: None,
+            edits: Vec::new(),
+            bytes: 0,
+            submit: false,
+        });
+        let area = Rect::new(0, 0, 40, 8);
+        let layout = LayoutSnapshot::for_app(area, &app, 1);
+        app.focus = Some(Control::SettingsButton(Button::Diagnostic));
+        app.settings_button(Button::Diagnostic, &layout);
+        assert!(matches!(app.modal, Some(Modal::Settings)));
+        assert_eq!(app.focus, Some(Control::SettingsField));
+        app.event(super::super::Event::FieldPaste(10, Ok("17".into())));
+        assert_eq!(app.settings_ui.as_ref().unwrap().field, "17");
     }
 
     /// Repeated legacy shortcuts cannot accept a discard while Keep Editing owns focus.

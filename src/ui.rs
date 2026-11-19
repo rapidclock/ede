@@ -1,7 +1,7 @@
 //! Rendering, focus order, and pointer targets derive from the same immutable geometry.
 use crate::text::Span;
 use crate::{
-    app::{AppState, MENU, Modal, PathKind, settings_ui},
+    app::{AppState, Modal, PathKind, menu, settings_ui},
     command::Command,
     editor::{After, TabId, TabSummary},
     settings::Context,
@@ -22,13 +22,14 @@ pub(crate) enum Control {
     SettingsButton(settings_ui::Button),
     SettingsField,
     SettingsRow(usize),
+    SettingsSection(settings_ui::Section),
     UseDefaults,
     Search(u8),
     Content,
     WelcomeOpen,
     WelcomeNew,
     Menu,
-    MenuOutside,
+    PaneOutside,
     WorkspaceSettings,
     Help,
     Quit,
@@ -40,6 +41,7 @@ pub(crate) enum Control {
     TabListRow(TabId),
     TabListClose,
     TabListSwitch,
+    TabListDetails,
     RecoveryList,
     RecoveryRow(usize),
     RecoveryOpen,
@@ -60,6 +62,7 @@ pub(crate) enum Control {
     HelpQuit,
     HelpSuspend,
     HelpClose,
+    MenuCategory(usize),
     MenuItem(usize),
     LanguageRow(usize),
     PathField,
@@ -78,7 +81,8 @@ impl Control {
             Self::SettingsButton(_)
             | Self::SettingsField
             | Self::SettingsRow(_)
-            | Self::MenuOutside
+            | Self::SettingsSection(_)
+            | Self::PaneOutside
             | Self::TabClose(_)
             | Self::TabDivider => None,
             Self::UseDefaults => Some(Command::Cancel),
@@ -102,7 +106,6 @@ impl Control {
             Self::Quit | Self::HelpQuit => Some(Command::Quit),
             Self::HelpSuspend => Some(Command::Suspend),
             Self::HelpClose | Self::PathCancel | Self::DetailsClose => Some(Command::Cancel),
-            Self::MenuItem(_) => Some(Command::Activate),
             _ => Some(Command::Activate),
         }
     }
@@ -110,7 +113,7 @@ impl Control {
     fn label(self) -> &'static str {
         match self {
             Self::SettingsButton(button) => button.label(),
-            Self::SettingsField | Self::SettingsRow(_) => "",
+            Self::SettingsField | Self::SettingsRow(_) | Self::SettingsSection(_) => "",
             Self::UseDefaults => "Use defaults for this session",
             Self::WelcomeOpen => "Open File",
             Self::WelcomeNew => "New Scratch",
@@ -136,10 +139,11 @@ impl Control {
             Self::Tabs => "Tabs",
             Self::TabClose(_) => "×",
             Self::TabDivider => "│",
-            Self::MenuOutside => "",
+            Self::PaneOutside => "",
             Self::WorkspaceSettings => "Settings",
             Self::TabListClose => "Close",
             Self::TabListSwitch => "Switch",
+            Self::TabListDetails => "Details",
             Self::PickerUp => "Up",
             Self::PickerOpen => "Open",
             Self::PickerPrevious => "Prev",
@@ -149,7 +153,8 @@ impl Control {
             Self::Quit | Self::HelpQuit => "Quit",
             Self::HelpSuspend => "Suspend",
             Self::HelpClose | Self::DetailsClose => "Close",
-            Self::MenuItem(index) => MENU[index].label(),
+            Self::MenuCategory(index) => menu::GROUPS[index].0,
+            Self::MenuItem(_) => "",
             Self::PathSubmit => "OK",
             Self::PathCancel | Self::ConfirmCancel => "Cancel",
             Self::ConfirmSave => "Save",
@@ -197,6 +202,12 @@ pub(crate) struct LayoutSnapshot {
     list_rows: u16,
 }
 impl LayoutSnapshot {
+    /// The docked search controls and summary occupy three rows above the status bar.
+    pub(crate) fn search_bounds(&self) -> Option<Rect> {
+        (self.area.width >= 40 && self.area.height >= 8 && self.signature.search.is_some())
+            .then(|| Rect::new(self.area.x, self.area.bottom() - 4, self.area.width, 3))
+    }
+
     /// Actual text viewport leaves room for the non-modal search controls.
     pub(crate) fn content_height(&self) -> u16 {
         self.targets
@@ -253,20 +264,30 @@ impl LayoutSnapshot {
         let (modal, detail) = match &app.modal {
             Some(Modal::ReplaceAll(_)) => (11, 0),
             None => (0, 0),
-            Some(Modal::Menu(index)) => (1, *index as u64),
+            Some(Modal::Menu(menu)) => (1, menu.layout_key()),
             Some(Modal::Language { row, .. }) => (12, *row as u64),
             Some(Modal::SyntaxTheme { row, .. }) => (14, *row as u64),
             Some(Modal::Path(..)) => (2, 0),
             Some(Modal::Confirm(after, _)) => (3, after.target().map_or(0, |tab| tab.0)),
-            Some(Modal::Details(_)) => (4, 0),
-            Some(Modal::TabDetails) => (13, u64::from(app.screen.path.is_some())),
+            Some(Modal::Details(_)) => (4, u64::from(app.details_refresh_target().is_some())),
+            Some(Modal::TabDetails { tab, .. }) => (
+                13,
+                tab.map_or(0, |tab| tab.0.wrapping_mul(2))
+                    | u64::from(app.details_refresh_target().is_some()),
+            ),
+            Some(Modal::About { .. }) => (16, 0),
+            Some(Modal::SettingsDiagnostic { .. }) => (17, 0),
             Some(Modal::SaveError(_)) => (5, 0),
             Some(Modal::PersistenceError(_)) => (10, 0),
             Some(Modal::Open(dialog)) => (6, dialog.highlight as u64),
             Some(Modal::Tabs(tab)) => (7, tab.map_or(0, |tab| tab.0)),
             Some(Modal::Recovery(dialog)) => (8, dialog.revision),
             Some(Modal::DiscardRecovery(dialog, _)) => (9, dialog.revision),
-            Some(Modal::Settings) => (15, 0),
+            Some(Modal::Settings) => (
+                15,
+                app.settings_feedback()
+                    .map_or(0, |text| text.width() as u64),
+            ),
         };
         let (picker_revision, picker_request) = match &app.modal {
             Some(Modal::Open(dialog)) => (dialog.revision, dialog.generation),
@@ -393,35 +414,60 @@ impl LayoutSnapshot {
         match &app.modal {
             Some(Modal::Settings) => {
                 if let Some(draft) = &app.settings_ui {
+                    let compact = overlay.width < SETTINGS_SPLIT_WIDTH;
+                    let writable = app.config_location.user_directory().is_some();
+                    let body = settings_body(overlay, draft);
                     let inline = draft.inline_scalar();
-                    for (offset, row) in draft.rows(overlay.height - 4).enumerate() {
-                        let y = overlay.y + 2 + offset as u16;
-                        result.add(
-                            Control::SettingsRow(row),
-                            Rect::new(overlay.x + 1, y, overlay.width - 2, 1),
-                        );
-                        if let Some((index, scalar)) = inline
-                            && row == index
-                        {
-                            let gutter = scalar.label().width() as u16 + 2;
-                            result.add(
-                                Control::SettingsField,
-                                Rect::new(overlay.x + 1 + gutter, y, overlay.width - 2 - gutter, 1),
-                            );
+                    if draft.show_sections() {
+                        let mut x = overlay.x + 1;
+                        for (row, section) in settings_ui::Section::ALL.into_iter().enumerate() {
+                            let width = section.label(compact).width() as u16 + 2;
+                            let y = overlay.y + 1 + if compact { 0 } else { row as u16 };
+                            result
+                                .add(Control::SettingsSection(section), Rect::new(x, y, width, 1));
+                            if compact {
+                                x += width + 1;
+                            }
                         }
-                    }
-                    if draft.editing() && inline.is_none() {
+                        let reserved = u16::from(inline.is_some())
+                            + u16::from(compact && writable && draft.show_utilities());
+                        result.list_rows = body.height.saturating_sub(reserved);
+                        for (offset, row) in draft.rows(result.list_rows).enumerate() {
+                            let y = body.y + u16::from(inline.is_some()) + offset as u16;
+                            result.add(
+                                Control::SettingsRow(row),
+                                Rect::new(body.x, y, body.width, 1),
+                            );
+                            if let Some((index, scalar)) = inline
+                                && row == index
+                            {
+                                let gutter = scalar.label().width() as u16 + 2;
+                                result.add(
+                                    Control::SettingsField,
+                                    Rect::new(body.x + gutter, y, body.width - gutter, 1),
+                                );
+                            }
+                        }
+                    } else if draft.editing() {
                         result.add(
                             Control::SettingsField,
-                            Rect::new(overlay.x + 1, overlay.y + 3, overlay.width - 2, 1),
+                            Rect::new(body.x, body.y + 2, body.width, 1),
                         );
                     }
                     for (row, buttons) in draft.buttons(
                         overlay.height - 2,
                         app.settings_save_state,
-                        app.config_location.user_directory().is_some(),
+                        writable,
+                        compact,
                     ) {
                         let mut x = overlay.x + 1;
+                        if buttons[0].align_right() {
+                            let width: u16 = buttons
+                                .iter()
+                                .map(|button| button.label().width() as u16 + 3)
+                                .sum();
+                            x = overlay.right() - width;
+                        }
                         for button in buttons {
                             let width = button.label().width() as u16 + 2;
                             result.add(
@@ -431,25 +477,42 @@ impl LayoutSnapshot {
                             x += width + 1;
                         }
                     }
+                    if draft.show_diagnostic()
+                        && app
+                            .settings_feedback()
+                            .is_some_and(|text| text.width() > usize::from(overlay.width - 2))
+                    {
+                        result.add(
+                            Control::SettingsButton(settings_ui::Button::Diagnostic),
+                            Rect::new(overlay.right() - 10, overlay.bottom() - 1, 9, 1),
+                        );
+                    }
                 }
             }
             Some(Modal::ReplaceAll(_)) => {
                 result.add(Control::Search(15), Rect::new(overlay.x + 2, y, 16, 1));
                 result.add(Control::Search(16), Rect::new(overlay.x + 20, y, 10, 1));
             }
-            Some(Modal::Menu(index)) => {
-                let count = overlay.height.saturating_sub(2) as usize;
-                let start = index.saturating_sub(count.saturating_sub(1));
-                for item in start..(start + count).min(MENU.len()) {
-                    result.add(
-                        Control::MenuItem(item),
-                        Rect::new(
-                            overlay.x + 1,
-                            overlay.y + 1 + (item - start) as u16,
-                            overlay.width - 2,
-                            1,
-                        ),
-                    );
+            Some(Modal::Menu(menu)) => {
+                let (categories, commands) = menu_columns(overlay);
+                result.list_rows = categories.height;
+                for (column, selection, count, control) in [
+                    (
+                        categories,
+                        menu.category,
+                        menu::GROUPS.len(),
+                        Control::MenuCategory as fn(usize) -> Control,
+                    ),
+                    (commands, menu.row, menu.commands().len(), Control::MenuItem),
+                ] {
+                    let start = list_start(selection, column.height);
+                    for (row, index) in (start..count).take(usize::from(column.height)).enumerate()
+                    {
+                        result.add(
+                            control(index),
+                            Rect::new(column.x, column.y + row as u16, column.width, 1),
+                        );
+                    }
                 }
             }
             Some(Modal::Language { row, .. } | Modal::SyntaxTheme { row, .. }) => {
@@ -536,13 +599,12 @@ impl LayoutSnapshot {
                     .screen
                     .tabs
                     .iter()
-                    .position(|tab| Some(tab.id) == *selected)
-                    .unwrap_or(0);
+                    .position(|tab| Some(tab.id) == *selected);
                 for (row, tab) in app
                     .screen
                     .tabs
                     .iter()
-                    .skip(list_start(highlight, rows))
+                    .skip(list_start(highlight.unwrap_or(0), rows))
                     .take(rows as usize)
                     .enumerate()
                 {
@@ -556,9 +618,14 @@ impl LayoutSnapshot {
                         ),
                     );
                 }
-                result.add(Control::TabListClose, Rect::new(overlay.x + 1, y, 8, 1));
-                result.add(Control::PathCancel, Rect::new(overlay.x + 10, y, 9, 1));
-                result.add(Control::TabListSwitch, Rect::new(overlay.x + 20, y, 9, 1));
+                if highlight.is_some() {
+                    result.add(Control::TabListClose, Rect::new(overlay.x + 1, y, 7, 1));
+                }
+                result.add(Control::PathCancel, Rect::new(overlay.x + 9, y, 6, 1));
+                if highlight.is_some() {
+                    result.add(Control::TabListSwitch, Rect::new(overlay.x + 16, y, 8, 1));
+                    result.add(Control::TabListDetails, Rect::new(overlay.x + 25, y, 9, 1));
+                }
             }
             Some(Modal::Open(dialog)) => {
                 let rows = overlay.height.saturating_sub(5);
@@ -618,9 +685,14 @@ impl LayoutSnapshot {
                     Rect::new(overlay.x + 21, y, 13, 1),
                 );
             }
-            Some(Modal::Details(_) | Modal::TabDetails) => {
+            Some(
+                Modal::Details(_)
+                | Modal::TabDetails { .. }
+                | Modal::About { .. }
+                | Modal::SettingsDiagnostic { .. },
+            ) => {
                 result.add(Control::DetailsClose, Rect::new(overlay.x + 2, y, 9, 1));
-                if app.screen.path.is_some() && app.screen.stream.is_none() {
+                if app.details_refresh_target().is_some() {
                     result.add(Control::RetryRefresh, Rect::new(overlay.x + 13, y, 17, 1));
                 }
             }
@@ -689,6 +761,16 @@ impl LayoutSnapshot {
             self.targets.push(Target { control, area });
         }
     }
+    /// Report the scroll column under a pointer inside the Actions pane.
+    pub(crate) fn menu_column(&self, x: u16, y: u16) -> Option<bool> {
+        let (categories, commands) = menu_columns(self.overlay?);
+        if categories.contains((x, y).into()) {
+            Some(false)
+        } else {
+            commands.contains((x, y).into()).then_some(true)
+        }
+    }
+
     /// Test whether a focus target exists in this frame.
     pub fn contains(&self, control: Control) -> bool {
         self.targets.iter().any(|t| t.control == control)
@@ -703,19 +785,39 @@ impl LayoutSnapshot {
     }
     /// Cycle through only the currently visible interaction surface.
     pub fn next(&self, current: Option<Control>, backwards: bool) -> Option<Control> {
-        let controls: Vec<_> = self
-            .targets
-            .iter()
-            .filter(|t| {
-                !matches!(
-                    t.control,
-                    Control::PickerRow(_)
-                        | Control::TabListRow(_)
-                        | Control::RecoveryRow(_)
-                        | Control::TabDivider
-                )
-            })
-            .collect();
+        self.next_when(current, backwards, |control| {
+            !matches!(
+                control,
+                Control::PickerRow(_)
+                    | Control::TabListRow(_)
+                    | Control::RecoveryRow(_)
+                    | Control::TabDivider
+            )
+        })
+    }
+
+    /// Treat the selected Settings section and row as roving focus groups.
+    pub(crate) fn next_setting(
+        &self,
+        current: Option<Control>,
+        backwards: bool,
+        section: settings_ui::Section,
+        row: Control,
+    ) -> Option<Control> {
+        self.next_when(current, backwards, |control| match control {
+            Control::SettingsSection(active) => active == section,
+            Control::SettingsField | Control::SettingsRow(_) => control == row,
+            _ => true,
+        })
+    }
+
+    fn next_when(
+        &self,
+        current: Option<Control>,
+        backwards: bool,
+        visible: impl Fn(Control) -> bool,
+    ) -> Option<Control> {
+        let controls: Vec<_> = self.targets.iter().filter(|t| visible(t.control)).collect();
         let count = controls.len();
         if count == 0 {
             return None;
@@ -740,6 +842,40 @@ impl LayoutSnapshot {
         Some(controls[next].control)
     }
 }
+/// Use a sidebar when there is room for the full section labels and values.
+pub(crate) const SETTINGS_SPLIT_WIDTH: u16 = 64;
+
+/// Content geometry shared by settings fields, hit targets, and informational text.
+fn settings_body(overlay: Rect, draft: &settings_ui::Draft) -> Rect {
+    let (sidebar, header) = if draft.show_sections() {
+        if overlay.width < SETTINGS_SPLIT_WIDTH {
+            (0, 1)
+        } else {
+            (22, 0)
+        }
+    } else {
+        (0, 0)
+    };
+    Rect::new(
+        overlay.x + 1 + sidebar,
+        overlay.y + 1 + header,
+        overlay.width - 2 - sidebar,
+        overlay.height - 3 - header,
+    )
+}
+
+/// Reserve a divider and a full-width command label below the scrollable columns.
+fn menu_columns(overlay: Rect) -> (Rect, Rect) {
+    let width = if overlay.width < 56 { 13 } else { 18 };
+    let height = overlay.height - 3;
+    let x = overlay.x + 1;
+    let y = overlay.y + 1;
+    (
+        Rect::new(x, y, width, height),
+        Rect::new(x + width + 1, y, overlay.width - width - 3, height),
+    )
+}
+
 fn list_start(highlight: usize, rows: u16) -> usize {
     highlight.saturating_sub(rows.saturating_sub(1) as usize)
 }
@@ -1104,12 +1240,19 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &AppState, layout: &LayoutSnaps
                 " Discard stream history "
             }
             Some(Modal::Confirm(..)) => " Unsaved changes ",
-            Some(Modal::Details(_) | Modal::TabDetails) => " Details ",
+            Some(Modal::Details(_)) => " Details ",
+            Some(Modal::TabDetails { .. }) => " Tab Details ",
+            Some(Modal::About { .. }) => " About ",
+            Some(Modal::SettingsDiagnostic { .. }) => " Settings Details ",
             Some(Modal::SaveError(_)) => " Save failed — work retained ",
             Some(Modal::PersistenceError(_)) => " Scratch persistence failed ",
             None => " Help ",
         };
         frame.render_widget(Block::default().title(title).borders(Borders::ALL), overlay);
+        if let Some(Modal::Menu(menu)) = app.modal {
+            render_actions(frame, app, layout, overlay, menu);
+            return;
+        }
         let inner = Rect::new(
             overlay.x + 1,
             overlay.y + 1,
@@ -1178,7 +1321,9 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &AppState, layout: &LayoutSnaps
                     format!("{verb} — {label}\n{guidance}")
                 }
             }
-            Some(Modal::TabDetails) => app.tab_details(),
+            Some(Modal::TabDetails { .. }) => app.tab_details(),
+            Some(Modal::About { .. }) => app.about(),
+            Some(Modal::SettingsDiagnostic { text, .. }) => safe(text),
             Some(Modal::Details(text) | Modal::SaveError(text) | Modal::PersistenceError(text)) => {
                 safe(text)
             }
@@ -1207,13 +1352,17 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &AppState, layout: &LayoutSnaps
                         .into(),
                     "Config clipboard.mode = \"internal\" keeps editor Copy and Cut private."
                         .into(),
-                    format!("{actions} opens Actions and the mouse capture toggle."),
-                    "Click outside Actions to dismiss it.".into(),
+                    format!("{actions} opens Actions. Left/Right switches columns."),
+                    "Mouse capture is under Actions → Settings.".into(),
+                    "Click outside a pane to dismiss it. Confirmations need a choice.".into(),
                     "Selection modifiers vary; tmux: copy mode.".into(),
                     "Tab × closes that tab. Tabs lists hidden entries.".into(),
-                    "Highlighted tab is active. * modified, ! save attention.".into(),
+                    "In Tabs, > marks the active tab. Details inspects the selected tab.".into(),
+                    "In the header, reverse video marks the active tab. * modified, ! attention."
+                        .into(),
                     "Tabs: … waiting, ↓ loading, ⇡ queued save, ↑ saving".into(),
-                    "Settings opens from the header or Actions. F5 is the default.".into(),
+                    "F5 opens Settings by default. Choose a section to see its settings.".into(),
+                    "Actions → Help → About shows the app version and configuration path.".into(),
                 ];
                 if app.config_location.safe() {
                     lines.splice(
@@ -1331,7 +1480,9 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &AppState, layout: &LayoutSnaps
                             app.modal,
                             Some(
                                 Modal::Details(_)
-                                    | Modal::TabDetails
+                                    | Modal::TabDetails { .. }
+                                    | Modal::About { .. }
+                                    | Modal::SettingsDiagnostic { .. }
                                     | Modal::ReplaceAll(_)
                                     | Modal::SaveError(_)
                                     | Modal::PersistenceError(_)
@@ -1411,12 +1562,7 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &AppState, layout: &LayoutSnaps
                 app.screen.tabs.iter().find(|tab| tab.id == id).map(|tab| {
                     let highlighted =
                         matches!(app.modal, Some(Modal::Tabs(Some(highlight))) if highlight == id);
-                    (
-                        tab_text(tab, app.screen.tab == Some(id)),
-                        highlighted
-                            || app.focus == Some(target.control)
-                            || app.screen.tab == Some(id),
-                    )
+                    (tab_text(tab, app.screen.tab == Some(id)), highlighted)
                 })
             }
             (Control::PickerRow(index), Some(Modal::Open(dialog))) => {
@@ -1478,13 +1624,16 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &AppState, layout: &LayoutSnaps
             _ => None,
         };
         if let Some((label, focused)) = row {
-            let style = if focused {
+            let mut style = if focused {
                 Style::default()
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD)
             } else {
                 Style::default()
             };
+            if focused && matches!(target.control, Control::TabListRow(_)) {
+                style = style.add_modifier(Modifier::REVERSED);
+            }
             frame.render_widget(Paragraph::new(label).style(style), target.area);
             continue;
         }
@@ -1556,40 +1705,13 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &AppState, layout: &LayoutSnaps
             }
             continue;
         }
-        let focused = app.focus == Some(target.control)
-            || matches!((app.modal.as_ref(),target.control),(Some(Modal::Menu(index)),Control::MenuItem(item)) if *index==item);
-        let title = match target.control {
-            Control::MenuItem(index) if MENU[index] == Command::MouseCapture => {
-                if app.mouse_capture {
-                    "Mouse capture: enabled (toggle)".to_owned()
-                } else {
-                    "Mouse capture: paused (toggle)".to_owned()
-                }
-            }
-            Control::MenuItem(index)
-                if matches!(
-                    MENU[index],
-                    Command::ReloadHighlighting | Command::ReloadSettings
-                ) && app.config_location.user_directory().is_none() =>
-            {
-                format!("{} (disabled)", MENU[index].label())
-            }
-            Control::MenuItem(index) => {
-                let command = MENU[index];
-                let keys = app.settings.applied.map.shortcuts(Context::Global, command);
-                let keys = if keys.is_empty() {
-                    app.settings.applied.map.shortcuts(Context::Editor, command)
-                } else {
-                    keys
-                };
-                if keys.is_empty() {
-                    command.label().to_owned()
-                } else {
-                    format!("{:<19} {keys}", command.label())
-                }
-            }
-            control => control.label().to_owned(),
-        };
+        let focused = app.focus == Some(target.control);
+        let title =
+            if target.control == Control::PathCancel && matches!(app.modal, Some(Modal::Tabs(_))) {
+                "Back"
+            } else {
+                target.control.label()
+            };
         let label = if focused {
             format!(">{title}<")
         } else {
@@ -1605,44 +1727,115 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &AppState, layout: &LayoutSnaps
         frame.render_widget(Paragraph::new(label).style(style), target.area);
     }
 }
+/// Render the two navigation columns and a full-width caption for the selected command.
+fn render_actions(
+    frame: &mut Frame<'_>,
+    app: &AppState,
+    layout: &LayoutSnapshot,
+    overlay: Rect,
+    menu: menu::Menu,
+) {
+    let (categories, _) = menu_columns(overlay);
+    for y in categories.y..categories.bottom() {
+        frame.render_widget(Paragraph::new("│"), Rect::new(categories.right(), y, 1, 1));
+    }
+    for target in &layout.targets {
+        let focused = app.focus == Some(target.control);
+        let style = if focused {
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        let label = match target.control {
+            Control::MenuCategory(index) => format!(
+                "{}{}",
+                if menu.category == index { "›" } else { " " },
+                menu::GROUPS[index].0,
+            ),
+            Control::MenuItem(index) => {
+                let command = menu.commands()[index];
+                let name = command.label();
+                let (left, right) = if focused { ('>', '<') } else { (' ', ' ') };
+                if name.width() + 2 > usize::from(target.area.width) {
+                    let prefix: String = name
+                        .chars()
+                        .take(usize::from(target.area.width - 3))
+                        .collect();
+                    format!("{left}{prefix}…{right}")
+                } else {
+                    format!("{left}{name}{right}")
+                }
+            }
+            _ => continue,
+        };
+        frame.render_widget(Paragraph::new(label).style(style), target.area);
+    }
+
+    let command = menu.commands()[menu.row];
+    let label = match command {
+        Command::MouseCapture if app.mouse_capture => "Mouse capture: enabled (toggle)".into(),
+        Command::MouseCapture => "Mouse capture: paused (toggle)".into(),
+        Command::ReloadHighlighting | Command::ReloadSettings
+            if app.config_location.user_directory().is_none() =>
+        {
+            format!("{} (disabled)", command.label())
+        }
+        _ => {
+            let map = &app.settings.applied.map;
+            let mut keys = map.shortcuts(Context::Global, command);
+            if keys.is_empty() {
+                keys = map.shortcuts(Context::Editor, command);
+            }
+            if keys.is_empty() {
+                command.label().into()
+            } else {
+                format!("{}  {keys}", command.label())
+            }
+        }
+    };
+    frame.render_widget(
+        Paragraph::new(label),
+        Rect::new(overlay.x + 1, overlay.bottom() - 2, overlay.width - 2, 1),
+    );
+}
+
 /// Display the right end of an editable field using the prepared hit geometry.
 fn render_settings(frame: &mut Frame<'_>, app: &AppState, layout: &LayoutSnapshot, overlay: Rect) {
     let Some(draft) = &app.settings_ui else {
         return;
     };
+    let compact = overlay.width < SETTINGS_SPLIT_WIDTH;
     frame.render_widget(Clear, overlay);
     frame.render_widget(
         Block::default()
-            .title(draft.title(&app.settings, &app.config_location))
+            .title(draft.title(&app.settings, &app.config_location, compact))
             .borders(Borders::ALL),
         overlay,
     );
-    for (row, text) in draft.lines(&app.settings, &app.config_location) {
-        let height = if draft.info() {
-            overlay.height.saturating_sub(4)
-        } else {
-            1
-        };
+    let body = settings_body(overlay, draft);
+    if draft.show_sections() && !compact {
+        for y in body.y..body.bottom() {
+            frame.render_widget(Paragraph::new("│"), Rect::new(body.x - 1, y, 1, 1));
+        }
+    }
+    for (row, text) in draft.lines(&app.settings) {
         frame.render_widget(
-            Paragraph::new(text)
-                .wrap(Wrap { trim: false })
-                .scroll((draft.info_scroll, 0)),
-            Rect::new(
-                overlay.x + 1,
-                overlay.y + 1 + row,
-                overlay.width - 2,
-                height,
-            ),
+            Paragraph::new(text),
+            Rect::new(body.x, body.y + row, body.width, 1),
         );
     }
-    if let Some(message) = app
-        .field_error
-        .as_deref()
-        .or_else(|| draft.feedback(&app.settings))
-    {
+    if let Some(message) = app.settings_feedback() {
+        let details = layout.contains(Control::SettingsButton(settings_ui::Button::Diagnostic));
         frame.render_widget(
             Paragraph::new(safe(message)).style(Style::default().add_modifier(Modifier::BOLD)),
-            Rect::new(overlay.x + 1, overlay.bottom() - 1, overlay.width - 2, 1),
+            Rect::new(
+                overlay.x + 1,
+                overlay.bottom() - 1,
+                overlay.width - 2 - if details { 10 } else { 0 },
+                1,
+            ),
         );
     }
     for target in &layout.targets {
@@ -1656,9 +1849,34 @@ fn render_settings(frame: &mut Frame<'_>, app: &AppState, layout: &LayoutSnapsho
         };
         match target.control {
             Control::SettingsButton(button) => {
+                use settings_ui::Button as B;
                 let (open, close) = if focus { ('>', '<') } else { ('[', ']') };
+                let foreground = match button {
+                    B::Save | B::SaveAndExit => Some(Color::Green),
+                    B::Discard | B::DiscardAndExit | B::DiscardCapture => Some(Color::Red),
+                    _ => None,
+                };
+                let mut button_style = Style::default();
+                if let Some(color) = foreground {
+                    button_style = button_style.fg(color);
+                }
+                if focus {
+                    button_style = button_style.add_modifier(Modifier::BOLD);
+                }
                 frame.render_widget(
-                    Paragraph::new(format!("{open}{}{close}", button.label())).style(style),
+                    Paragraph::new(format!("{open}{}{close}", button.label())).style(button_style),
+                    target.area,
+                );
+            }
+            Control::SettingsSection(section) => {
+                let (open, close) = if focus { ('>', '<') } else { ('[', ']') };
+                let style = if section == draft.section() {
+                    style.add_modifier(Modifier::REVERSED)
+                } else {
+                    style
+                };
+                frame.render_widget(
+                    Paragraph::new(format!("{open}{}{close}", section.label(compact))).style(style),
                     target.area,
                 );
             }
@@ -1920,7 +2138,11 @@ mod tests {
         for (width, height) in [(0, 0), (1, 1), (39, 7), (40, 8), (80, 24), (200, 100)] {
             for modal in [
                 None,
-                Some(Modal::Menu(13)),
+                Some(Modal::Menu(menu::Menu {
+                    category: 7,
+                    row: 2,
+                    commands_focused: true,
+                })),
                 Some(Modal::Path(PathKind::GoTo, "test".into())),
                 Some(Modal::Confirm(After::Quit, None)),
             ] {
@@ -1942,6 +2164,55 @@ mod tests {
                 }
                 assert_eq!(layout.hit(width, height), None);
             }
+        }
+    }
+
+    /// Section selectors and action colors remain legible at both supported layouts.
+    #[test]
+    fn settings_section_geometry_and_footer_colors() {
+        use crate::input::Input;
+        use settings_ui::{Button, Section};
+
+        let config = tempfile::tempdir().unwrap();
+        let mut app = AppState::new();
+        app.config_location = crate::settings::Location::isolated(config.path().to_owned());
+        for width in [40, 64, 80] {
+            let area = Rect::new(0, 0, width, 8);
+            if app.modal.is_none() {
+                let workspace = LayoutSnapshot::for_app(area, &app, 1);
+                app.input(Input::Command(Command::Settings), &workspace);
+            }
+            let layout = LayoutSnapshot::for_app(area, &app, 2);
+            let overlay = layout.overlay.unwrap();
+            let area_of = |control| {
+                layout
+                    .targets
+                    .iter()
+                    .find(|target| target.control == control)
+                    .unwrap()
+                    .area
+            };
+            let recovery = area_of(Control::SettingsSection(Section::Recovery));
+            let limits = area_of(Control::SettingsSection(Section::Highlighting));
+            let value = area_of(Control::SettingsRow(0));
+            assert!(!layout.contains(Control::SettingsRow(1)));
+            if width < SETTINGS_SPLIT_WIDTH {
+                assert!(recovery.x < limits.x && value.y > limits.y);
+            } else {
+                assert!(recovery.y < limits.y && value.x > limits.right());
+            }
+            let save = area_of(Control::SettingsButton(Button::Save));
+            let discard = area_of(Control::SettingsButton(Button::Discard));
+            let exit = area_of(Control::SettingsButton(Button::Exit));
+            assert_eq!(exit.right() + 1, overlay.right());
+            assert_eq!(save.y, overlay.bottom() - 2);
+            let mut terminal = Terminal::new(TestBackend::new(width, 8)).unwrap();
+            terminal.draw(|frame| render(frame, &app, &layout)).unwrap();
+            let buffer = terminal.backend().buffer();
+            assert_eq!(buffer[(save.x, save.y)].fg, Color::Green);
+            assert_eq!(buffer[(discard.x, discard.y)].fg, Color::Red);
+            assert_eq!(buffer[(exit.x, exit.y)].fg, Color::Reset);
+            assert_eq!(buffer[(value.x, value.y)].symbol(), ">");
         }
     }
     /// A wide Unicode run clipped at both sides paints exact selected occupied cells.

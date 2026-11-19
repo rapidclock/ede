@@ -651,6 +651,16 @@ Depends on Stage 10. Branch `stage/extras`, PR target `feat/initial_mvp`.
 Design — [Stage 11 specification](11_extras.md).
 Evidence and open checks — [Stage 11 validation record](11_extras.md#validation-record).
 
+### 12 — Pane refinements
+
+Outcome — Users can dismiss panes with an outside click, inspect a selected
+tab without switching, browse categorized Actions and Settings, and find the
+running version and configuration location in About.
+Depends on Stage 11. Branch `stage/pane_refinements`, PR target `feat/initial_mvp`.
+
+Design — [Stage 12 specification](12_pane_refinements.md).
+Evidence — [Stage 12 validation record](12_pane_refinements.md#validation-record).
+
 ## 9. Research references
 
 These explain candidate technologies; they do not constitute implementation choices.

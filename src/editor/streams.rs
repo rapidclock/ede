@@ -4,7 +4,7 @@ use super::*;
 use crate::stream::{self, Phase, Source};
 
 /// Small display state independent of storage ownership or the file descriptor.
-#[derive(Clone)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct StreamStatus {
     pub following: bool,
     pub unseen: bool,

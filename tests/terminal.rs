@@ -26,6 +26,235 @@ use nix::{
 /// Bounded timeouts turn a broken terminal loop into a useful test failure, not a hanging CI job.
 const TIMEOUT: Duration = Duration::from_secs(5);
 
+/// A dirty outside dismissal preserves the pending field and requires an explicit choice.
+#[test]
+fn settings_outside_click_protects_unaccepted_text() {
+    let root = tempfile::tempdir().unwrap();
+    let mut process = PtyChild::editor_with_options(
+        Some("xterm-256color"),
+        std::iter::empty::<&str>(),
+        None,
+        Some(root.path()),
+        None,
+    );
+    process.resize(40, 8);
+    process.expect("New Scratch");
+    process.send(b"\x1b[15~");
+    process.expect("Checkpoint interval");
+    process.send(b"\r\x7f7\x1b[<0;40;8M\x1b[<0;40;8m");
+    process.expect(">Keep Editing<");
+    process.send(b"\x1b[<0;40;8M\x1b[<0;40;8m");
+    process.expect(">Keep Editing<");
+    assert!(!root.path().join("ede/config.toml").exists());
+    process.send(b"\x1b");
+    process.expect("Checkpoint interval (s) 7");
+    process.send(b"\x1b[<0;40;8M\x1b[<0;40;8m");
+    process.click_label("[Save and Exit]", 1);
+    process.expect_status("Settings saved");
+    let config = std::fs::read_to_string(root.path().join("ede/config.toml")).unwrap();
+    assert!(config.contains("checkpoint_interval_seconds = 7"));
+    process.send(b"\x11");
+    assert!(process.wait().success());
+}
+
+/// Details reads an inactive tab without installing it in the editor.
+#[test]
+fn tabs_details_preserves_active_document() {
+    let root = tempfile::tempdir().unwrap();
+    let rust = root.path().join("inactive.rs");
+    let text = root.path().join("active.txt");
+    std::fs::write(&rust, "fn example() {}\n").unwrap();
+    std::fs::write(&text, "active document text\n").unwrap();
+    let mut process = PtyChild::editor_with_options(
+        Some("xterm-256color"),
+        [rust.as_os_str(), text.as_os_str()],
+        None,
+        Some(root.path()),
+        None,
+    );
+    process.expect_body("fn example()", TIMEOUT);
+    process.send(b"\x1b[19~");
+    process.expect_body("active document text", TIMEOUT);
+    run_action(&mut process, "Tabs", 0);
+    process.expect("Tabs — Enter to switch");
+    process.send(b"\x1b[A");
+    process.expect("> active.txt");
+    syntax_color(&mut process, 3, 7, vt100::Color::Idx(6));
+    syntax_color(&mut process, 4, 7, vt100::Color::Default);
+    process.click_label("[Details]", 1);
+    process.expect("Language: Rust (Auto)");
+    process.expect("Highlighting: analysis runs when the tab is active");
+    process.send(b"\x1b");
+    process.expect(">Details<");
+    process.send(b"\r");
+    process.expect("Language: Rust (Auto)");
+    process.send(b"\x1b");
+    process.expect(">Details<");
+    process.send(b"\x1b[<0;80;1M\x1b[<0;80;1m");
+    process.expect_absent("Tabs — Enter to switch");
+    process.expect_body("active document text", TIMEOUT);
+
+    let config = root.path().join("ede");
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::write(
+        config.join("highlighting.toml"),
+        "[files.extensions]\nrs = 'plain'\n",
+    )
+    .unwrap();
+    run_action(&mut process, "Highlighting", 2);
+    process.expect_absent("Actions (wheel/arrows)");
+    run_action(&mut process, "Tabs", 0);
+    process.expect("Tabs — Enter to switch");
+    process.send(b"\x1b[A");
+    process.click_label("[Details]", 1);
+    process.expect("Language: Plain Text (Auto)");
+    process.expect("Highlighting: Plain Text");
+    process.send(b"\x1b");
+    process.expect(">Details<");
+    process.send(b"\x1b");
+    process.expect_absent("Tabs — Enter to switch");
+    process.expect_body("active document text", TIMEOUT);
+    process.send(b"\x11");
+    assert!(process.wait().success());
+}
+
+/// Parked stream metadata stays live while an ordinary document owns the viewport.
+#[test]
+fn tab_details_tracks_parked_stream_without_switching() {
+    let root = tempfile::tempdir().unwrap();
+    let log = root.path().join("follow.log");
+    std::fs::write(&log, "first\n").unwrap();
+    let mut process = PtyChild::editor_with_args(
+        Some("xterm-256color"),
+        [std::ffi::OsStr::new("--follow"), log.as_os_str()],
+    );
+    process.expect_status("Waiting for more");
+    process.send(b"\x0e");
+    process.expect_status("Ready");
+    process.send(b"active scratch");
+    process.expect_body("active scratch", TIMEOUT);
+    process.click_label("[Tabs]", 1);
+    process.send(b"\x1b[A");
+    process.click_label("[Details]", 1);
+    process.expect("Read-only retained history — 6 bytes");
+    process.expect_absent("Retry refresh");
+    let mut file = File::options().append(true).open(&log).unwrap();
+    file.write_all(b"second\n").unwrap();
+    process.expect("Read-only retained history — 13 bytes");
+    process.send(b"\x1b");
+    process.expect(">Details<");
+    process.send(b"\x1b");
+    process.expect_absent("Tabs — Enter to switch");
+    process.expect_body("active scratch", TIMEOUT);
+    process.send(b"\x11");
+    process.expect("discard retained stream history");
+    process.send(b"\x1b[Z\r");
+    assert!(process.wait().success());
+}
+
+/// Settings sections share a draft, and About exposes build and configuration information.
+#[test]
+fn settings_sections_and_menu_about_at_minimum_size() {
+    let root = tempfile::tempdir_in("/tmp").unwrap();
+    let mut process = PtyChild::editor_with_options(
+        Some("xterm-256color"),
+        std::iter::empty::<&str>(),
+        None,
+        Some(root.path()),
+        None,
+    );
+    process.resize(40, 8);
+    process.expect("New Scratch");
+    process.send(b"\x1b[15~");
+    process.expect("Checkpoint interval");
+    process.expect_absent("Document limit");
+    process.expect_absent("[Config]");
+    process.send(b"\r\x7fx");
+    process.click_label("[Limits]", 1);
+    process.expect("Enter a whole number from 1 to 3600");
+    process.send(b"\x7f9");
+    process.click_label("[Limits]", 1);
+    process.expect("Document limit");
+    process.expect_absent("Checkpoint interval");
+    process.click_label("[Keys]", 1);
+    process.click_label("controls.activate", 1);
+    process.click_label("[Replace]", 1);
+    process.expect("Type the replacement shortcut");
+    process.send(b"\x7f\x7f\x7f\x7f\x7fF10\r");
+    process.expect("1/1 F10 (override)");
+    process.click_label("[Save]", 1);
+    process.expect_status("Settings saved");
+    let config = std::fs::read_to_string(root.path().join("ede/config.toml")).unwrap();
+    assert!(config.contains("checkpoint_interval_seconds = 9"));
+    assert!(config.contains("[keybindings.controls]") && config.contains("F10"));
+    process.send(b"\x1b\x1bOQ\x1b[F\x1b[C\x1b[B\r");
+    process.expect(concat!("ede ", env!("CARGO_PKG_VERSION")));
+    process.resize(100, 18);
+    process.expect("ede/config.toml");
+    process.send(b"\x1b");
+    process.expect_absent("About");
+    process.send(b"\x1bOQ");
+    process.click_label(" Help", 1);
+    process.click_label(" About", 1);
+    process.expect(concat!("ede ", env!("CARGO_PKG_VERSION")));
+    process.send(b"\x1b");
+    process.expect_absent("About");
+    process.send(b"\x11");
+    assert!(process.wait().success());
+}
+
+/// Full configuration diagnostics are readable when the footer truncates them.
+#[test]
+fn settings_diagnostic_opens_and_returns_to_settings() {
+    let root = tempfile::tempdir().unwrap();
+    let config = root.path().join("ede");
+    std::fs::create_dir(&config).unwrap();
+    std::fs::write(
+        config.join("config.toml"),
+        "[recovery]\ncheckpoint_interval_seconds = 0\n",
+    )
+    .unwrap();
+    let mut process = PtyChild::editor_with_options(
+        Some("xterm-256color"),
+        std::iter::empty::<&str>(),
+        None,
+        Some(root.path()),
+        None,
+    );
+    process.expect_status("Settings error");
+    process.resize(40, 8);
+    process.send(b"\x1b[15~");
+    process.click_label("[Details]", 1);
+    process.expect("Settings Details");
+    process.send(b"\x1b[B\x1b[B\x1b[B");
+    process.expect("3600");
+    process.send(b"\x1b");
+    process.expect("Checkpoint interval");
+    process.send(b"\x1b");
+    process.expect_absent("Checkpoint interval");
+    process.send(b"\x11");
+    assert!(process.wait().success());
+}
+
+/// Search dismissal consumes the first click, even when it lands in editor content.
+#[test]
+fn search_outside_click_preserves_caret_until_second_click() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("search.txt");
+    std::fs::write(&path, "first\nsecond\n").unwrap();
+    let mut process = PtyChild::editor_with_path(Some("xterm-256color"), Some(&path));
+    process.expect_status("Ln 1 Col 1");
+    process.send(b"\x06");
+    process.expect("Find:");
+    process.send(b"\x1b[<0;3;3M\x1b[<0;3;3m");
+    process.expect_absent("Find:");
+    process.expect_status("Ln 1 Col 1");
+    process.send(b"\x1b[<0;3;3M\x1b[<0;3;3m");
+    process.expect_status("Ln 2 Col 3");
+    process.send(b"\x11");
+    assert!(process.wait().success());
+}
+
 /// Outside clicks consume the gesture and the direct Settings control works at 40×8.
 #[test]
 fn actions_outside_click_and_direct_settings_at_minimum_size() {
@@ -252,8 +481,7 @@ fn markdown_source_renders_syntax_colors() {
     }
     process.expect("Ordinary prose");
     syntax_color(&mut process, 22, 0, vt100::Color::Default);
-    let open_language = [b"\x1bOQ".as_slice(), &b"\x1b[B".repeat(27), b"\r"].concat();
-    process.send(&open_language);
+    run_action(&mut process, "Highlighting", 0);
     process.expect("Auto (Markdown)");
     process.send(b"\x1b[B\r");
     process.expect_absent("Auto (Markdown)");
@@ -411,8 +639,7 @@ fn tab_details_language_follows_opened_name_and_committed_save_as() {
     process.expect_status("Ready");
 
     let show_language = |expected, process: &mut PtyChild| {
-        let open_details = [b"\x1bOQ".as_slice(), &b"\x1b[B".repeat(17), b"\r"].concat();
-        process.send(&open_details);
+        run_action(process, "Tabs", 2);
         process.expect(expected);
         process.send(b"\x1b");
         process.expect_absent(expected);
@@ -435,8 +662,7 @@ fn tab_details_language_follows_opened_name_and_committed_save_as() {
     process.expect_status("Saved");
     show_language("Language: TypeScript (Auto)", &mut process);
 
-    let open_language = [b"\x1bOQ".as_slice(), &b"\x1b[B".repeat(27), b"\r"].concat();
-    process.send(&open_language);
+    run_action(&mut process, "Highlighting", 0);
     process.expect("Auto (TypeScript)");
     process.send(&[b"\x1b[B".repeat(5).as_slice(), b"\r"].concat());
     show_language("Language: JSON (Manual)", &mut process);
@@ -1054,7 +1280,7 @@ fn settings_checkpoint_interval_reaches_promoted_stdin() {
     process.expect_body("cadence applies to stdin", TIMEOUT);
     process.expect_status("User config");
     configure(1);
-    syntax_action(&mut process, 36);
+    run_action(&mut process, "Settings", 1);
     let started = Instant::now();
     drop(producer);
     process.expect_status("Editable scratch");
@@ -1404,7 +1630,7 @@ fn invalid_general_config_preserves_previous_revision_and_default_quit() {
     running.expect_status("User config");
     running.expect_status("Ready");
     std::fs::write(&config, "[keybindings.global]\nquit = ['Cmd+Q']").unwrap();
-    syntax_action(&mut running, 36);
+    run_action(&mut running, "Settings", 1);
     running.expect_status("Settings error");
     running.resize(20, 4);
     running.expect("Ctrl+B Quit");
@@ -1415,7 +1641,7 @@ fn invalid_general_config_preserves_previous_revision_and_default_quit() {
     let mut fallback = start();
     fallback.expect_status("Settings error");
     fallback.expect_status("Ready");
-    syntax_action(&mut fallback, 11); // Pause mouse capture.
+    run_action(&mut fallback, "Settings", 2); // Pause mouse capture.
     fallback.send(b"X");
     fallback.expect_body("Xoriginal", TIMEOUT);
     fallback.send(b"\x11");
@@ -1461,21 +1687,21 @@ fn general_highlighting_limits_recheck_offscreen_crlf_lines() {
     );
     process.expect_status("Plain syntax");
     write_limits(32, content.len());
-    syntax_action(&mut process, 36);
+    run_action(&mut process, "Settings", 1);
     syntax_color(&mut process, 1, 0, vt100::Color::Idx(14));
     write_limits(0, content.len());
-    syntax_action(&mut process, 36);
+    run_action(&mut process, "Settings", 1);
     process.expect_status("Settings error");
     syntax_color(&mut process, 1, 0, vt100::Color::Idx(14));
     std::fs::write(
         root.join("highlighting.toml"),
         "default_theme = 'Aqua'\n[themes.Aqua]\nbase = 'dark'\n[themes.Aqua.colors]\nkeyword = '#1188DD'\n",
     ).unwrap();
-    syntax_action(&mut process, 29);
+    run_action(&mut process, "Highlighting", 2);
     syntax_color(&mut process, 1, 0, vt100::Color::Rgb(0x11, 0x88, 0xdd));
     process.expect_status("Settings error");
     write_limits(32, content.len() - 1);
-    syntax_action(&mut process, 36);
+    run_action(&mut process, "Settings", 1);
     process.expect_status("Plain syntax");
     process.send(b"\x11");
     assert!(process.wait().success());
@@ -1568,7 +1794,7 @@ fn settings_capture_and_dirty_confirmation_at_minimum_size() {
     process.resize(40, 8);
     process.send(b"\x1b[20~");
     process.expect("Checkpoint interval (s)");
-    process.send(&b"\x1b[B".repeat(4));
+    process.click_label("[Keys]", 1);
     process.click_label("controls.activate", 1);
     process.expect("1/1 Enter (default)");
     process.click_label("[Replace]", 1);
@@ -1659,7 +1885,10 @@ fn real_mouse_overlay_and_resize() {
     process.send(b"\x1bOP");
     process.expect("Cmd aliases require");
     // Header Quit is underneath the overlay and must not be activated.
-    process.send(b"\x1b[<0;74;1M\x1b[<0;74;1mtext");
+    process.send(b"\x1b[<0;74;1M\x1b[<0;74;1m");
+    process.expect_absent("Cmd aliases require");
+    assert!(process.child.try_wait().unwrap().is_none());
+    process.send(b"\x1bOP");
     process.expect("Cmd aliases require");
     assert!(process.child.try_wait().unwrap().is_none());
     process.reset_output();
@@ -1963,13 +2192,7 @@ fn independent_instances_restore_overflow_and_open_after_freeing_a_slot() {
     let mut c = launch();
     c.expect_with_timeout("Untitled 33", Duration::from_secs(15));
     c.expect_status("Ready");
-    let recovery_menu = [
-        b"\x1bOQ".as_slice(),
-        b"\x1b[B".repeat(18).as_slice(),
-        b"\r".as_slice(),
-    ]
-    .concat();
-    c.send(&recovery_menu);
+    run_action(&mut c, "File", 4);
     c.expect("Recovery — retained scratches");
     c.expect("Scratch 65");
     c.expect("Scratch 66");
@@ -1981,7 +2204,7 @@ fn independent_instances_restore_overflow_and_open_after_freeing_a_slot() {
     c.expect("Unsaved changes");
     c.send(b"\t\t\r");
     c.expect_active_tab("~Untitled 34");
-    c.send(&recovery_menu);
+    run_action(&mut c, "File", 4);
     c.expect("Scratch 65");
     c.send(b"\r");
     c.expect_active_tab("~Untitled 65");
@@ -3493,12 +3716,8 @@ fn isolated_tmux_editing_and_suspend_smoke() {
         thread::sleep(Duration::from_millis(5));
     }
     // Pause native capture through the menu and keep it paused through suspend.
-    process.send(b"\x1bOQ");
-    process.expect("Actions");
-    for _ in 0..11 {
-        process.send(b"\x1b[B");
-    }
-    process.send(b"\r\x1bOQ");
+    run_action(&mut process, "Settings", 2);
+    select_action(&mut process, "Settings", 2);
     process.expect("Mouse capture: paused");
     process.send(b"\x1b");
     let deadline = Instant::now() + TIMEOUT;
@@ -3632,9 +3851,35 @@ fn enhanced_shift_tab_moves_dialog_focus() {
     assert!(process.wait().success());
 }
 
-/// F2 Actions entries remain reachable even near the end of the scrolling menu.
-fn syntax_action(process: &mut PtyChild, index: usize) {
-    process.send(&[b"\x1bOQ".as_slice(), &b"\x1b[B".repeat(index), b"\r"].concat());
+/// Select a command through the portable keyboard navigation in Actions.
+fn select_action(process: &mut PtyChild, category: &str, row: usize) {
+    let index = [
+        "File",
+        "Edit",
+        "Search",
+        "Tabs",
+        "Highlighting",
+        "Streams",
+        "Settings",
+        "Help",
+    ]
+    .iter()
+    .position(|label| *label == category)
+    .unwrap();
+    process.send(
+        &[
+            b"\x1bOQ".as_slice(),
+            &b"\x1b[B".repeat(index),
+            b"\x1b[C",
+            &b"\x1b[B".repeat(row),
+        ]
+        .concat(),
+    );
+}
+
+fn run_action(process: &mut PtyChild, category: &str, row: usize) {
+    select_action(process, category, row);
+    process.send(b"\r");
 }
 
 /// Assert terminal-visible attributes, including repaint as asynchronous work settles.
@@ -3695,12 +3940,12 @@ fn safe_config_uses_bundled_theme_and_queries() {
     process.expect_status("Safe config");
     syntax_color(&mut process, 1, 0, vt100::Color::Idx(14));
     syntax_color(&mut process, 1, 22, vt100::Color::Idx(11));
-    syntax_action(&mut process, 11); // Disable mouse capture.
+    run_action(&mut process, "Settings", 2); // Disable mouse capture.
     process.send(b"\x1bOP");
     process.expect(r"cfg-\u{1b}/ede/config.toml");
     process.send(b"\x1b");
     process.expect_absent("Up/Down scroll help");
-    process.send(&[b"\x1bOQ".as_slice(), &b"\x1b[B".repeat(29)].concat());
+    select_action(&mut process, "Highlighting", 2);
     process.expect("Reload Highlighting (disabled)");
     process.send(b"\r\x1b[B");
     process.expect(">Retry Highlighting<");
@@ -3756,7 +4001,7 @@ fn markdown_theme_can_override_headings_and_list_markers() {
     syntax_color(&mut process, 5, 0, vt100::Color::Rgb(0x22, 0x55, 0x88));
     syntax_color(&mut process, 7, 0, vt100::Color::Rgb(0x11, 0x66, 0x33));
     std::fs::write(&file, base.replace("#225588", "#334499")).unwrap();
-    syntax_action(&mut process, 29);
+    run_action(&mut process, "Highlighting", 2);
     syntax_color(&mut process, 4, 0, vt100::Color::Rgb(0x66, 0x44, 0x88));
     syntax_color(&mut process, 5, 0, vt100::Color::Rgb(0x33, 0x44, 0x99));
     syntax_color(&mut process, 7, 0, vt100::Color::Rgb(0x66, 0x44, 0x88));
@@ -3802,22 +4047,22 @@ fn highlighting_configuration_reload_keeps_last_good_revision() {
     syntax_color(&mut process, 1, 0, vt100::Color::Rgb(0xaa, 0x12, 0x34));
     syntax_color(&mut process, 1, 22, vt100::Color::Rgb(4, 0xab, 0x27));
     std::fs::write(&file, theme("#556677")).unwrap();
-    syntax_action(&mut process, 29);
+    run_action(&mut process, "Highlighting", 2);
     syntax_color(&mut process, 1, 0, vt100::Color::Rgb(0x55, 0x66, 0x77));
     syntax_color(&mut process, 1, 22, vt100::Color::Rgb(4, 0xab, 0x27));
 
     std::fs::write(&rules, "(missing_node_kind) @keyword").unwrap();
     std::fs::write(&file, theme("#111111")).unwrap();
-    syntax_action(&mut process, 29);
+    run_action(&mut process, "Highlighting", 2);
     process.expect("Syntax config error");
     syntax_color(&mut process, 1, 0, vt100::Color::Rgb(0x55, 0x66, 0x77));
-    syntax_action(&mut process, 17);
+    run_action(&mut process, "Tabs", 2);
     process.expect("queries/rust/highlights.scm");
     process.send(b"\x1b");
     process.expect_absent("queries/rust/highlights.scm");
     std::fs::remove_file(&rules).unwrap();
     std::fs::remove_file(&file).unwrap();
-    syntax_action(&mut process, 29);
+    run_action(&mut process, "Highlighting", 2);
     process.expect_absent("Syntax config error");
     syntax_color(&mut process, 1, 0, vt100::Color::Default);
     process.send(b"\x11");
@@ -3841,7 +4086,7 @@ fn highlighting_line_fallback_preserves_editor_and_recovers_on_refresh() {
     process.expect("Plain syntax");
     process.expect("fn sample() {}");
     syntax_color(&mut process, 1, 0, vt100::Color::Default);
-    syntax_action(&mut process, 17);
+    run_action(&mut process, "Tabs", 2);
     process.expect("a line exceeds 64 KiB");
     process.send(b"\x1b");
     process.expect_absent("a line exceeds 64 KiB");
@@ -3880,7 +4125,7 @@ fn sixty_four_highlighted_tabs_keep_foreground_budget() {
             }
             if Instant::now() >= deadline {
                 let screen = process.parser.screen().contents();
-                syntax_action(&mut process, 17);
+                run_action(&mut process, "Tabs", 2);
                 process.expect("Highlighting:");
                 panic!(
                     "tab {index} stopped highlighting: {screen}\n{}",
