@@ -21,6 +21,9 @@ pub(crate) struct TabSummary {
     pub scratch: bool,
     pub retention: &'static str,
     pub warning: Option<Arc<str>>,
+    pub language: Option<&'static syntax::Language>,
+    pub language_auto: bool,
+    pub stream: Option<super::StreamStatus>,
 }
 
 /// The active or a parked document's editor state. Only the active tab has a layout.
@@ -122,12 +125,9 @@ fn path_label(path: &Path) -> Arc<str> {
     crate::text::safe(&name.chars().take(256).collect::<String>()).into()
 }
 
-/// Compact native path display for distinguishing tabs with the same basename.
+/// Prepare the path display once for details and close confirmations.
 fn tab_path_hint(path: &Path) -> Arc<str> {
-    let spelling = path.to_string_lossy();
-    let mut reversed: Vec<_> = spelling.chars().rev().take(256).collect();
-    reversed.reverse();
-    crate::text::safe(&reversed.into_iter().collect::<String>()).into()
+    crate::text::safe(&path.to_string_lossy()).into()
 }
 
 impl Coordinator {
@@ -285,6 +285,12 @@ impl Coordinator {
                         (state.attention || state.uncertain.is_some())
                             .then(|| Arc::from(state.screen.message.as_str()))
                     }),
+                language: state
+                    .screen
+                    .syntax_language
+                    .effective(state.screen.path.as_deref(), &self.tab.screen.syntax_config),
+                language_auto: state.screen.syntax_language == syntax::Choice::Auto,
+                stream: state.screen.stream.clone(),
             }
         });
         if !summaries.clone().eq(self.summaries.iter().cloned()) {
