@@ -52,7 +52,11 @@ jobs:
 
       - name: Build interactive benchmark (Linux)
         if: runner.os == 'Linux'
-        run: cargo test --release --locked --test terminal --no-run
+        shell: bash
+        run: |
+          terminal_test=$(cargo test --release --locked --test terminal --no-run --message-format=json |
+            jq -er 'select(.reason == "compiler-artifact" and .target.kind == ["test"] and .target.name == "terminal" and .executable != null) | .executable')
+          echo "EDE_TERMINAL_TEST=$terminal_test" >> "$GITHUB_ENV"
 
       - name: Validate syntax worker release and heap ceiling (Linux)
         if: runner.os == 'Linux'
@@ -63,16 +67,11 @@ jobs:
       - name: Validate highlighting alongside search with constrained memory (Linux)
         if: runner.os == 'Linux'
         run: |
-          for binary in "$GITHUB_WORKSPACE"/target/release/deps/terminal-*; do
-            if [ ! -f "$binary" ] || [ ! -x "$binary" ]; then
-              continue
-            fi
-            sudo systemd-run --wait --pipe --collect \
-              --property=MemoryMax=256M --property=MemorySwapMax=0 \
-              --setenv="TMPDIR=$RUNNER_TEMP" --setenv="EDE_BENCH_PEAK_RSS=1" \
-              --property="WorkingDirectory=$GITHUB_WORKSPACE" --uid="$(id -u)" \
-              "$binary" --ignored --exact large_highlighting_and_search_overlap --nocapture
-          done
+          sudo systemd-run --wait --pipe --collect \
+            --property=MemoryMax=256M --property=MemorySwapMax=0 \
+            --setenv="TMPDIR=$RUNNER_TEMP" --setenv="EDE_BENCH_PEAK_RSS=1" \
+            --property="WorkingDirectory=$GITHUB_WORKSPACE" --uid="$(id -u)" \
+            "$EDE_TERMINAL_TEST" --ignored --exact large_highlighting_and_search_overlap --nocapture
 
       - name: Build refresh resource probe (Linux)
         if: runner.os == 'Linux'
@@ -83,18 +82,13 @@ jobs:
       - name: Validate scratch recovery and refresh with constrained memory (Linux)
         if: runner.os == 'Linux'
         run: |
-          for binary in "$GITHUB_WORKSPACE"/target/release/deps/terminal-*; do
-            if [ ! -f "$binary" ] || [ ! -x "$binary" ]; then
-              continue
-            fi
-            sudo systemd-run --wait --pipe --collect \
-              --property=MemoryMax=256M --property=MemorySwapMax=0 \
-              --setenv="TMPDIR=$RUNNER_TEMP" \
-              --setenv="EDE_BENCH_MIB=1024" --setenv="EDE_PASTE_MIB=64" \
-              --setenv="EDE_BENCH_PEAK_RSS=1" \
-              --property="WorkingDirectory=$GITHUB_WORKSPACE" --uid="$(id -u)" \
-              "$binary" --ignored --exact large_recovery_and_refresh_benchmark --nocapture
-          done
+          sudo systemd-run --wait --pipe --collect \
+            --property=MemoryMax=256M --property=MemorySwapMax=0 \
+            --setenv="TMPDIR=$RUNNER_TEMP" \
+            --setenv="EDE_BENCH_MIB=1024" --setenv="EDE_PASTE_MIB=64" \
+            --setenv="EDE_BENCH_PEAK_RSS=1" \
+            --property="WorkingDirectory=$GITHUB_WORKSPACE" --uid="$(id -u)" \
+            "$EDE_TERMINAL_TEST" --ignored --exact large_recovery_and_refresh_benchmark --nocapture
 
       - name: Measure refresh storage under constrained memory (Linux)
         if: runner.os == 'Linux'
@@ -109,19 +103,14 @@ jobs:
       - name: Validate search and replacement with constrained memory (Linux)
         if: runner.os == 'Linux'
         run: |
-          for binary in "$GITHUB_WORKSPACE"/target/release/deps/terminal-*; do
-            if [ ! -f "$binary" ] || [ ! -x "$binary" ]; then
-              continue
-            fi
-            for corpus in ordinary dense long; do
-              sudo systemd-run --wait --pipe --collect \
-                --property=MemoryMax=256M --property=MemorySwapMax=0 \
-                --setenv="TMPDIR=$RUNNER_TEMP" \
-                --setenv="EDE_BENCH_MIB=1024" --setenv="EDE_BENCH_CORPUS=$corpus" \
-                --setenv="EDE_BENCH_PEAK_RSS=1" \
-                --property="WorkingDirectory=$GITHUB_WORKSPACE" --uid="$(id -u)" \
-                "$binary" --ignored --exact large_search_and_replace_benchmark --nocapture
-            done
+          for corpus in ordinary dense long; do
+            sudo systemd-run --wait --pipe --collect \
+              --property=MemoryMax=256M --property=MemorySwapMax=0 \
+              --setenv="TMPDIR=$RUNNER_TEMP" \
+              --setenv="EDE_BENCH_MIB=1024" --setenv="EDE_BENCH_CORPUS=$corpus" \
+              --setenv="EDE_BENCH_PEAK_RSS=1" \
+              --property="WorkingDirectory=$GITHUB_WORKSPACE" --uid="$(id -u)" \
+              "$EDE_TERMINAL_TEST" --ignored --exact large_search_and_replace_benchmark --nocapture
           done
 
       - name: Validate large-file storage with constrained memory (Linux)
@@ -147,16 +136,11 @@ jobs:
       - name: Validate large-file editing with constrained memory (Linux)
         if: runner.os == 'Linux'
         run: |
-          for binary in "$GITHUB_WORKSPACE"/target/release/deps/terminal-*; do
-            if [ ! -f "$binary" ] || [ ! -x "$binary" ]; then
-              continue
-            fi
-            for corpus in ordinary dense long; do
-              sudo systemd-run --wait --pipe --collect \
-                --property=MemoryMax=256M --property=MemorySwapMax=0 \
-                --setenv="TMPDIR=$RUNNER_TEMP" \
-                --setenv="EDE_BENCH_MIB=1024" --setenv="EDE_BENCH_CORPUS=$corpus" \
-                --property="WorkingDirectory=$GITHUB_WORKSPACE" --uid="$(id -u)" \
-                "$binary" --ignored --exact large_file_interactive_benchmark --nocapture
-            done
+          for corpus in ordinary dense long; do
+            sudo systemd-run --wait --pipe --collect \
+              --property=MemoryMax=256M --property=MemorySwapMax=0 \
+              --setenv="TMPDIR=$RUNNER_TEMP" \
+              --setenv="EDE_BENCH_MIB=1024" --setenv="EDE_BENCH_CORPUS=$corpus" \
+              --property="WorkingDirectory=$GITHUB_WORKSPACE" --uid="$(id -u)" \
+              "$EDE_TERMINAL_TEST" --ignored --exact large_file_interactive_benchmark --nocapture
           done
