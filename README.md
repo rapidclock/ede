@@ -1,15 +1,25 @@
 # ede
 
-A Rust terminal text editor for macOS and Linux, built in reviewed stages.
-Current version **0.0.1-dev.10**. See the
+A Rust terminal text editor for macOS and Linux. See the
 [MVP overview](specs/001_initial_mvp/overview.md) and the
 [Stage 10 validation record](specs/001_initial_mvp/10_mvp_validation.md#validation-record).
+
+## Install from crates.io
+
+Building ede requires Rust 1.99.1 or later and a C toolchain for the bundled
+syntax grammars. Install the Xcode Command Line Tools on macOS or `build-essential`
+on Ubuntu. Once the crate is published, install it with:
+
+```sh
+cargo install --locked ede
+ede --version
+```
 
 ## Build and run
 
 Install Rust through rustup. `rust-toolchain.toml` pins the toolchain and its
-formatting and linting components. Install the Xcode Command Line Tools on macOS
-or a C compiler and linker on Linux for the bundled syntax grammars.
+formatting and linting components. Use the same C toolchain as for a crates.io
+install.
 
 ```sh
 cargo build --locked
