@@ -1,4 +1,6 @@
 //! Command-line boundary: informational flags never acquire terminal resources.
+//!
+//! See LICENSE.md for the GPLv3 section 7(b) attribution term for the Ede editor.
 
 #[path = "ede/allocator.rs"]
 mod allocator;
