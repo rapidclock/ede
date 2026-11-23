@@ -1,4 +1,6 @@
 //! Interactive paged text editor. Application state is independent of terminal ownership.
+//!
+//! See LICENSE.md for the GPLv3 section 7(b) attribution term for the Ede library.
 
 mod app;
 mod clipboard;

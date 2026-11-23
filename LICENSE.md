@@ -1,9 +1,20 @@
 # Ede license
 
-Copyright © 2026 [rapidclock](https://github.com/rapidclock).
+Copyright © 2026 rapidclock (<https://github.com/rapidclock>).
 
 Ede, including its editor and library, is licensed under version 3 of the
 GNU General Public License (`GPL-3.0-only`).
+
+## Attribution on redistribution
+
+Under GPLv3 section 7(b), when you redistribute the Ede editor or library,
+in source or binary form, with or without modifications, you must preserve
+the copyright notice above, including rapidclock’s GitHub profile URL.
+You may carry the notice with the Ede material or in the Appropriate Legal
+Notices displayed by a work containing it. When you give this attribution
+in your own notices, include both the name and the full profile URL.
+
+## GNU General Public License
 
 ```text
                     GNU GENERAL PUBLIC LICENSE
