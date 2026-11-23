@@ -2,9 +2,15 @@
 name = "ede"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.99.1"
+rust-version = "1.100.0"
 description = "A terminal text editor for macOS and Linux"
-publish = false
+license = "GPL-3.0-only"
+repository = "https://github.com/rapidclock/ede"
+readme = "README.md"
+keywords = ["editor", "terminal", "text-editor", "tui"]
+categories = ["command-line-utilities"]
+publish = ["crates-io"]
+exclude = ["/.github/", "/.gitignore", "/AGENTS.md", "/REVIEW.md"]
 
 [dependencies]
 base64 = "0.22.1"
