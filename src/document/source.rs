@@ -1,6 +1,6 @@
 //! Private immutable-prefix text arenas, block indexes and independent read handles.
 use super::{
-    Cancellation, Error, FaultInjector, IoPoint, OpenOptions, SourceId, StorageLimits,
+    Cancellation, Error, FaultInjector, IoPoint, Newline, OpenOptions, SourceId, StorageLimits,
     cache::Key,
     history::State,
     index::LineIndex,
@@ -429,6 +429,33 @@ fn read_text(
         out = remaining;
     }
     Ok(())
+}
+
+/// Find the first LF or CRLF in the logical text using the existing line index.
+pub(super) fn first_line_ending(
+    source: &Source,
+    tree: &Tree,
+    state: State,
+    cancel: &Cancellation,
+) -> Result<Option<Newline>, Error> {
+    if state.root.entry.lines == 0 {
+        return Ok(None);
+    }
+    let limits = &source.limits;
+    let _buffers = source
+        .resources
+        .buffers
+        .acquire(limits.text_page_bytes.max(limits.node_page_bytes) * 2 + 256)?;
+    let after_lf = tree.after_lf(state.root, 0, source, cancel)?;
+    let mut preceding = [0];
+    if after_lf >= 2 {
+        read_text(source, tree, state, after_lf - 2, &mut preceding)?;
+    }
+    Ok(Some(if preceding[0] == b'\r' {
+        Newline::CrLf
+    } else {
+        Newline::Lf
+    }))
 }
 /// Validate a logical UTF-8 endpoint and, for edits, an indivisible CRLF pair.
 fn boundary(

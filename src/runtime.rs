@@ -7,7 +7,7 @@ use std::{
 };
 
 use crate::{
-    editor::{Action, After, ClipboardTransfer, Editor},
+    editor::{Action, After, ClipboardTransfer, Editor, LineEndingStatus},
     ingress::Ingress,
 };
 use ratatui::{Terminal, TerminalOptions, Viewport, backend::CrosstermBackend, layout::Rect};
@@ -243,6 +243,7 @@ fn event_loop_impl(
     let mut last_draw = None;
     let mut requested_geometry = None;
     let mut drag_scroll = false;
+    let mut inspected_details = None;
 
     loop {
         if let Some(signal) = host.termination() {
@@ -299,6 +300,21 @@ fn event_loop_impl(
             return Ok(Exit { code: 0 });
         }
         app.poll_settings(editor.as_deref_mut());
+        if let Some((tab, status)) = app.details_line_ending() {
+            // Retry a failed read when Details reopens without polling failures.
+            let inspect = status == LineEndingStatus::Detecting
+                || (status == LineEndingStatus::Unavailable && inspected_details != Some(tab));
+            if inspect
+                && !app.pending
+                && let Some(bridge) = editor.as_deref_mut()
+                && bridge.submit(Action::InspectLineEnding(tab))
+            {
+                inspected_details = Some(tab);
+                app.pending = true;
+            }
+        } else {
+            inspected_details = None;
+        }
         if let Some(signal) = host.termination() {
             return Ok(Exit { code: 128 + signal });
         }

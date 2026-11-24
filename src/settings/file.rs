@@ -1,6 +1,7 @@
 //! Parse an entire settings revision and publish edits using a verified disk base.
 
 use super::{ClipboardMode, Context, Revision, Scalar, values::Values};
+use crate::document::Newline;
 use nix::{
     errno::Errno,
     fcntl::{AtFlags, Flock, FlockArg, OFlag, open, openat, renameat},
@@ -22,6 +23,8 @@ use toml::{Table, Value};
 use toml_edit::{Array, DocumentMut, Item, TableLike};
 
 const NAME: &str = "config.toml";
+const DEFAULT_LINE_ENDING: &str = "default_line_ending";
+const RETIRED_LITERAL_PASTE: &str = "literal_terminal_paste";
 const STAGED_NAME: &str = "revision";
 const LIMIT: u64 = 64 * 1024;
 
@@ -154,6 +157,10 @@ fn parse(text: &str) -> io::Result<Revision> {
             return Err(invalid("clipboard: use mode or copy_to_system, not both"));
         }
         for (key, value) in entries {
+            // Accept configs saved by the earlier draft without applying its paste option.
+            if key == RETIRED_LITERAL_PASTE && value.is_bool() {
+                continue;
+            }
             settings.values.clipboard_override = Some(match key.as_str() {
                 "mode" => value
                     .as_str()
@@ -166,6 +173,25 @@ fn parse(text: &str) -> io::Result<Revision> {
                 },
                 _ => return Err(invalid(format!("clipboard.{key}: unknown setting"))),
             });
+        }
+    }
+    if let Some(editor) = table.remove("editor") {
+        let Value::Table(entries) = editor else {
+            return Err(invalid("editor: expected table"));
+        };
+        for (key, value) in entries {
+            if key != DEFAULT_LINE_ENDING {
+                return Err(invalid(format!("editor.{key}: unknown setting")));
+            }
+            let ending = [Newline::Lf, Newline::CrLf]
+                .into_iter()
+                .find(|ending| {
+                    value
+                        .as_str()
+                        .is_some_and(|name| name.eq_ignore_ascii_case(ending.label()))
+                })
+                .ok_or_else(|| invalid("editor.default_line_ending: expected lf or crlf"))?;
+            settings.values.default_line_ending = Some(ending);
         }
     }
     for (name, entries) in table {
@@ -321,6 +347,21 @@ fn serialize(base: &Base, draft: &Revision) -> io::Result<String> {
             change(clipboard, "mode", toml_edit::value(mode.id()));
         } else {
             remove(clipboard, "mode", &mut comments);
+        }
+    }
+    if let Some(clipboard) = doc.get_mut("clipboard").and_then(Item::as_table_like_mut) {
+        remove(clipboard, RETIRED_LITERAL_PASTE, &mut comments);
+    }
+    if previous.values.default_line_ending != draft.values.default_line_ending {
+        let editor = table(doc.as_table_mut(), "editor")?;
+        if let Some(ending) = draft.values.default_line_ending {
+            change(
+                editor,
+                DEFAULT_LINE_ENDING,
+                toml_edit::value(ending.label().to_ascii_lowercase()),
+            );
+        } else {
+            remove(editor, DEFAULT_LINE_ENDING, &mut comments);
         }
     }
     for (before, after) in previous.map.rows.iter().zip(&draft.map.rows) {
@@ -694,6 +735,46 @@ mod tests {
         }
         assert!(parse("[clipboard]\nmode = \"auto\"").is_err());
         assert!(parse("[clipboard]\nmode = \"both\"\ncopy_to_system = false").is_err());
+    }
+
+    /// An unrelated save preserves the line-ending override, and Restore Defaults clears it.
+    #[test]
+    fn default_line_ending_preserves_and_restores_settings() {
+        let root = tempfile::tempdir().unwrap();
+        for ending in [Newline::Lf, Newline::CrLf] {
+            let text = format!(
+                "[editor]\ndefault_line_ending = {:?} # line ending\n",
+                ending.label()
+            );
+            fs::write(root.path().join("config.toml"), &text).unwrap();
+            let (mut draft, base) = load(root.path()).unwrap();
+            assert_eq!(draft.values.default_line_ending(), ending);
+            draft.values.set(Scalar::Checkpoint, Some(12));
+            assert!(serialize(&base, &draft).unwrap().contains(&text));
+            let restored = serialize(&base, &Revision::default()).unwrap();
+            assert!(!restored.contains(DEFAULT_LINE_ENDING));
+            assert!(restored.contains("# line ending"));
+        }
+        assert!(parse("[editor]\ndefault_line_ending = 'cr'").is_err());
+        assert!(parse("[editor]\ndefault_line_ending = true").is_err());
+    }
+
+    /// Migrate the old draft key without dropping an existing private clipboard preference.
+    #[test]
+    fn retired_paste_setting_preserves_other_settings() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(
+            root.path().join("config.toml"),
+            "[clipboard]\nmode = 'internal'\nliteral_terminal_paste = true # old draft\n",
+        )
+        .unwrap();
+        let (draft, base) = load(root.path()).unwrap();
+        assert_eq!(draft.values.clipboard_mode(), ClipboardMode::Internal);
+        assert_eq!(draft.values.default_line_ending(), Newline::Lf);
+        let migrated = serialize(&base, &draft).unwrap();
+        assert!(!migrated.contains(RETIRED_LITERAL_PASTE));
+        assert!(migrated.contains("# old draft"));
+        assert_eq!(parse(&migrated).unwrap(), draft);
     }
 
     #[test]

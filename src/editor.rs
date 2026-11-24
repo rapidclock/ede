@@ -40,8 +40,8 @@ pub(crate) use recovery::RecoveryPage;
 pub(crate) use recovery::RecoveryRow;
 use recovery::{RetainedScratch, Retention};
 pub(crate) use session::absolute;
+pub(crate) use session::{LineEndingStatus, TabId, TabSummary};
 use session::{OpenJob, RunningSave, SaveIntent, Tab, TabState, WaitingGuard};
-pub(crate) use session::{TabId, TabSummary};
 /// Tab-local input revokes prepared refreshes while queued intentions retain their charge.
 #[derive(Default)]
 struct InputEpoch {
@@ -142,6 +142,7 @@ impl ViewControl {
             | Action::DiscardRetained { .. }
             | Action::SetLanguage(..)
             | Action::RetryHighlighting(..)
+            | Action::InspectLineEnding(_)
             | Action::SyntaxTheme(..)
             | Action::ReloadHighlighting
             | Action::FieldPaste(..)
@@ -244,6 +245,7 @@ pub(crate) enum Action {
     CancelGuard,
     FinishQuit,
     RetryRefresh(TabId),
+    InspectLineEnding(TabId),
     SetLanguage(TabId, syntax::Choice),
     RetryHighlighting(TabId),
     SyntaxTheme(Arc<str>),
@@ -871,8 +873,16 @@ struct Coordinator {
     stream_guard: Option<After>,
     quit_ready: bool,
     settings_generation: u64,
+    default_line_ending: document::Newline,
     export: Option<streams::Export>,
 }
+/// Text or staged bytes to insert in one replacement.
+enum Replacement<'a> {
+    Text(String),
+    Newline,
+    Paste(&'a Spool),
+}
+
 impl Coordinator {
     /// Initialize empty interaction metadata; storage owns document contents.
     fn new(
@@ -927,6 +937,7 @@ impl Coordinator {
             stream_guard: None,
             quit_ready: false,
             settings_generation: 0,
+            default_line_ending: document::Newline::default(),
             export: None,
         }
     }
@@ -1105,13 +1116,14 @@ impl Coordinator {
     }
     /// Submit a storage request, waiting on this worker and observing cancellation/progress.
     fn call(&mut self, request: Request) -> Result<Response, Error> {
-        self.call_authorized(request, None)
+        self.call_authorized(request, None, false)
     }
 
     fn call_authorized(
         &mut self,
         request: Request,
         authority: Option<Cancellation>,
+        detect_line_ending: bool,
     ) -> Result<Response, Error> {
         let opening = matches!(
             request,
@@ -1121,7 +1133,7 @@ impl Coordinator {
         self.counter += 1;
         let job = self
             .service
-            .submit_authorized(self.counter, request, authority)
+            .submit_authorized(self.counter, request, authority, detect_line_ending)
             .map_err(|error| error.error)?;
         loop {
             if self.stop.load(Ordering::Acquire) || (cancellable && self.cancel.is_cancelled()) {
@@ -1277,17 +1289,15 @@ impl Coordinator {
     /// Apply one atomic replacement, publishing view history only after successful commit.
     fn replace(
         &mut self,
-        text: Option<String>,
-        paste: Option<Arc<Spool>>,
+        replacement: Replacement<'_>,
         range: std::ops::Range<u64>,
     ) -> Result<(), Error> {
-        self.replace_authorized(text, paste, range, None)
+        self.replace_authorized(replacement, range, None)
     }
 
     fn replace_authorized(
         &mut self,
-        text: Option<String>,
-        paste: Option<Arc<Spool>>,
+        replacement: Replacement<'_>,
         range: std::ops::Range<u64>,
         authority: Option<(clipboard::Target, Cancellation)>,
     ) -> Result<(), Error> {
@@ -1310,9 +1320,6 @@ impl Coordinator {
         let info = self.tab.info.as_ref().ok_or(Error::Busy)?;
         let expected = info.revision;
         let before = self.tab.screen.position;
-        let inserted = text
-            .as_ref()
-            .map_or_else(|| paste.as_ref().map_or(0, |p| p.len), |s| s.len() as u64);
         let document = self.document()?;
         let authority = if let Some((target, authority)) = authority {
             if self.clipboard_target() != Some(target) {
@@ -1323,36 +1330,56 @@ impl Coordinator {
         } else {
             None
         };
-        let response = if let Some(text) = text {
-            self.call_authorized(
-                Request::Replace {
-                    document,
-                    expected,
-                    range: TextRange::new(range.start, range.end)?,
-                    text,
-                },
-                authority,
-            )?
-        } else {
-            let mut transaction =
-                match self.call(Request::BeginTransaction { document, expected })? {
+        let edit_range = TextRange::new(range.start, range.end)?;
+        let (request, inserted) = match replacement {
+            Replacement::Text(text) => {
+                let inserted = text.len() as u64;
+                (
+                    Request::Replace {
+                        document,
+                        expected,
+                        range: edit_range,
+                        text,
+                    },
+                    inserted,
+                )
+            }
+            Replacement::Newline | Replacement::Paste(_) => {
+                let mut transaction = match self.call_authorized(
+                    Request::BeginTransaction { document, expected },
+                    authority.clone(),
+                    true,
+                )? {
                     Response::Transaction(transaction) => transaction,
                     _ => return Err(Error::CorruptStorage),
                 };
-            let paste = paste.ok_or(Error::CorruptStorage)?;
-            transaction.replace(
-                TextRange::new(range.start, range.end)?,
-                paste.reader(),
-                authority.as_ref().unwrap_or(&self.cancel),
-            )?;
-            self.call_authorized(
-                Request::Apply {
-                    document,
-                    transaction,
-                },
-                authority,
-            )?
+                let cancel = authority.as_ref().unwrap_or(&self.cancel);
+                let newline = transaction
+                    .first_line_ending
+                    .unwrap_or(self.default_line_ending);
+                let inserted = match replacement {
+                    Replacement::Paste(spool) => transaction.replace_counted(
+                        edit_range,
+                        spool.paste_reader(newline),
+                        cancel,
+                    )?,
+                    Replacement::Newline => transaction.replace_counted(
+                        edit_range,
+                        newline.as_str().as_bytes(),
+                        cancel,
+                    )?,
+                    Replacement::Text(_) => unreachable!(),
+                };
+                (
+                    Request::Apply {
+                        document,
+                        transaction,
+                    },
+                    inserted,
+                )
+            }
         };
+        let response = self.call_authorized(request, authority, false)?;
         if let Response::Changed {
             revision,
             history_pruned,
@@ -1486,6 +1513,7 @@ impl Coordinator {
     fn action(&mut self, action: Action) -> Result<(), Error> {
         if let Action::ApplySettings(values, generation) = action {
             self.settings_generation = generation;
+            self.default_line_ending = values.default_line_ending();
             if let Some(retention) = &mut self.retention {
                 retention.set_interval(Instant::now(), values.checkpoint());
             }
@@ -1553,6 +1581,7 @@ impl Coordinator {
                 | Action::CancelGuard
                 | Action::FinishQuit
                 | Action::RetryRefresh(_)
+                | Action::InspectLineEnding(_)
                 | Action::SetLanguage(..)
                 | Action::RetryHighlighting(..)
                 | Action::SyntaxTheme(..)
@@ -1576,6 +1605,7 @@ impl Coordinator {
             }
             Action::RevokeSearch => {}
             Action::RetryRefresh(tab) => self.retry_refresh(tab)?,
+            Action::InspectLineEnding(tab) => self.inspect_line_ending(tab),
             Action::SetLanguage(tab, choice) => {
                 let config = self.syntax.config();
                 if let Some(state) = self.state_mut(tab) {
@@ -1696,12 +1726,14 @@ impl Coordinator {
             Action::SaveGuard(after, path) => self.save_for_guard(after, path)?,
             Action::Discard(after, acknowledged) => self.discard(after, acknowledged),
             Action::ForTab(tab, action) => self.tab_action(tab, *action)?,
-            Action::Insert(text) => {
-                self.replace(Some(text), None, self.tab.screen.position.selection())?
-            }
-            Action::Paste(paste) => {
-                self.replace(None, Some(paste), self.tab.screen.position.selection())?
-            }
+            Action::Insert(text) => self.replace(
+                Replacement::Text(text),
+                self.tab.screen.position.selection(),
+            )?,
+            Action::Paste(spool) => self.replace(
+                Replacement::Paste(&spool),
+                self.tab.screen.position.selection(),
+            )?,
             Action::Size(width, height, generation) => {
                 self.width = width;
                 self.height = height;
@@ -1829,24 +1861,21 @@ impl Coordinator {
                 Command::Cut => self.copy(true, None)?,
                 Command::Paste => {
                     if let Some(paste) = self.clipboard.clone() {
-                        self.replace(None, Some(paste), self.tab.screen.position.selection())?;
+                        self.replace(
+                            Replacement::Paste(&paste),
+                            self.tab.screen.position.selection(),
+                        )?;
                     } else {
                         self.tab.screen.message = "Nothing copied in ede".into();
                     }
                 }
                 Command::Newline | Command::Tab => {
-                    let text = if command == Command::Tab {
-                        "\t"
-                    } else if self.snapshot()?.format().newline == document::Newline::CrLf {
-                        "\r\n"
+                    let replacement = if command == Command::Tab {
+                        Replacement::Text("\t".into())
                     } else {
-                        "\n"
+                        Replacement::Newline
                     };
-                    self.replace(
-                        Some(text.into()),
-                        None,
-                        self.tab.screen.position.selection(),
-                    )?;
+                    self.replace(replacement, self.tab.screen.position.selection())?;
                 }
                 Command::Backspace | Command::Delete => {
                     let mut range = self.tab.screen.position.selection();
@@ -1859,7 +1888,7 @@ impl Coordinator {
                             range.end = text.next(range.end)?;
                         }
                     }
-                    self.replace(Some(String::new()), None, range)?;
+                    self.replace(Replacement::Text(String::new()), range)?;
                 }
                 Command::Undo | Command::Redo => {
                     let expected = self.tab.info.as_ref().ok_or(Error::Busy)?.revision;
@@ -2150,16 +2179,50 @@ mod tests {
         worker.action(hit(21, 3, PointerGesture::Drag(2))).unwrap();
         assert_eq!(worker.tab.screen.position.selection(), 15..21);
     }
+    /// Internal paste uses the current fallback for a new document and keeps the copied bytes.
+    #[test]
+    fn internal_paste_normalizes_to_the_destination() {
+        use std::io::Read;
+
+        let mut worker = coordinator(OpenOptions::default());
+        let copied = "one\r\ntwo\nthree\rfour";
+        worker.action(Action::Insert(copied.into())).unwrap();
+        worker.action(Action::Command(Command::SelectAll)).unwrap();
+        worker.action(Action::Command(Command::Copy)).unwrap();
+        worker.add_new().unwrap();
+        let mut settings = crate::settings::Values::default();
+        settings.default_line_ending = Some(document::Newline::CrLf);
+        worker.action(Action::ApplySettings(settings, 1)).unwrap();
+        worker.action(Action::Command(Command::Paste)).unwrap();
+        assert_eq!(contents(&mut worker), "one\r\ntwo\r\nthree\r\nfour");
+        worker.action(Action::Command(Command::Undo)).unwrap();
+        assert_eq!(contents(&mut worker), "");
+        worker
+            .action(Action::ApplySettings(crate::settings::Values::default(), 2))
+            .unwrap();
+        worker.action(Action::Command(Command::Paste)).unwrap();
+        assert_eq!(contents(&mut worker), "one\ntwo\nthree\nfour");
+        let mut retained = String::new();
+        worker
+            .clipboard
+            .as_ref()
+            .unwrap()
+            .reader()
+            .read_to_string(&mut retained)
+            .unwrap();
+        assert_eq!(retained, copied);
+    }
+
     /// Internal and external disk-spooled pastes exceed 1 MiB, commit atomically, and undo once.
     #[test]
     fn large_paste_and_invalid_payload_are_atomic() {
         let mut worker = coordinator(OpenOptions::default());
         let mut paste = Spool::new().unwrap();
-        let block = "界\r\n".repeat(16_384);
+        let block = "界\r\n".repeat(16_385);
         for _ in 0..16 {
             paste.append(block.as_bytes()).unwrap();
         }
-        let length = paste.len;
+        let length = block.replace("\r\n", "\n").len() as u64 * 16;
         assert!(length > 1 << 20);
         worker.action(Action::Paste(Arc::new(paste))).unwrap();
         assert_eq!(worker.snapshot().unwrap().len(), length);

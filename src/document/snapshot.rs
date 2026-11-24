@@ -1,9 +1,9 @@
 //! Bounded immutable revision leases and scalar-aligned owned text windows.
 use super::{
-    ByteOffset, Cancellation, DocumentId, Error, Format, Revision,
+    ByteOffset, Cancellation, DocumentId, Error, Format, Newline, Revision,
     history::State,
     resources::Permit,
-    source::{Reader, Store},
+    source::{Reader, Store, first_line_ending},
 };
 use std::sync::{
     Arc, Mutex,
@@ -69,6 +69,13 @@ impl Snapshot {
     /// Exact number of logical lines, including the empty final line after LF.
     pub fn line_count(&self) -> u64 {
         self.state.root.entry.lines + 1
+    }
+    /// Read the first LF or CRLF in this immutable revision on a worker.
+    pub(crate) fn first_line_ending(
+        &self,
+        cancel: &Cancellation,
+    ) -> Result<Option<Newline>, Error> {
+        first_line_ending(&self.reader.source, &self.reader.tree, *self.state, cancel)
     }
     /// Round a byte position down to a UTF-8 scalar boundary with at most three bytes of context.
     /// Blocking; intended for bounded chunk readers on background workers.

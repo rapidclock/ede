@@ -72,7 +72,7 @@ impl TextRange {
     }
 }
 
-/// Suggested terminator for the later interactive Enter command.
+/// Line terminator used by the document and editor.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum Newline {
     /// LF, also the default for text without a terminator.
@@ -80,6 +80,23 @@ pub enum Newline {
     Lf,
     /// A CR followed by LF.
     CrLf,
+}
+impl Newline {
+    /// User-facing name and accepted configuration value.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Lf => "LF",
+            Self::CrLf => "CRLF",
+        }
+    }
+
+    /// Text used when the editor inserts a line ending.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Lf => "\n",
+            Self::CrLf => "\r\n",
+        }
+    }
 }
 /// Serialization metadata, retained through edits and save points.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]

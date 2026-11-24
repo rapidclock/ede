@@ -330,6 +330,7 @@ struct Envelope {
     document: DocumentId,
     request: Request,
     cancel: Cancellation,
+    detect_line_ending: bool,
     closed: Arc<AtomicBool>,
     progress: Arc<Mutex<Progress>>,
     admission: Admission,
@@ -468,7 +469,7 @@ impl StorageService {
     /// Try to enqueue work without filesystem I/O or waiting for queue capacity.
     /// Requests for an opening document wait for its preparation to settle.
     pub fn submit(&mut self, request_id: u64, request: Request) -> Result<Job, SubmissionError> {
-        self.submit_authorized(request_id, request, None)
+        self.submit_authorized(request_id, request, None, false)
     }
 
     /// Admit a request whose final storage commit also checks the initiating operation's token.
@@ -477,8 +478,9 @@ impl StorageService {
         request_id: u64,
         request: Request,
         authority: Option<Cancellation>,
+        detect_line_ending: bool,
     ) -> Result<Job, SubmissionError> {
-        match self.admit(request_id, request, authority) {
+        match self.admit(request_id, request, authority, detect_line_ending) {
             Ok(job) => Ok(job),
             Err((error, request)) => Err(SubmissionError { error, request }),
         }
@@ -489,6 +491,7 @@ impl StorageService {
         request_id: u64,
         request: Request,
         authority: Option<Cancellation>,
+        detect_line_ending: bool,
     ) -> Result<Job, (Error, Box<Request>)> {
         if self
             .entries
@@ -558,6 +561,7 @@ impl StorageService {
             document,
             request,
             cancel: cancel.clone(),
+            detect_line_ending,
             closed: closed.clone(),
             progress: progress.clone(),
             admission,
@@ -1161,7 +1165,10 @@ fn execute(
                     usage: document.stats()?,
                 }),
                 Request::BeginTransaction { expected, .. } => {
-                    Ok(Response::Transaction(document.transaction(expected)?))
+                    Ok(Response::Transaction(document.begin_transaction(
+                        expected,
+                        envelope.detect_line_ending.then_some(&envelope.cancel),
+                    )?))
                 }
                 Request::Replace {
                     expected,

@@ -63,7 +63,10 @@ activate = ["Enter", "Ctrl+O"]
 | `highlighting.parse_timeout_ms` | 250 | 1–250 |
 
 The proposed upper limits for highlighting retain the Stage 07 resource
-envelope. Reject unknown fields, wrong types, out-of-range integers, unknown
+envelope. `[editor] default_line_ending` accepts `"lf"` or `"crlf"` and
+defaults to `"lf"`. **Settings → Editor → Default line ending** exposes the
+choice. Saving applies it immediately to new and open documents with no LF
+or CRLF. Reject unknown fields, wrong types, out-of-range integers, unknown
 contexts and command IDs, and malformed or conflicting bindings. Limit
 `config.toml` to 64 KiB and each command entry to eight shortcuts. A missing file
 means bundled defaults. Read only a regular file through a bounded read, with
@@ -416,6 +419,12 @@ verify changed guards with deliberate mutations in isolated copies per
   Reducer checks cover captured Escape and release, held presses, and preservation
   of a typed field across asynchronous reload. Picker, search, scratch and stream
   regressions passed.
+- [macOS CI run 103](https://github.com/rapidclock/ede/actions/runs/45306751499)
+  exposed a race between the Settings PTY test's standalone Escape and its
+  immediate resize. PTY tests now wait for visible resize and confirmation
+  states. Reducer checks dispatch the hidden Settings and Quit keys with an
+  explicit small layout. On macOS arm64, all three affected PTY tests passed
+  32 repetitions each, and the full suite passed with the CI descriptor limit.
 - **K05 — Publication.** Real files and barriers cover stale base, same-inode
   edits, replacement, chmod, new hard links, symlinks, replaced directories,
   creation during publication, contention, cancellation and shutdown on both

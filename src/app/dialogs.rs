@@ -69,6 +69,17 @@ impl AppState {
         })
     }
 
+    /// Report the status of the tab that the open Details dialog describes.
+    pub(crate) fn details_line_ending(&self) -> Option<(TabId, crate::editor::LineEndingStatus)> {
+        let Some(Modal::TabDetails { tab: Some(id), .. }) = self.modal else {
+            return None;
+        };
+        self.screen
+            .tabs
+            .iter()
+            .find_map(|tab| (tab.id == id).then_some((id, tab.line_ending)))
+    }
+
     /// Display the running package version and the resolved configuration path safely.
     pub(crate) fn about(&self) -> String {
         let location = self.config_location.display_file().map_or_else(

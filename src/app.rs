@@ -320,6 +320,14 @@ impl AppState {
         let mode = if auto { "Auto" } else { "Manual" };
         let name = language.map_or("Plain Text", |language| language.label);
         label.push_str(&format!("\nLanguage: {name} ({mode})"));
+        if let Some(ending) = summary.and_then(|tab| match tab.line_ending {
+            crate::editor::LineEndingStatus::Hidden => None,
+            crate::editor::LineEndingStatus::Detecting => Some("Detecting…"),
+            crate::editor::LineEndingStatus::Known(ending) => Some(ending.label()),
+            crate::editor::LineEndingStatus::Unavailable => Some("Unavailable"),
+        }) {
+            label.push_str(&format!("\nLine ending: {ending}"));
+        }
         let syntax = if active {
             self.active_highlighting_status()
         } else if language.is_some() {
@@ -2678,6 +2686,7 @@ mod tests {
             warning: None,
             language: None,
             language_auto: true,
+            line_ending: crate::editor::LineEndingStatus::Hidden,
             stream: None,
         }]);
         app.modal = Some(Modal::Tabs(Some(selected)));
@@ -2933,12 +2942,23 @@ mod settings_guard_tests {
         app.event(Event::Guard(1, After::Quit, true));
         assert_eq!(app.focus, Some(Control::ConfirmCancel));
         let visible = LayoutSnapshot::for_app(area, &app, 2);
+        let obscured = LayoutSnapshot::for_app(Rect::new(0, 0, 39, 8), &app, 3);
+        for code in [KeyCode::Tab, KeyCode::Tab, KeyCode::Enter, KeyCode::Esc] {
+            assert!(
+                app.input(
+                    Input::Key(KeyEvent::new(code, KeyModifiers::NONE)),
+                    &obscured
+                )
+                .is_none()
+            );
+        }
+        assert!(matches!(app.modal, Some(Modal::Confirm(After::Quit, _))));
+        assert_eq!(app.focus, Some(Control::ConfirmCancel));
         assert!(
             app.input(Input::Key(key), &visible).is_none(),
             "Discard requires the Discard control to own focus"
         );
         app.focus = Some(Control::ConfirmDiscard);
-        let obscured = LayoutSnapshot::for_app(Rect::new(0, 0, 39, 8), &app, 3);
         assert!(
             app.input(Input::Key(key), &obscured).is_none(),
             "a hidden Discard target must stay inactive"

@@ -138,6 +138,7 @@ fn tab_details_tracks_parked_stream_without_switching() {
     process.click_label("[Details]", 1);
     process.expect("Read-only retained history — 6 bytes");
     process.expect_absent("Retry refresh");
+    process.expect_absent("Line ending:");
     let mut file = File::options().append(true).open(&log).unwrap();
     file.write_all(b"second\n").unwrap();
     process.expect("Read-only retained history — 13 bytes");
@@ -324,7 +325,7 @@ fn actions_outside_click_and_direct_settings_at_minimum_size() {
     assert!(process.wait().success());
 }
 
-/// Save commits a still-focused inline scalar in a single gesture.
+/// Save commits a still-focused scalar, and a failed scalar edit survives a resize.
 #[test]
 fn settings_footer_saves_pending_value() {
     let root = tempfile::tempdir().unwrap();
@@ -356,7 +357,6 @@ fn settings_footer_saves_pending_value() {
     process.expect("Enter a whole number from 1 to 3600");
     process.resize(20, 4);
     process.expect("Resize to 40x8");
-    process.send(b"\x1b");
     process.resize(40, 8);
     process.expect("Checkpoint interval (s) x");
     assert_eq!(
@@ -709,6 +709,40 @@ fn tab_details_language_follows_opened_name_and_committed_save_as() {
     assert_eq!(std::fs::read(&saved).unwrap(), b"source text\n");
     assert_eq!(std::fs::read(&busy).unwrap(), b"existing\n");
     process.send(b"\x11");
+    assert!(process.wait().success());
+    process.assert_restored();
+}
+
+/// Details tracks the first line ending of a parked file across external refreshes.
+#[test]
+fn tab_details_tracks_parked_file_line_ending() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("mixed.txt");
+    std::fs::write(&path, b"one\rtwo\r\nthree\nfour\n").unwrap();
+    let mut process = PtyChild::editor_with_path(Some("xterm-256color"), Some(&path));
+    process.expect_status("Ready");
+    process.send(b"\x0e");
+    process.expect("Untitled 1");
+    process.expect_status("Ready");
+    process.send(b"active scratch");
+    process.expect_body("active scratch", TIMEOUT);
+    run_action(&mut process, "Tabs", 2);
+    process.expect("Line ending: LF");
+    process.send(b"\x1b");
+    process.expect_absent("Tab Details");
+
+    process.click_label("[Tabs]", 1);
+    process.send(b"\x1b[A");
+    process.click_label("[Details]", 1);
+    process.expect("Line ending: CRLF");
+    std::fs::write(&path, b"one\ntwo\r\nthree\r\n").unwrap();
+    process.expect("Line ending: LF");
+    process.send(b"\x1b");
+    process.expect(">Details<");
+    process.send(b"\x1b");
+    process.expect_absent("Tabs — Enter to switch");
+    process.expect_body("active scratch", TIMEOUT);
+    process.send(b"\x01\x7f\x11");
     assert!(process.wait().success());
     process.assert_restored();
 }
@@ -1854,7 +1888,6 @@ fn settings_capture_and_dirty_confirmation_at_minimum_size() {
     process.expect(">Keep Editing<");
     process.resize(20, 4);
     process.expect("Escape Cancel");
-    process.send(b"\t\r");
     process.resize(40, 8);
     process.expect(">Keep Editing<");
     process.send(b"\r");
@@ -2874,6 +2907,9 @@ fn mouse_tabs_overflow_and_stale_release() {
     process.click_label("[Tabs]", 1);
     process.expect("Tabs — Enter to switch");
     process.expect("tab-6");
+    // Pending startup loads can still change the layout between a press and release.
+    process.expect_absent("…");
+    process.expect_absent("↓");
     process.click_label("tab-5", 1);
     process.click_label("[Switch]", 1);
     process.expect_body("body-5", TIMEOUT);
@@ -3008,6 +3044,130 @@ fn open_edit_save_and_dirty_quit_round_trip() {
     );
 }
 
+/// Terminal paste normalizes every received line ending to the destination style.
+#[test]
+fn terminal_paste_restores_line_breaks() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("pasted.txt");
+    for (original, expected) in [
+        (&b""[..], &b"one\ntwo\n\nthree\nfour\nfive\n!"[..]),
+        (
+            &b"original\r\nother\n"[..],
+            &b"one\r\ntwo\r\n\r\nthree\r\nfour\r\nfive\r\n!original\r\nother\n"[..],
+        ),
+    ] {
+        std::fs::write(&path, original).unwrap();
+        let mut process = PtyChild::editor_with_path(Some("xterm-256color"), Some(&path));
+        process.expect_status("Ready");
+        process.send(b"\x1b[200~one\rtwo\r\rthree\r\nfour\nfive\r\x1b[201~");
+        process.expect_body("five", TIMEOUT);
+        process.send(b"!\x13");
+        process.expect_status("Saved");
+        assert_eq!(std::fs::read(&path).unwrap(), expected);
+        process.send(b"\x11");
+        assert!(process.wait().success());
+        process.assert_restored();
+    }
+}
+
+/// Settings changes apply immediately only when the open document lacks a line ending.
+#[test]
+fn default_line_ending_applies_to_open_documents_without_endings() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("paste.txt");
+    let config = directory.path().join("ede/config.toml");
+    std::fs::write(&path, "seed").unwrap();
+    let mut process = PtyChild::editor_with_options(
+        Some("xterm-256color"),
+        [&path],
+        None,
+        Some(directory.path()),
+        None,
+    );
+    process.resize(40, 8);
+    process.expect_status("Ready");
+    process.send(b"\x1b[15~");
+    process.expect("[Editor]");
+    process.send(b"\x1b[Z\x1b[C\x1b[C");
+    process.expect("Default line ending · LF");
+    process.send(b"\r\r");
+    process.expect("Default line ending · CRLF");
+    assert!(!config.exists());
+    process.click_label("[Discard]", 1);
+    process.expect("Discard unsaved settings?");
+    process.click_label("[Discard]", 1);
+    process.expect("Default line ending · LF");
+    process.send(b"\r");
+    process.expect("Default line ending · CRLF");
+    process.click_label("[Save]", 1);
+    process.expect_status("Settings saved");
+    assert!(
+        std::fs::read_to_string(&config)
+            .unwrap()
+            .contains("[editor]\ndefault_line_ending = \"crlf\"")
+    );
+    process.resize(64, 8);
+    process.click_label("[Keyboard Shortcuts]", 1);
+    process.expect(">Keyboard Shortcuts<");
+    process.expect("App commands");
+    process.send(b"\r\x1b[C");
+    process.expect("Editing text");
+    process.expect("[Keyboard Shortcuts]");
+    process.send(b"\x1b");
+    process.expect_absent("Keyboard Shortcuts");
+    process.resize(80, 24);
+    run_action(&mut process, "Tabs", 2);
+    process.expect("Line ending: CRLF");
+    process.send(b"\x1b");
+    process.expect_absent("Tab Details");
+    process.send(b"\r\x1b[200~first\nsecond\x1b[201~");
+    process.expect_body("secondseed", TIMEOUT);
+    process.send(b"\x13");
+    process.expect_status("Saved");
+    assert_eq!(std::fs::read(&path).unwrap(), b"\r\nfirst\r\nsecondseed");
+
+    process.resize(80, 24);
+    process.send(b"\x1b[15~");
+    process.click_label("[Editor]", 1);
+    process.click_label("Default line ending · CRLF", 1);
+    process.expect("Default line ending · LF");
+    process.click_label("[Save]", 1);
+    process.expect_status("Settings saved");
+    assert!(
+        std::fs::read_to_string(&config)
+            .unwrap()
+            .contains("default_line_ending = \"lf\"")
+    );
+    process.send(b"\x1b");
+    process.expect_absent("Default line ending");
+    run_action(&mut process, "Tabs", 2);
+    process.expect("Line ending: CRLF");
+    process.send(b"\x1b");
+    process.expect_absent("Tab Details");
+    process.send(b"\r\x1b[200~third\nfourth\x1b[201~");
+    process.expect_body("fourthseed", TIMEOUT);
+    process.send(b"\x13");
+    process.expect_status("Saved");
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        b"\r\nfirst\r\nsecond\r\nthird\r\nfourthseed"
+    );
+
+    process.send(b"\x01\x7f");
+    run_action(&mut process, "Tabs", 2);
+    process.expect("Line ending: LF");
+    process.send(b"\x1b");
+    process.expect_absent("Tab Details");
+    process.send(b"\x1b[200~clean\r\nend\x1b[201~");
+    process.expect_body("clean", TIMEOUT);
+    process.send(b"\x13");
+    process.expect_status("Saved");
+    assert_eq!(std::fs::read(&path).unwrap(), b"clean\nend");
+    process.send(b"\x11");
+    assert!(process.wait().success());
+    process.assert_restored();
+}
+
 /// The terminal parser and document path accept a multi-megabyte paste with one undo unit.
 #[test]
 fn external_large_paste_save_undo_and_redo() {
@@ -3028,7 +3188,10 @@ fn external_large_paste_save_undo_and_redo() {
     process.send(path.as_os_str().as_encoded_bytes());
     process.send(b"\r");
     process.expect_status("Saved");
-    assert_eq!(std::fs::read(&path).unwrap(), payload.as_bytes());
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        payload.replace("\r\n", "\n").as_bytes()
+    );
     eprintln!(
         "external paste: {} bytes, receive/render/save {:?}",
         payload.len(),
@@ -3043,7 +3206,7 @@ fn external_large_paste_save_undo_and_redo() {
     process.assert_restored();
 }
 
-/// A prompt at tiny geometry cannot accept a hidden Discard/Save button.
+/// A dirty Quit prompt requested at tiny geometry is usable once visible.
 #[test]
 fn dirty_quit_at_tiny_size_requires_visible_confirmation() {
     let directory = tempfile::tempdir().unwrap();
@@ -3056,14 +3219,11 @@ fn dirty_quit_at_tiny_size_requires_visible_confirmation() {
     process.resize(20, 4);
     process.expect("Resize");
     process.send(b"\x11");
-    thread::sleep(Duration::from_millis(30));
-    process.send(b"\t\t\r\x1b");
-    thread::sleep(Duration::from_millis(30));
-    assert!(process.child.try_wait().unwrap().is_none());
+    process.expect("Escape Cancel");
     process.resize(80, 24);
     process.expect("Unsaved changes");
     process.send(b"\x1b");
-    thread::sleep(Duration::from_millis(60));
+    process.expect_absent("Unsaved changes");
     process.send(b"\x11");
     process.expect("Unsaved changes");
     process.send(b"\t\t\r");

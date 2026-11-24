@@ -252,14 +252,29 @@ impl Document {
     }
     /// Start an on-disk transaction plan for incremental, bounded-memory staging.
     pub fn transaction(&self, expected: Revision) -> Result<StagedTransaction, Error> {
+        self.begin_transaction(expected, None)
+    }
+
+    /// Start staging and capture the first current LF or CRLF when requested.
+    pub(super) fn begin_transaction(
+        &self,
+        expected: Revision,
+        cancel: Option<&Cancellation>,
+    ) -> Result<StagedTransaction, Error> {
         if expected != self.revision {
             return Err(Error::StaleRevision);
         }
         let store = self.store.lock().map_err(|_| Error::CorruptStorage)?;
+        let first_line_ending = if let Some(cancel) = cancel {
+            super::source::first_line_ending(&store.source, &store.tree, self.current, cancel)?
+        } else {
+            None
+        };
         Ok(StagedTransaction {
             file: tempfile::tempfile_in(store.directory.path())?,
             document: self.id,
             expected,
+            first_line_ending,
             count: 0,
             last_end: 0,
             length: 0,
