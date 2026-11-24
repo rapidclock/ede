@@ -17,8 +17,8 @@ pub struct StagedTransaction {
     pub(super) file: File,
     pub(super) document: DocumentId,
     pub(super) expected: Revision,
-    /// Enter convention from the same revision the staged edit will target.
-    pub(crate) newline: Newline,
+    /// First LF or CRLF in the same revision the staged edit will target.
+    pub(crate) first_line_ending: Option<Newline>,
     pub(super) count: u64,
     pub(super) last_end: u64,
     pub(super) length: u64,

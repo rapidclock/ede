@@ -2872,6 +2872,9 @@ fn mouse_tabs_overflow_and_stale_release() {
     process.click_label("[Tabs]", 1);
     process.expect("Tabs — Enter to switch");
     process.expect("tab-6");
+    // Pending startup loads can still change the layout between a press and release.
+    process.expect_absent("…");
+    process.expect_absent("↓");
     process.click_label("tab-5", 1);
     process.click_label("[Switch]", 1);
     process.expect_body("body-5", TIMEOUT);
@@ -3006,16 +3009,16 @@ fn open_edit_save_and_dirty_quit_round_trip() {
     );
 }
 
-/// Terminal paste restores bare CRs with the document's Enter convention.
+/// Terminal paste normalizes every received line ending to the destination style.
 #[test]
 fn terminal_paste_restores_line_breaks() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("pasted.txt");
     for (original, expected) in [
-        (&b""[..], &b"one\ntwo\n\nthree\r\nfour\nfive\n!"[..]),
+        (&b""[..], &b"one\ntwo\n\nthree\nfour\nfive\n!"[..]),
         (
             &b"original\r\nother\n"[..],
-            &b"one\r\ntwo\r\n\r\nthree\r\nfour\nfive\r\n!original\r\nother\n"[..],
+            &b"one\r\ntwo\r\n\r\nthree\r\nfour\r\nfive\r\n!original\r\nother\n"[..],
         ),
     ] {
         std::fs::write(&path, original).unwrap();
@@ -3032,44 +3035,13 @@ fn terminal_paste_restores_line_breaks() {
     }
 }
 
-/// Users can retain standalone carriage returns received in a terminal paste.
+/// Settings changes apply immediately only when the open document lacks a line ending.
 #[test]
-fn terminal_paste_can_preserve_literal_bytes() {
-    let directory = tempfile::tempdir().unwrap();
-    let config = directory.path().join("ede");
-    std::fs::create_dir(&config).unwrap();
-    std::fs::write(
-        config.join("config.toml"),
-        "[clipboard]\nliteral_terminal_paste = true\n",
-    )
-    .unwrap();
-    let path = directory.path().join("literal.txt");
-    std::fs::write(&path, "").unwrap();
-    let mut process = PtyChild::editor_with_options(
-        Some("xterm-256color"),
-        [&path],
-        None,
-        Some(directory.path()),
-        None,
-    );
-    process.expect_status("Ready");
-    process.send(b"\x1b[200~first\rsecond\x1b[201~");
-    process.expect_body("first<U+000D>second", TIMEOUT);
-    process.send(b"\x13");
-    process.expect_status("Saved");
-    assert_eq!(std::fs::read(&path).unwrap(), b"first\rsecond");
-    process.send(b"\x11");
-    assert!(process.wait().success());
-    process.assert_restored();
-}
-
-/// The Paste setting is reachable by keyboard and mouse and applies on save.
-#[test]
-fn settings_exposes_literal_terminal_paste() {
+fn default_line_ending_applies_to_open_documents_without_endings() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("paste.txt");
     let config = directory.path().join("ede/config.toml");
-    std::fs::write(&path, "").unwrap();
+    std::fs::write(&path, "seed").unwrap();
     let mut process = PtyChild::editor_with_options(
         Some("xterm-256color"),
         [&path],
@@ -3080,24 +3052,24 @@ fn settings_exposes_literal_terminal_paste() {
     process.resize(40, 8);
     process.expect_status("Ready");
     process.send(b"\x1b[15~");
-    process.expect("[Paste]");
+    process.expect("[Editor]");
     process.send(b"\x1b[Z\x1b[C\x1b[C");
-    process.expect("Literal terminal paste · Off");
+    process.expect("Default line ending · LF");
     process.send(b"\r\r");
-    process.expect("Literal terminal paste · On");
+    process.expect("Default line ending · CRLF");
     assert!(!config.exists());
     process.click_label("[Discard]", 1);
     process.expect("Discard unsaved settings?");
     process.click_label("[Discard]", 1);
-    process.expect("Literal terminal paste · Off");
+    process.expect("Default line ending · LF");
     process.send(b"\r");
-    process.expect("Literal terminal paste · On");
+    process.expect("Default line ending · CRLF");
     process.click_label("[Save]", 1);
     process.expect_status("Settings saved");
     assert!(
         std::fs::read_to_string(&config)
             .unwrap()
-            .contains("literal_terminal_paste = true")
+            .contains("[editor]\ndefault_line_ending = \"crlf\"")
     );
     process.resize(64, 8);
     process.click_label("[Keyboard Shortcuts]", 1);
@@ -3108,30 +3080,40 @@ fn settings_exposes_literal_terminal_paste() {
     process.expect("[Keyboard Shortcuts]");
     process.send(b"\x1b");
     process.expect_absent("Keyboard Shortcuts");
-    process.send(b"\x1b[200~first\rsecond\x1b[201~");
-    process.expect_body("first<U+000D>second", TIMEOUT);
-    process.send(b"\x1a");
-    process.expect_absent("first<U+000D>second");
+    process.send(b"\r\x1b[200~first\nsecond\x1b[201~");
+    process.expect_body("secondseed", TIMEOUT);
+    process.send(b"\x13");
+    process.expect_status("Saved");
+    assert_eq!(std::fs::read(&path).unwrap(), b"\r\nfirst\r\nsecondseed");
 
     process.resize(80, 24);
     process.send(b"\x1b[15~");
-    process.click_label("[Paste]", 1);
-    process.click_label("Literal terminal paste · On", 1);
-    process.expect("Literal terminal paste · Off");
+    process.click_label("[Editor]", 1);
+    process.click_label("Default line ending · CRLF", 1);
+    process.expect("Default line ending · LF");
     process.click_label("[Save]", 1);
     process.expect_status("Settings saved");
     assert!(
         std::fs::read_to_string(&config)
             .unwrap()
-            .contains("literal_terminal_paste = false")
+            .contains("default_line_ending = \"lf\"")
     );
     process.send(b"\x1b");
-    process.expect_absent("Literal terminal paste");
-    process.send(b"\x1b[200~first\rsecond\x1b[201~");
-    process.expect_body("second", TIMEOUT);
+    process.expect_absent("Default line ending");
+    process.send(b"\r\x1b[200~third\nfourth\x1b[201~");
+    process.expect_body("fourthseed", TIMEOUT);
     process.send(b"\x13");
     process.expect_status("Saved");
-    assert_eq!(std::fs::read(&path).unwrap(), b"first\nsecond");
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        b"\r\nfirst\r\nsecond\r\nthird\r\nfourthseed"
+    );
+
+    process.send(b"\x01\x7f\x1b[200~clean\r\nend\x1b[201~");
+    process.expect_body("clean", TIMEOUT);
+    process.send(b"\x13");
+    process.expect_status("Saved");
+    assert_eq!(std::fs::read(&path).unwrap(), b"clean\nend");
     process.send(b"\x11");
     assert!(process.wait().success());
     process.assert_restored();
@@ -3157,7 +3139,10 @@ fn external_large_paste_save_undo_and_redo() {
     process.send(path.as_os_str().as_encoded_bytes());
     process.send(b"\r");
     process.expect_status("Saved");
-    assert_eq!(std::fs::read(&path).unwrap(), payload.as_bytes());
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        payload.replace("\r\n", "\n").as_bytes()
+    );
     eprintln!(
         "external paste: {} bytes, receive/render/save {:?}",
         payload.len(),

@@ -172,12 +172,11 @@ bracketed paste, received characters behave as ordinary key input; do not promis
 safe recognition of a paste the terminal does not identify. Stage 03 must support
 external and internal pastes larger than 1 MiB without an arbitrary total-size
 cutoff, subject to the existing text-validity and available-storage contracts.
-For document paste, restore standalone CR from the terminal using the document's
-Enter convention. Preserve LF and CRLF received intact. The
-`clipboard.literal_terminal_paste` setting preserves all received bytes when
-enabled. **Settings → Paste** exposes it as **Literal terminal paste**. The
-option becomes active when the draft is saved. Internal and desktop clipboard
-paste and terminal paste into fields use their literal behavior.
+All document paste routes normalize LF, CRLF, and standalone CR to the first
+LF or CRLF in the destination, using the same rule as Enter. When the current
+document has no LF or CRLF, both commands use the applied default line ending.
+Copy retains the exact selection, and fields accept the bytes their own input
+rules allow.
 Receive large bracketed pastes incrementally into private disk staging with bounded
 buffers, then commit the complete paste as one edit. While `Receiving paste` is
 displayed, use the shown `kill -USR1 PID` command from another shell on the editor
@@ -410,7 +409,7 @@ layout adapter, not separate keyboard/mouse estimates.
 | E02 | Movement, insertion/deletion and selection agree for ASCII, tabs, combining marks, CJK, emoji/ZWJ, isolated combining clusters, LF/CRLF/mixed endings, empty text, EOF and no final newline. Test chunk boundaries and round-trip bytes. |
 | E03 | Keyboard and cell hit-testing choose the same boundaries, including ties, escaped controls, clipped wide glyphs and blank cells. No document/path/error control sequence can affect terminal state. |
 | E04 | Forward/reverse multiline drag, Shift-click, wheel and timer autoscroll preserve selection; release/focus loss/resize/suspend/modal changes stop capture. Stale frame/completion events cannot move the caret or revive retired content. |
-| E05 | Cut/copy/internal paste and literal terminal paste preserve original bytes. Default terminal document paste restores standalone CR using the Enter convention and preserves received LF and CRLF. External and internal pastes larger than 1 MiB succeed with sufficient storage, use bounded ingress/staging buffers, and each commit as one undo unit. Measure parser-to-storage peak memory as paste size grows. Delivered Cmd+C/X/V and Ctrl+C/X/V invoke the same internal commands. Terminal-handled Cmd+V inserts its text once. No-selection copy is harmless; paste controls do not invoke shortcuts. Failed/cancelled large cut or paste leaves document/clipboard/history unchanged. Verify both capture modes and remote clipboard fallback. |
+| E05 | Copy and Cut preserve the original selection bytes. Terminal, desktop, and retained clipboard pastes normalize CR, LF, and CRLF to the destination style. External and internal pastes larger than 1 MiB succeed with sufficient storage, use bounded ingress/staging buffers, and each commit as one undo unit. Measure parser-to-storage peak memory as paste size grows. Delivered Cmd+C/X/V and Ctrl+C/X/V invoke the same internal commands. Terminal-handled Cmd+V inserts its text once. No-selection copy is harmless; paste controls do not invoke shortcuts. Failed/cancelled large cut or paste leaves document/clipboard/history unchanged. Verify both capture modes and remote clipboard fallback. |
 | E06 | Undo/redo restores text and caret/selection, keeps redo after failure, skips no-ops, follows pruning and returns clean at the save point. Ordinary typing, multiline selection replacement and large disk-spooled paste each have the specified undo units. |
 | E07 | Keyboard/mouse Save/Save As and New/Open/Quit prompts protect work. Test path errors, existing Save As destination, permission/metadata/link refusals, external conflicts, cancellation before/after publication, uncertainty and save-R finishing after edit-R+1. |
 | E08 | All controls/dialogs are reachable by keyboard and mouse at 40×8; Tab inserts text only in editor context. Test every listed delivered Cmd alias against its portable command, including Shift distinctions, focus/modal rules and quit protection. Verify translated terminal mappings, unavailable/unanswered enhancement fallback, intercepted shortcuts and protocol restoration on error/exit/suspend/resume. Tiny/zero sizes retain work and confirmation state. Existing help, Ctrl+S flow-control, signals, suspend/resume and restoration tests remain green. |
@@ -475,26 +474,18 @@ transport matrix remains explicit validation work.
 
 ### Terminal paste line endings (E05)
 
-The macOS arm64 PTY regression first reproduced standalone CR in the saved
-file. With the fix, `cargo test --locked` passed all 367 runnable checks, and
-`cargo fmt --check` and `cargo clippy --locked --all-targets -- -D warnings`
-passed. The paste cases cover LF and CRLF, split input and output, the caret
-after an expanding replacement, and literal paste and settings reset.
+Before the correction, a macOS PTY test and an injected desktop clipboard
+test reproduced incoming line endings being preserved during paste. The
+revised checks cover all document paste routes, UTF-8 and split endings,
+the caret after conversion, and the effect of changing the saved default on
+an open file with and without an existing line ending. On macOS arm64,
+371 workspace tests passed, along with formatting, Clippy, and independent
+review.
 
-In the Ubuntu 26.10 arm64 UTM guest, `cargo test --locked paste` passed,
-including eight PTY checks. In the guest desktop, copying two lines from
-Text Editor and using the terminal's Ctrl+Shift+V reproduced `<U+000D>`
-in the installed baseline. The patched build restored two lines. Exact byte
-comparisons confirmed the baseline saved bare CR, the empty file saved LF,
-and both paste and Enter inserted CRLF in the CRLF file. Windows Terminal
-with WSL and the opt-in memory benchmark remain unverified for this fix.
-
-The `0.1.1-dev.2` Settings regression passed on macOS and in the Ubuntu UTM
-guest. It covers keyboard and mouse navigation, discard and save, Keyboard
-Shortcuts at 64×8, and the effect of each saved setting on document paste.
-The full macOS suite passed all 368 runnable tests, and formatting and Clippy
-passed. In the Ubuntu terminal, the Paste section displayed the option and
-reported a successful save in each position using a temporary config.
+In the Ubuntu 26.10 arm64 UTM guest, the original installed build displayed
+`<U+000D>` when the terminal pasted two lines copied from Text Editor. An
+earlier build restored those line breaks and saved the expected LF and CRLF
+bytes. Windows Terminal under WSL remains open for direct testing.
 
 **Local implementation reviewed — 2026-11-03 and 2026-11-04.** The requested thorough
 code review includes fixes and regression coverage below. Available local checks

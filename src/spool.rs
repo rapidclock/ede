@@ -43,9 +43,9 @@ impl Spool {
         }
     }
 
-    /// Restore terminal-encoded line breaks as the document's preferred ending.
-    pub fn terminal_paste_reader(&self, newline: Newline) -> impl Read + '_ {
-        TerminalPasteReader {
+    /// Stream pasted text with its LF, CRLF and bare CR converted to the destination ending.
+    pub fn paste_reader(&self, newline: Newline) -> impl Read + '_ {
+        PasteReader {
             input: BufReader::new(self.reader()),
             newline,
             pending: b"",
@@ -74,14 +74,14 @@ impl Read for Reader<'_> {
     }
 }
 
-/// Interpret bare CR as a line break and pass through LF and CRLF as received.
-struct TerminalPasteReader<R> {
+/// Normalize line endings without changing the immutable clipboard spool.
+struct PasteReader<R> {
     input: R,
     newline: Newline,
     pending: &'static [u8],
 }
 
-impl<R: BufRead> Read for TerminalPasteReader<R> {
+impl<R: BufRead> Read for PasteReader<R> {
     fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
         let mut written = 0;
         while written < output.len() {
@@ -94,17 +94,17 @@ impl<R: BufRead> Read for TerminalPasteReader<R> {
                 break;
             }
             let count = input.len().min(output.len() - written);
-            let plain = memchr::memchr(b'\r', &input[..count]).unwrap_or(count);
+            let plain = memchr::memchr2(b'\r', b'\n', &input[..count]).unwrap_or(count);
+            let ending = input.get(plain).copied();
             output[written..written + plain].copy_from_slice(&input[..plain]);
             written += plain;
             self.input.consume(plain);
             if plain < count {
                 self.input.consume(1);
-                self.pending = if self.input.fill_buf()?.first() == Some(&b'\n') {
-                    b"\r"
-                } else {
-                    self.newline.as_str().as_bytes()
-                };
+                if ending == Some(b'\r') && self.input.fill_buf()?.first() == Some(&b'\n') {
+                    self.input.consume(1);
+                }
+                self.pending = self.newline.as_str().as_bytes();
             }
         }
         Ok(written)
@@ -117,13 +117,13 @@ mod tests {
 
     /// Both staged input and transaction output can split a line ending.
     #[test]
-    fn terminal_paste_handles_split_line_endings() {
+    fn paste_normalizes_split_line_endings() {
         let payload = "\r\r\n界\n\rX\r";
         for (newline, expected) in [
-            (Newline::Lf, "\n\r\n界\n\nX\n"),
-            (Newline::CrLf, "\r\n\r\n界\n\r\nX\r\n"),
+            (Newline::Lf, "\n\n界\n\nX\n"),
+            (Newline::CrLf, "\r\n\r\n界\r\n\r\nX\r\n"),
         ] {
-            let mut reader = TerminalPasteReader {
+            let mut reader = PasteReader {
                 input: BufReader::with_capacity(1, payload.as_bytes()),
                 newline,
                 pending: b"",

@@ -241,7 +241,7 @@ impl Coordinator {
             return;
         }
         let result = self.replace_authorized(
-            Replacement::LiteralPaste(&spool),
+            Replacement::Paste(&spool),
             target.position.selection(),
             Some((target, cancel)),
         );
@@ -535,7 +535,7 @@ mod tests {
                 observed: 1,
             })
             .unwrap();
-        assert_eq!(contents(&mut owner), "external 界\r\nmarker\n");
+        assert_eq!(contents(&mut owner), "external 界\r\nmarker\r\n");
         assert_eq!(desktop.reads.load(Ordering::Relaxed), 4);
         owner.action(Action::Command(Command::Undo)).unwrap();
         assert_eq!(owner.tab.screen.position, target.position);

@@ -228,10 +228,7 @@ pub(crate) enum Action {
         observed: u64,
     },
     Insert(String),
-    Paste {
-        spool: Arc<Spool>,
-        literal: bool,
-    },
+    Paste(Arc<Spool>),
     FieldPaste(Arc<Spool>, u64),
     Open(PathBuf),
     Follow(PathBuf),
@@ -643,7 +640,7 @@ impl Editor {
         }
         let paste = matches!(
             inner,
-            Action::Paste { .. }
+            Action::Paste(_)
                 | Action::FieldPaste(..)
                 | Action::Command(Command::Paste)
                 | Action::NativePaste { .. }
@@ -874,13 +871,14 @@ struct Coordinator {
     stream_guard: Option<After>,
     quit_ready: bool,
     settings_generation: u64,
+    default_line_ending: document::Newline,
     export: Option<streams::Export>,
 }
 /// Text or staged bytes to insert in one replacement.
 enum Replacement<'a> {
     Text(String),
-    LiteralPaste(&'a Spool),
-    TerminalPaste(&'a Spool),
+    Newline,
+    Paste(&'a Spool),
 }
 
 impl Coordinator {
@@ -937,6 +935,7 @@ impl Coordinator {
             stream_guard: None,
             quit_ready: false,
             settings_generation: 0,
+            default_line_ending: document::Newline::default(),
             export: None,
         }
     }
@@ -1115,13 +1114,14 @@ impl Coordinator {
     }
     /// Submit a storage request, waiting on this worker and observing cancellation/progress.
     fn call(&mut self, request: Request) -> Result<Response, Error> {
-        self.call_authorized(request, None)
+        self.call_authorized(request, None, false)
     }
 
     fn call_authorized(
         &mut self,
         request: Request,
         authority: Option<Cancellation>,
+        detect_line_ending: bool,
     ) -> Result<Response, Error> {
         let opening = matches!(
             request,
@@ -1131,7 +1131,7 @@ impl Coordinator {
         self.counter += 1;
         let job = self
             .service
-            .submit_authorized(self.counter, request, authority)
+            .submit_authorized(self.counter, request, authority, detect_line_ending)
             .map_err(|error| error.error)?;
         loop {
             if self.stop.load(Ordering::Acquire) || (cancellable && self.cancel.is_cancelled()) {
@@ -1342,21 +1342,31 @@ impl Coordinator {
                     inserted,
                 )
             }
-            Replacement::LiteralPaste(spool) | Replacement::TerminalPaste(spool) => {
-                let mut transaction =
-                    match self.call(Request::BeginTransaction { document, expected })? {
-                        Response::Transaction(transaction) => transaction,
-                        _ => return Err(Error::CorruptStorage),
-                    };
+            Replacement::Newline | Replacement::Paste(_) => {
+                let mut transaction = match self.call_authorized(
+                    Request::BeginTransaction { document, expected },
+                    authority.clone(),
+                    true,
+                )? {
+                    Response::Transaction(transaction) => transaction,
+                    _ => return Err(Error::CorruptStorage),
+                };
                 let cancel = authority.as_ref().unwrap_or(&self.cancel);
-                let inserted = if matches!(replacement, Replacement::TerminalPaste(_)) {
-                    transaction.replace_counted(
+                let newline = transaction
+                    .first_line_ending
+                    .unwrap_or(self.default_line_ending);
+                let inserted = match replacement {
+                    Replacement::Paste(spool) => transaction.replace_counted(
                         edit_range,
-                        spool.terminal_paste_reader(transaction.newline),
+                        spool.paste_reader(newline),
                         cancel,
-                    )?
-                } else {
-                    transaction.replace_counted(edit_range, spool.reader(), cancel)?
+                    )?,
+                    Replacement::Newline => transaction.replace_counted(
+                        edit_range,
+                        newline.as_str().as_bytes(),
+                        cancel,
+                    )?,
+                    Replacement::Text(_) => unreachable!(),
                 };
                 (
                     Request::Apply {
@@ -1367,7 +1377,7 @@ impl Coordinator {
                 )
             }
         };
-        let response = self.call_authorized(request, authority)?;
+        let response = self.call_authorized(request, authority, false)?;
         if let Response::Changed {
             revision,
             history_pruned,
@@ -1501,6 +1511,7 @@ impl Coordinator {
     fn action(&mut self, action: Action) -> Result<(), Error> {
         if let Action::ApplySettings(values, generation) = action {
             self.settings_generation = generation;
+            self.default_line_ending = values.default_line_ending();
             if let Some(retention) = &mut self.retention {
                 retention.set_interval(Instant::now(), values.checkpoint());
             }
@@ -1535,7 +1546,7 @@ impl Coordinator {
         if matches!(
             action,
             Action::Insert(_)
-                | Action::Paste { .. }
+                | Action::Paste(_)
                 | Action::Clipboard { .. }
                 | Action::Command(_)
                 | Action::NativeCopy { cut: true, .. }
@@ -1715,14 +1726,10 @@ impl Coordinator {
                 Replacement::Text(text),
                 self.tab.screen.position.selection(),
             )?,
-            Action::Paste { spool, literal } => {
-                let replacement = if literal {
-                    Replacement::LiteralPaste(&spool)
-                } else {
-                    Replacement::TerminalPaste(&spool)
-                };
-                self.replace(replacement, self.tab.screen.position.selection())?
-            }
+            Action::Paste(spool) => self.replace(
+                Replacement::Paste(&spool),
+                self.tab.screen.position.selection(),
+            )?,
             Action::Size(width, height, generation) => {
                 self.width = width;
                 self.height = height;
@@ -1851,7 +1858,7 @@ impl Coordinator {
                 Command::Paste => {
                     if let Some(paste) = self.clipboard.clone() {
                         self.replace(
-                            Replacement::LiteralPaste(&paste),
+                            Replacement::Paste(&paste),
                             self.tab.screen.position.selection(),
                         )?;
                     } else {
@@ -1859,15 +1866,12 @@ impl Coordinator {
                     }
                 }
                 Command::Newline | Command::Tab => {
-                    let text = if command == Command::Tab {
-                        "\t"
+                    let replacement = if command == Command::Tab {
+                        Replacement::Text("\t".into())
                     } else {
-                        self.snapshot()?.format().newline.as_str()
+                        Replacement::Newline
                     };
-                    self.replace(
-                        Replacement::Text(text.into()),
-                        self.tab.screen.position.selection(),
-                    )?;
+                    self.replace(replacement, self.tab.screen.position.selection())?;
                 }
                 Command::Backspace | Command::Delete => {
                     let mut range = self.tab.screen.position.selection();
@@ -2171,23 +2175,52 @@ mod tests {
         worker.action(hit(21, 3, PointerGesture::Drag(2))).unwrap();
         assert_eq!(worker.tab.screen.position.selection(), 15..21);
     }
+    /// Internal paste uses the current fallback for a new document and keeps the copied bytes.
+    #[test]
+    fn internal_paste_normalizes_to_the_destination() {
+        use std::io::Read;
+
+        let mut worker = coordinator(OpenOptions::default());
+        let copied = "one\r\ntwo\nthree\rfour";
+        worker.action(Action::Insert(copied.into())).unwrap();
+        worker.action(Action::Command(Command::SelectAll)).unwrap();
+        worker.action(Action::Command(Command::Copy)).unwrap();
+        worker.add_new().unwrap();
+        let mut settings = crate::settings::Values::default();
+        settings.default_line_ending = Some(document::Newline::CrLf);
+        worker.action(Action::ApplySettings(settings, 1)).unwrap();
+        worker.action(Action::Command(Command::Paste)).unwrap();
+        assert_eq!(contents(&mut worker), "one\r\ntwo\r\nthree\r\nfour");
+        worker.action(Action::Command(Command::Undo)).unwrap();
+        assert_eq!(contents(&mut worker), "");
+        worker
+            .action(Action::ApplySettings(crate::settings::Values::default(), 2))
+            .unwrap();
+        worker.action(Action::Command(Command::Paste)).unwrap();
+        assert_eq!(contents(&mut worker), "one\ntwo\nthree\nfour");
+        let mut retained = String::new();
+        worker
+            .clipboard
+            .as_ref()
+            .unwrap()
+            .reader()
+            .read_to_string(&mut retained)
+            .unwrap();
+        assert_eq!(retained, copied);
+    }
+
     /// Internal and external disk-spooled pastes exceed 1 MiB, commit atomically, and undo once.
     #[test]
     fn large_paste_and_invalid_payload_are_atomic() {
         let mut worker = coordinator(OpenOptions::default());
         let mut paste = Spool::new().unwrap();
-        let block = "界\r\n".repeat(16_384);
+        let block = "界\r\n".repeat(16_385);
         for _ in 0..16 {
             paste.append(block.as_bytes()).unwrap();
         }
-        let length = paste.len;
+        let length = block.replace("\r\n", "\n").len() as u64 * 16;
         assert!(length > 1 << 20);
-        worker
-            .action(Action::Paste {
-                spool: Arc::new(paste),
-                literal: false,
-            })
-            .unwrap();
+        worker.action(Action::Paste(Arc::new(paste))).unwrap();
         assert_eq!(worker.snapshot().unwrap().len(), length);
         worker.action(Action::Command(Command::Undo)).unwrap();
         assert_eq!(worker.snapshot().unwrap().len(), 0);
@@ -2202,14 +2235,7 @@ mod tests {
         let position = worker.tab.screen.position;
         let mut invalid = Spool::new().unwrap();
         invalid.append(b"valid\xffinvalid").unwrap();
-        assert!(
-            worker
-                .action(Action::Paste {
-                    spool: Arc::new(invalid),
-                    literal: false,
-                })
-                .is_err()
-        );
+        assert!(worker.action(Action::Paste(Arc::new(invalid))).is_err());
         assert_eq!(worker.tab.screen.position, position);
         assert_eq!(worker.snapshot().unwrap().len(), length * 2);
     }
@@ -3008,10 +3034,7 @@ mod ordering_tests {
         drop(inbox.recv().unwrap());
         let mut spool = Spool::new().unwrap();
         spool.append(b"cancel this").unwrap();
-        assert!(editor.submit(Action::Paste {
-            spool: Arc::new(spool),
-            literal: false,
-        }));
+        assert!(editor.submit(Action::Paste(Arc::new(spool))));
         editor.cancel();
         let envelope = inbox.recv().unwrap();
         assert!(envelope.paste_cancel.as_ref().unwrap().is_cancelled());

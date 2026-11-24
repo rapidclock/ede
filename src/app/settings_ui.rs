@@ -1,6 +1,7 @@
 //! Draft editing, navigation, and publication for the Settings pane.
 
 use super::*;
+use crate::document::Newline;
 use crate::settings::{Base, Chord, Revision, SaveState, Scalar, Update};
 use unicode_width::UnicodeWidthStr;
 
@@ -8,8 +9,8 @@ mod shortcuts;
 pub(crate) use shortcuts::group_label;
 use shortcuts::{Category, command_label};
 
-const PASTE_ROW: usize = Scalar::ALL.len();
-const GENERAL_ROWS: usize = PASTE_ROW + 1;
+const EDITOR_ROW: usize = Scalar::ALL.len();
+const GENERAL_ROWS: usize = EDITOR_ROW + 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Operation {
@@ -41,7 +42,7 @@ enum Page {
 pub(crate) enum Section {
     Recovery,
     Highlighting,
-    Paste,
+    Editor,
     Keyboard,
 }
 
@@ -49,7 +50,7 @@ impl Section {
     pub(crate) const ALL: [Self; 4] = [
         Self::Recovery,
         Self::Highlighting,
-        Self::Paste,
+        Self::Editor,
         Self::Keyboard,
     ];
 
@@ -58,7 +59,7 @@ impl Section {
             (Self::Recovery, _) => "Recovery",
             (Self::Highlighting, true) => "Limits",
             (Self::Highlighting, false) => "Highlighting Limits",
-            (Self::Paste, _) => "Paste",
+            (Self::Editor, _) => "Editor",
             (Self::Keyboard, true) => "Keys",
             (Self::Keyboard, false) => "Keyboard Shortcuts",
         }
@@ -230,13 +231,11 @@ impl Draft {
 
     /// Describe a general setting with its current draft value.
     pub(crate) fn row_label(&self, index: usize) -> String {
-        if index == PASTE_ROW {
-            let value = if self.revision.values.literal_terminal_paste() {
-                "On"
-            } else {
-                "Off"
-            };
-            return format!("Literal terminal paste · {value}");
+        if index == EDITOR_ROW {
+            return format!(
+                "Default line ending · {}",
+                self.revision.values.default_line_ending().label()
+            );
         }
         let scalar = Scalar::ALL[index];
         let source = if self.revision.values.override_value(scalar).is_some() {
@@ -252,13 +251,16 @@ impl Draft {
     }
 
     /// Returning to the applied value restores its original override state.
-    fn toggle_literal_terminal_paste(&mut self) {
-        let literal = !self.revision.values.literal_terminal_paste();
-        self.revision.values.literal_terminal_paste =
-            if literal == self.original.values.literal_terminal_paste() {
-                self.original.values.literal_terminal_paste
+    fn toggle_default_line_ending(&mut self) {
+        let ending = match self.revision.values.default_line_ending() {
+            Newline::Lf => Newline::CrLf,
+            Newline::CrLf => Newline::Lf,
+        };
+        self.revision.values.default_line_ending =
+            if ending == self.original.values.default_line_ending() {
+                self.original.values.default_line_ending
             } else {
-                Some(literal)
+                Some(ending)
             };
     }
 
@@ -341,8 +343,8 @@ impl Draft {
     pub(crate) fn section(&self) -> Section {
         match self.selected {
             0 => Section::Recovery,
-            1..PASTE_ROW => Section::Highlighting,
-            PASTE_ROW => Section::Paste,
+            1..EDITOR_ROW => Section::Highlighting,
+            EDITOR_ROW => Section::Editor,
             _ => Section::Keyboard,
         }
     }
@@ -350,8 +352,8 @@ impl Draft {
     fn section_rows(&self, section: Section) -> std::ops::Range<usize> {
         match section {
             Section::Recovery => 0..1,
-            Section::Highlighting => 1..PASTE_ROW,
-            Section::Paste => PASTE_ROW..GENERAL_ROWS,
+            Section::Highlighting => 1..EDITOR_ROW,
+            Section::Editor => EDITOR_ROW..GENERAL_ROWS,
             Section::Keyboard => GENERAL_ROWS..self.count(),
         }
     }
@@ -1161,9 +1163,9 @@ impl AppState {
             B::NextKey => self.settings_adjacent(1),
             B::Back | B::DiscardCapture => self.settings_back(layout),
             B::Edit => {
-                if draft.selected == PASTE_ROW {
+                if draft.selected == EDITOR_ROW {
                     if writable {
-                        draft.toggle_literal_terminal_paste();
+                        draft.toggle_default_line_ending();
                     }
                     self.switch_settings(Page::List);
                 } else if let Some(scalar) = Scalar::ALL.get(draft.selected).copied() {

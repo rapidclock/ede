@@ -77,9 +77,9 @@ prefix-only success is
 provisional. Reject inserted NULs and invalid UTF-8 as well, so edits do not create
 a document that this policy would reject on reopening.
 
-The storage layer never normalizes inserted line endings. The later Enter command
-uses the first encountered LF/CRLF style, or LF for an empty/no-newline document;
-literal paste/replacement retains its supplied terminators. LF defines line
+The storage layer preserves inserted bytes. The editor's Enter and Paste
+commands choose the first existing LF or CRLF, or the configured default if
+the document has no line ending. LF defines line
 boundaries; a preceding CR belongs to the same terminator. Empty text has one
 logical line; text ending in LF has a final empty line. Format metadata is part of
 the content state used for dirty checks and serialization.

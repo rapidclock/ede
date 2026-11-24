@@ -1,5 +1,6 @@
 //! Validated scalar values shared by persistence, editor runtime, and settings controls.
 
+use crate::document::Newline;
 use std::time::Duration;
 
 /// Individual configurable scalar fields, in display order.
@@ -102,8 +103,8 @@ impl ClipboardMode {
 pub(crate) struct Values {
     scalars: [Option<u64>; 4],
     pub(crate) clipboard_override: Option<ClipboardMode>,
-    /// Preserve the bytes received in terminal document paste.
-    pub(crate) literal_terminal_paste: Option<bool>,
+    /// Fallback for documents with no LF or CRLF yet.
+    pub(crate) default_line_ending: Option<Newline>,
 }
 
 impl Values {
@@ -129,9 +130,9 @@ impl Values {
         self.clipboard_override.unwrap_or_default()
     }
 
-    /// Whether terminal paste should insert the received bytes literally.
-    pub fn literal_terminal_paste(self) -> bool {
-        self.literal_terminal_paste.unwrap_or_default()
+    /// Effective line ending for documents with no detected style.
+    pub fn default_line_ending(self) -> Newline {
+        self.default_line_ending.unwrap_or_default()
     }
 
     pub fn syntax(self) -> SyntaxLimits {

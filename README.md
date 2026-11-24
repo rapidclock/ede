@@ -66,7 +66,8 @@ offers **Retry Finish**. See the
 Opening validates a private UTF-8 snapshot in the background. Its initial preview
 is read-only; Escape cancels preparation. Once ready, files remain editable
 regardless of total size. Lines do not wrap; horizontal scrolling follows the
-caret. Enter preserves the document's suggested LF/CRLF style, Tab inserts a
+caret. Enter uses the document's first LF or CRLF, or the configured default if
+the document has no line endings. Tab inserts a
 literal tab, and existing bytes are not normalized. Unsupported encodings and
 binary data report errors.
 
@@ -157,11 +158,12 @@ The Ubuntu desktop route uses X11 CLIPBOARD through Xorg or through the GNOME
 Wayland session's Xwayland clipboard bridge.
 
 The terminal's own Paste command sends client text through bracketed paste.
-In the document, a standalone carriage return from the terminal becomes the
-same LF or CRLF that Enter would insert. LF and CRLF received intact are
-preserved. To insert the terminal payload byte for byte, turn on **Literal
-terminal paste** under **Settings → Paste** and choose **Save**. In `config.toml`,
-the equivalent is `literal_terminal_paste = true` under `[clipboard]`.
+All document pastes convert LF, CRLF, and standalone CR to the line ending
+Enter would insert. The document's first line ending takes precedence. For a
+new or open document with no LF or CRLF, **Settings → Editor → Default line
+ending** selects LF or CRLF, with LF as the default. The change applies as soon
+as you save Settings. In `config.toml`, use `default_line_ending = "lf"` or
+`"crlf"` under `[editor]`.
 For example, on macOS Cmd+V typically belongs to the terminal. All paste paths
 support large contents using disk staging. A paste commits as one undoable edit
 or leaves the document unchanged on validation, staging, space, or pre-commit
@@ -279,8 +281,8 @@ also open it. Assigning F5 explicitly to another workspace command suppresses
 the inherited Settings shortcut until that conflict is removed. Explicit
 Settings bindings and unbindings take precedence.
 
-Choose **Recovery**, **Highlighting Limits**, **Paste**, or **Keyboard Shortcuts**
-in the sidebar. Narrow terminals use **Recovery**, **Limits**, **Paste**, and
+Choose **Recovery**, **Highlighting Limits**, **Editor**, or **Keyboard Shortcuts**
+in the sidebar. Narrow terminals use **Recovery**, **Limits**, **Editor**, and
 **Keys** above the list. Use Tab or Shift+Tab to focus the section selectors or
 rows. Move between sections with Up/Down in the sidebar and Left/Right in the
 compact layout.

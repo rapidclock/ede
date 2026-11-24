@@ -201,7 +201,7 @@ pub(super) fn clears_anchor(action: &Action) -> bool {
     matches!(
         action,
         Action::Insert(_)
-            | Action::Paste { .. }
+            | Action::Paste(_)
             | Action::Clipboard { cut: true, .. }
             | Action::NativeCopy { cut: true, .. }
             | Action::NativePaste { .. }
@@ -230,7 +230,7 @@ pub(super) fn mutates(action: &Action) -> bool {
     matches!(
         action,
         Action::Insert(_)
-            | Action::Paste { .. }
+            | Action::Paste(_)
             | Action::Clipboard { cut: true, .. }
             | Action::NativeCopy { cut: true, .. }
             | Action::NativePaste { .. }

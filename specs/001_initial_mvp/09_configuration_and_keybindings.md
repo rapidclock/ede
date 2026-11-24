@@ -63,7 +63,10 @@ activate = ["Enter", "Ctrl+O"]
 | `highlighting.parse_timeout_ms` | 250 | 1–250 |
 
 The proposed upper limits for highlighting retain the Stage 07 resource
-envelope. Reject unknown fields, wrong types, out-of-range integers, unknown
+envelope. `[editor] default_line_ending` accepts `"lf"` or `"crlf"` and
+defaults to `"lf"`. **Settings → Editor → Default line ending** exposes the
+choice. Saving applies it immediately to new and open documents with no LF
+or CRLF. Reject unknown fields, wrong types, out-of-range integers, unknown
 contexts and command IDs, and malformed or conflicting bindings. Limit
 `config.toml` to 64 KiB and each command entry to eight shortcuts. A missing file
 means bundled defaults. Read only a regular file through a bounded read, with
