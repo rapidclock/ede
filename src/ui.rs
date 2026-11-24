@@ -438,7 +438,7 @@ impl LayoutSnapshot {
                             }
                         }
                         if let Some(group) = draft.shortcut_group() {
-                            result.add_shortcut_groups(overlay, body, group, compact);
+                            result.add_shortcut_groups(overlay, body, group);
                         }
                         let rows = settings_entries_area(overlay, body, draft, writable);
                         result.list_rows = rows.height;
@@ -731,9 +731,9 @@ impl LayoutSnapshot {
         }
         result
     }
-    /// Wide panes show a sidebar list. Compact panes show clickable previous and next controls.
-    fn add_shortcut_groups(&mut self, overlay: Rect, body: Rect, group: Context, compact: bool) {
-        if compact {
+    /// Use a sidebar list when it fits and previous/next controls otherwise.
+    fn add_shortcut_groups(&mut self, overlay: Rect, body: Rect, group: Context) {
+        if settings_groups_inline(overlay) {
             let mut x = body.x;
             let group_width = Context::ALL
                 .into_iter()
@@ -753,7 +753,7 @@ impl LayoutSnapshot {
                 x += width + 1;
             }
         } else {
-            let y = overlay.y + 4;
+            let y = overlay.y + 1 + settings_ui::Section::ALL.len() as u16;
             let rows = overlay.bottom() - 2 - y;
             let start = list_start(group as usize, rows);
             for (offset, context) in Context::ALL
@@ -922,6 +922,12 @@ impl LayoutSnapshot {
 /// Use a sidebar when there is room for the full section labels and values.
 pub(crate) const SETTINGS_SPLIT_WIDTH: u16 = 64;
 
+/// A group in the sidebar needs space below the sections and above the footer.
+pub(crate) fn settings_groups_inline(overlay: Rect) -> bool {
+    overlay.width < SETTINGS_SPLIT_WIDTH
+        || overlay.height < settings_ui::Section::ALL.len() as u16 + 4
+}
+
 /// Content geometry shared by settings fields, hit targets, and informational text.
 fn settings_body(overlay: Rect, draft: &settings_ui::Draft) -> Rect {
     let (sidebar, header) = if draft.show_sections() {
@@ -958,7 +964,7 @@ fn settings_entries_area(
 ) -> Rect {
     let compact = overlay.width < SETTINGS_SPLIT_WIDTH;
     let before = if draft.shortcut_group().is_some() {
-        1 + u16::from(compact)
+        1 + u16::from(settings_groups_inline(overlay))
     } else {
         u16::from(draft.inline_scalar().is_some())
     };
@@ -1947,7 +1953,7 @@ fn render_settings(frame: &mut Frame<'_>, app: &AppState, layout: &LayoutSnapsho
         }
     }
     if draft.shortcut_group().is_some() {
-        let y = body.y + u16::from(compact);
+        let y = body.y + u16::from(settings_groups_inline(overlay));
         let (command, shortcut) = shortcut_columns(Rect::new(body.x, y, body.width, 1));
         let header = Style::default().add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
         frame.render_widget(Paragraph::new("Command").style(header), command);
@@ -2024,7 +2030,7 @@ fn render_settings(frame: &mut Frame<'_>, app: &AppState, layout: &LayoutSnapsho
                 };
                 let (open, close) = if focus {
                     ('>', '<')
-                } else if compact {
+                } else if settings_groups_inline(overlay) {
                     ('[', ']')
                 } else {
                     (' ', ' ')

@@ -175,8 +175,9 @@ cutoff, subject to the existing text-validity and available-storage contracts.
 For document paste, restore standalone CR from the terminal using the document's
 Enter convention. Preserve LF and CRLF received intact. The
 `clipboard.literal_terminal_paste` setting preserves all received bytes when
-enabled. Internal and desktop clipboard paste and terminal paste into fields
-use their literal behavior.
+enabled. **Settings → Paste** exposes it as **Literal terminal paste**. The
+option becomes active when the draft is saved. Internal and desktop clipboard
+paste and terminal paste into fields use their literal behavior.
 Receive large bracketed pastes incrementally into private disk staging with bounded
 buffers, then commit the complete paste as one edit. While `Receiving paste` is
 displayed, use the shown `kill -USR1 PID` command from another shell on the editor

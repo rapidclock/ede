@@ -129,6 +129,11 @@ impl Values {
         self.clipboard_override.unwrap_or_default()
     }
 
+    /// Whether terminal paste should insert the received bytes literally.
+    pub fn literal_terminal_paste(self) -> bool {
+        self.literal_terminal_paste.unwrap_or_default()
+    }
+
     pub fn syntax(self) -> SyntaxLimits {
         SyntaxLimits {
             document: self.get(Scalar::Document),

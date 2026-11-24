@@ -871,12 +871,7 @@ impl AppState {
                         tab,
                         Box::new(Action::Paste {
                             spool: paste,
-                            literal: self
-                                .settings
-                                .applied
-                                .values
-                                .literal_terminal_paste
-                                .unwrap_or_default(),
+                            literal: self.settings.applied.values.literal_terminal_paste(),
                         }),
                     ))),
                     PasteTarget::ReadOnly => {

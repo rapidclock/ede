@@ -8,7 +8,8 @@ mod shortcuts;
 pub(crate) use shortcuts::group_label;
 use shortcuts::{Category, command_label};
 
-const GENERAL_ROWS: usize = Scalar::ALL.len();
+const PASTE_ROW: usize = Scalar::ALL.len();
+const GENERAL_ROWS: usize = PASTE_ROW + 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Operation {
@@ -40,17 +41,24 @@ enum Page {
 pub(crate) enum Section {
     Recovery,
     Highlighting,
+    Paste,
     Keyboard,
 }
 
 impl Section {
-    pub(crate) const ALL: [Self; 3] = [Self::Recovery, Self::Highlighting, Self::Keyboard];
+    pub(crate) const ALL: [Self; 4] = [
+        Self::Recovery,
+        Self::Highlighting,
+        Self::Paste,
+        Self::Keyboard,
+    ];
 
     pub(crate) const fn label(self, compact: bool) -> &'static str {
         match (self, compact) {
             (Self::Recovery, _) => "Recovery",
             (Self::Highlighting, true) => "Limits",
             (Self::Highlighting, false) => "Highlighting Limits",
+            (Self::Paste, _) => "Paste",
             (Self::Keyboard, true) => "Keys",
             (Self::Keyboard, false) => "Keyboard Shortcuts",
         }
@@ -220,8 +228,16 @@ impl Draft {
             }
     }
 
-    /// Describe a scalar row with its current value and source.
+    /// Describe a general setting with its current draft value.
     pub(crate) fn row_label(&self, index: usize) -> String {
+        if index == PASTE_ROW {
+            let value = if self.revision.values.literal_terminal_paste() {
+                "On"
+            } else {
+                "Off"
+            };
+            return format!("Literal terminal paste · {value}");
+        }
         let scalar = Scalar::ALL[index];
         let source = if self.revision.values.override_value(scalar).is_some() {
             "override"
@@ -233,6 +249,17 @@ impl Draft {
             scalar.label(),
             self.revision.values.get(scalar)
         )
+    }
+
+    /// Returning to the applied value restores its original override state.
+    fn toggle_literal_terminal_paste(&mut self) {
+        let literal = !self.revision.values.literal_terminal_paste();
+        self.revision.values.literal_terminal_paste =
+            if literal == self.original.values.literal_terminal_paste() {
+                self.original.values.literal_terminal_paste
+            } else {
+                Some(literal)
+            };
     }
 
     /// Format a shortcut row for the two display columns.
@@ -314,7 +341,8 @@ impl Draft {
     pub(crate) fn section(&self) -> Section {
         match self.selected {
             0 => Section::Recovery,
-            1..GENERAL_ROWS => Section::Highlighting,
+            1..PASTE_ROW => Section::Highlighting,
+            PASTE_ROW => Section::Paste,
             _ => Section::Keyboard,
         }
     }
@@ -322,7 +350,8 @@ impl Draft {
     fn section_rows(&self, section: Section) -> std::ops::Range<usize> {
         match section {
             Section::Recovery => 0..1,
-            Section::Highlighting => 1..GENERAL_ROWS,
+            Section::Highlighting => 1..PASTE_ROW,
+            Section::Paste => PASTE_ROW..GENERAL_ROWS,
             Section::Keyboard => GENERAL_ROWS..self.count(),
         }
     }
@@ -822,11 +851,12 @@ impl AppState {
             Command::Move(movement, _) => {
                 let compact = area.width < crate::ui::SETTINGS_SPLIT_WIDTH;
                 if let Some(Control::SettingsGroup(_)) = self.focus {
+                    let inline = crate::ui::settings_groups_inline(area);
                     let step = match movement {
-                        Movement::Up if !compact => -1,
-                        Movement::Down if !compact => 1,
-                        Movement::Left if compact => -1,
-                        Movement::Right if compact => 1,
+                        Movement::Up if !inline => -1,
+                        Movement::Down if !inline => 1,
+                        Movement::Left if inline => -1,
+                        Movement::Right if inline => 1,
                         Movement::Home | Movement::Start => -(Context::ALL.len() as isize),
                         Movement::End | Movement::Finish => Context::ALL.len() as isize,
                         Movement::Left | Movement::Up => {
@@ -855,8 +885,8 @@ impl AppState {
                         Movement::Down if !compact => 1,
                         Movement::Left if compact => -1,
                         Movement::Right if compact => 1,
-                        Movement::Home | Movement::Start => -3,
-                        Movement::End | Movement::Finish => 3,
+                        Movement::Home | Movement::Start => -(Section::ALL.len() as isize),
+                        Movement::End | Movement::Finish => Section::ALL.len() as isize,
                         Movement::Right | Movement::Down => {
                             self.focus = Some(
                                 draft
@@ -1131,7 +1161,12 @@ impl AppState {
             B::NextKey => self.settings_adjacent(1),
             B::Back | B::DiscardCapture => self.settings_back(layout),
             B::Edit => {
-                if let Some(scalar) = Scalar::ALL.get(draft.selected).copied() {
+                if draft.selected == PASTE_ROW {
+                    if writable {
+                        draft.toggle_literal_terminal_paste();
+                    }
+                    self.switch_settings(Page::List);
+                } else if let Some(scalar) = Scalar::ALL.get(draft.selected).copied() {
                     if writable {
                         draft.field = draft.revision.values.get(scalar).to_string();
                         draft.feedback = None;

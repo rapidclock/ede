@@ -159,8 +159,9 @@ Wayland session's Xwayland clipboard bridge.
 The terminal's own Paste command sends client text through bracketed paste.
 In the document, a standalone carriage return from the terminal becomes the
 same LF or CRLF that Enter would insert. LF and CRLF received intact are
-preserved. Set `literal_terminal_paste = true` under `[clipboard]` to insert
-the terminal payload byte for byte.
+preserved. To insert the terminal payload byte for byte, turn on **Literal
+terminal paste** under **Settings → Paste** and choose **Save**. In `config.toml`,
+the equivalent is `literal_terminal_paste = true` under `[clipboard]`.
 For example, on macOS Cmd+V typically belongs to the terminal. All paste paths
 support large contents using disk staging. A paste commits as one undoable edit
 or leaves the document unchanged on validation, staging, space, or pre-commit
@@ -278,16 +279,18 @@ also open it. Assigning F5 explicitly to another workspace command suppresses
 the inherited Settings shortcut until that conflict is removed. Explicit
 Settings bindings and unbindings take precedence.
 
-Choose **Recovery**, **Highlighting Limits**, or **Keyboard Shortcuts** in the
-sidebar. Narrow terminals use **Recovery**, **Limits**, and **Keys** above the
-list. Use Tab or Shift+Tab to focus the section selectors or rows. Move between
-sections with Up/Down in the sidebar and Left/Right in the compact layout.
+Choose **Recovery**, **Highlighting Limits**, **Paste**, or **Keyboard Shortcuts**
+in the sidebar. Narrow terminals use **Recovery**, **Limits**, **Paste**, and
+**Keys** above the list. Use Tab or Shift+Tab to focus the section selectors or
+rows. Move between sections with Up/Down in the sidebar and Left/Right in the
+compact layout.
 
 **Keyboard Shortcuts** expands into groups for the screen or control that has
 focus. **App commands** covers workspace actions such as Open file and Open
 Settings. **Focused buttons** covers keys such as Enter and Tab when a workspace
 button has focus. **While in Settings** covers actions within the Settings pane
-itself. At narrow sizes, use the arrows beside the group name to change groups.
+itself. When groups appear above the list, use the arrows beside the group name
+to change groups.
 The **Command** and **Shortcut** columns show each binding. Click a row or press
 Enter on it to edit. Type a chord or choose **Capture** and accept the preview.
 The binding editor title shows the configuration ID. All sections share one

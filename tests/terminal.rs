@@ -3065,6 +3065,80 @@ fn terminal_paste_can_preserve_literal_bytes() {
     process.assert_restored();
 }
 
+/// The Paste setting is reachable by keyboard and mouse and applies on save.
+#[test]
+fn settings_exposes_literal_terminal_paste() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("paste.txt");
+    let config = directory.path().join("ede/config.toml");
+    std::fs::write(&path, "").unwrap();
+    let mut process = PtyChild::editor_with_options(
+        Some("xterm-256color"),
+        [&path],
+        None,
+        Some(directory.path()),
+        None,
+    );
+    process.resize(40, 8);
+    process.expect_status("Ready");
+    process.send(b"\x1b[15~");
+    process.expect("[Paste]");
+    process.send(b"\x1b[Z\x1b[C\x1b[C");
+    process.expect("Literal terminal paste · Off");
+    process.send(b"\r\r");
+    process.expect("Literal terminal paste · On");
+    assert!(!config.exists());
+    process.click_label("[Discard]", 1);
+    process.expect("Discard unsaved settings?");
+    process.click_label("[Discard]", 1);
+    process.expect("Literal terminal paste · Off");
+    process.send(b"\r");
+    process.expect("Literal terminal paste · On");
+    process.click_label("[Save]", 1);
+    process.expect_status("Settings saved");
+    assert!(
+        std::fs::read_to_string(&config)
+            .unwrap()
+            .contains("literal_terminal_paste = true")
+    );
+    process.resize(64, 8);
+    process.click_label("[Keyboard Shortcuts]", 1);
+    process.expect(">Keyboard Shortcuts<");
+    process.expect("App commands");
+    process.send(b"\r\x1b[C");
+    process.expect("Editing text");
+    process.expect("[Keyboard Shortcuts]");
+    process.send(b"\x1b");
+    process.expect_absent("Keyboard Shortcuts");
+    process.send(b"\x1b[200~first\rsecond\x1b[201~");
+    process.expect_body("first<U+000D>second", TIMEOUT);
+    process.send(b"\x1a");
+    process.expect_absent("first<U+000D>second");
+
+    process.resize(80, 24);
+    process.send(b"\x1b[15~");
+    process.click_label("[Paste]", 1);
+    process.click_label("Literal terminal paste · On", 1);
+    process.expect("Literal terminal paste · Off");
+    process.click_label("[Save]", 1);
+    process.expect_status("Settings saved");
+    assert!(
+        std::fs::read_to_string(&config)
+            .unwrap()
+            .contains("literal_terminal_paste = false")
+    );
+    process.send(b"\x1b");
+    process.expect_absent("Literal terminal paste");
+    process.send(b"\x1b[200~first\rsecond\x1b[201~");
+    process.expect_body("second", TIMEOUT);
+    process.send(b"\x13");
+    process.expect_status("Saved");
+    assert_eq!(std::fs::read(&path).unwrap(), b"first\nsecond");
+    process.send(b"\x11");
+    assert!(process.wait().success());
+    process.assert_restored();
+}
+
 /// The terminal parser and document path accept a multi-megabyte paste with one undo unit.
 #[test]
 fn external_large_paste_save_undo_and_redo() {
