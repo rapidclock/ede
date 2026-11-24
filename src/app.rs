@@ -320,6 +320,14 @@ impl AppState {
         let mode = if auto { "Auto" } else { "Manual" };
         let name = language.map_or("Plain Text", |language| language.label);
         label.push_str(&format!("\nLanguage: {name} ({mode})"));
+        if let Some(ending) = summary.and_then(|tab| match tab.line_ending {
+            crate::editor::LineEndingStatus::Hidden => None,
+            crate::editor::LineEndingStatus::Detecting => Some("Detecting…"),
+            crate::editor::LineEndingStatus::Known(ending) => Some(ending.label()),
+            crate::editor::LineEndingStatus::Unavailable => Some("Unavailable"),
+        }) {
+            label.push_str(&format!("\nLine ending: {ending}"));
+        }
         let syntax = if active {
             self.active_highlighting_status()
         } else if language.is_some() {
@@ -2678,6 +2686,7 @@ mod tests {
             warning: None,
             language: None,
             language_auto: true,
+            line_ending: crate::editor::LineEndingStatus::Hidden,
             stream: None,
         }]);
         app.modal = Some(Modal::Tabs(Some(selected)));

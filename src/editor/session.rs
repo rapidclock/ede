@@ -6,6 +6,15 @@ use super::*;
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub(crate) struct TabId(pub(crate) u64);
 
+/// Effective insertion line ending advertised by Tab Details.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum LineEndingStatus {
+    Hidden,
+    Detecting,
+    Known(document::Newline),
+    Unavailable,
+}
+
 /// Bounded data shared with the terminal for tab rendering and hit-testing.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct TabSummary {
@@ -23,6 +32,7 @@ pub(crate) struct TabSummary {
     pub warning: Option<Arc<str>>,
     pub language: Option<&'static syntax::Language>,
     pub language_auto: bool,
+    pub line_ending: LineEndingStatus,
     pub stream: Option<super::StreamStatus>,
 }
 
@@ -37,6 +47,7 @@ pub(super) struct TabState {
     pub(super) input: Arc<InputEpoch>,
     pub screen: Screen,
     pub info: Option<DocumentInfo>,
+    line_ending: Option<(DocumentId, document::Revision, LineEndingStatus)>,
     pub uncertain: Option<JobId>,
     pub undo_views: VecDeque<(Position, Position)>,
     pub redo_views: Vec<(Position, Position)>,
@@ -199,6 +210,43 @@ impl Coordinator {
         }
     }
 
+    /// Inspect the requested tab's current revision without activating it.
+    pub(super) fn inspect_line_ending(&mut self, id: TabId) {
+        let Some(state) = self.state(id) else {
+            return;
+        };
+        if !matches!(
+            state.line_ending_status(self.default_line_ending),
+            LineEndingStatus::Detecting | LineEndingStatus::Unavailable
+        ) {
+            return;
+        }
+        let Some((document, info)) = state.screen.document.zip(state.info.as_ref()) else {
+            return;
+        };
+        let revision = info.revision;
+        let ending = self
+            .snapshot_of(document)
+            .and_then(|snapshot| {
+                if snapshot.revision() != revision {
+                    return Err(Error::StaleRevision);
+                }
+                snapshot.first_line_ending(&self.cancel)
+            })
+            .ok()
+            .flatten()
+            .map_or(LineEndingStatus::Unavailable, LineEndingStatus::Known);
+        if let Some(state) = self.state_mut(id)
+            && state.screen.document == Some(document)
+            && state
+                .info
+                .as_ref()
+                .is_some_and(|info| info.revision == revision)
+        {
+            state.line_ending = Some((document, revision, ending));
+        }
+    }
+
     /// Apply input to its original document, even when a paste finishes after a switch.
     pub(super) fn tab_action(&mut self, id: TabId, action: Action) -> Result<(), Error> {
         if let Action::Save(path) = action {
@@ -290,6 +338,7 @@ impl Coordinator {
                     .syntax_language
                     .effective(state.screen.path.as_deref(), &self.tab.screen.syntax_config),
                 language_auto: state.screen.syntax_language == syntax::Choice::Auto,
+                line_ending: state.line_ending_status(self.default_line_ending),
                 stream: state.screen.stream.clone(),
             }
         });
@@ -1177,6 +1226,22 @@ impl Coordinator {
 }
 
 impl TabState {
+    /// Only an editable document with a first LF needs an indexed lookup.
+    fn line_ending_status(&self, default: document::Newline) -> LineEndingStatus {
+        let Some((document, info)) = self.screen.document.zip(self.info.as_ref()) else {
+            return LineEndingStatus::Hidden;
+        };
+        if self.capability != crate::search::Capability::Editable {
+            return LineEndingStatus::Hidden;
+        };
+        if info.lines == 1 {
+            return LineEndingStatus::Known(default);
+        }
+        self.line_ending
+            .filter(|(id, revision, _)| *id == document && *revision == info.revision)
+            .map_or(LineEndingStatus::Detecting, |(_, _, status)| status)
+    }
+
     /// Retire a latched failure whenever the effective language changes.
     pub(super) fn resolve_syntax(&mut self, config: &syntax::Config) {
         let language = self

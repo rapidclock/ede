@@ -40,8 +40,8 @@ pub(crate) use recovery::RecoveryPage;
 pub(crate) use recovery::RecoveryRow;
 use recovery::{RetainedScratch, Retention};
 pub(crate) use session::absolute;
+pub(crate) use session::{LineEndingStatus, TabId, TabSummary};
 use session::{OpenJob, RunningSave, SaveIntent, Tab, TabState, WaitingGuard};
-pub(crate) use session::{TabId, TabSummary};
 /// Tab-local input revokes prepared refreshes while queued intentions retain their charge.
 #[derive(Default)]
 struct InputEpoch {
@@ -142,6 +142,7 @@ impl ViewControl {
             | Action::DiscardRetained { .. }
             | Action::SetLanguage(..)
             | Action::RetryHighlighting(..)
+            | Action::InspectLineEnding(_)
             | Action::SyntaxTheme(..)
             | Action::ReloadHighlighting
             | Action::FieldPaste(..)
@@ -244,6 +245,7 @@ pub(crate) enum Action {
     CancelGuard,
     FinishQuit,
     RetryRefresh(TabId),
+    InspectLineEnding(TabId),
     SetLanguage(TabId, syntax::Choice),
     RetryHighlighting(TabId),
     SyntaxTheme(Arc<str>),
@@ -1579,6 +1581,7 @@ impl Coordinator {
                 | Action::CancelGuard
                 | Action::FinishQuit
                 | Action::RetryRefresh(_)
+                | Action::InspectLineEnding(_)
                 | Action::SetLanguage(..)
                 | Action::RetryHighlighting(..)
                 | Action::SyntaxTheme(..)
@@ -1602,6 +1605,7 @@ impl Coordinator {
             }
             Action::RevokeSearch => {}
             Action::RetryRefresh(tab) => self.retry_refresh(tab)?,
+            Action::InspectLineEnding(tab) => self.inspect_line_ending(tab),
             Action::SetLanguage(tab, choice) => {
                 let config = self.syntax.config();
                 if let Some(state) = self.state_mut(tab) {

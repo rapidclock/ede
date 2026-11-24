@@ -138,6 +138,7 @@ fn tab_details_tracks_parked_stream_without_switching() {
     process.click_label("[Details]", 1);
     process.expect("Read-only retained history — 6 bytes");
     process.expect_absent("Retry refresh");
+    process.expect_absent("Line ending:");
     let mut file = File::options().append(true).open(&log).unwrap();
     file.write_all(b"second\n").unwrap();
     process.expect("Read-only retained history — 13 bytes");
@@ -708,6 +709,40 @@ fn tab_details_language_follows_opened_name_and_committed_save_as() {
     assert_eq!(std::fs::read(&saved).unwrap(), b"source text\n");
     assert_eq!(std::fs::read(&busy).unwrap(), b"existing\n");
     process.send(b"\x11");
+    assert!(process.wait().success());
+    process.assert_restored();
+}
+
+/// Details tracks the first line ending of a parked file across external refreshes.
+#[test]
+fn tab_details_tracks_parked_file_line_ending() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("mixed.txt");
+    std::fs::write(&path, b"one\rtwo\r\nthree\nfour\n").unwrap();
+    let mut process = PtyChild::editor_with_path(Some("xterm-256color"), Some(&path));
+    process.expect_status("Ready");
+    process.send(b"\x0e");
+    process.expect("Untitled 1");
+    process.expect_status("Ready");
+    process.send(b"active scratch");
+    process.expect_body("active scratch", TIMEOUT);
+    run_action(&mut process, "Tabs", 2);
+    process.expect("Line ending: LF");
+    process.send(b"\x1b");
+    process.expect_absent("Tab Details");
+
+    process.click_label("[Tabs]", 1);
+    process.send(b"\x1b[A");
+    process.click_label("[Details]", 1);
+    process.expect("Line ending: CRLF");
+    std::fs::write(&path, b"one\ntwo\r\nthree\r\n").unwrap();
+    process.expect("Line ending: LF");
+    process.send(b"\x1b");
+    process.expect(">Details<");
+    process.send(b"\x1b");
+    process.expect_absent("Tabs — Enter to switch");
+    process.expect_body("active scratch", TIMEOUT);
+    process.send(b"\x01\x7f\x11");
     assert!(process.wait().success());
     process.assert_restored();
 }
@@ -3080,6 +3115,11 @@ fn default_line_ending_applies_to_open_documents_without_endings() {
     process.expect("[Keyboard Shortcuts]");
     process.send(b"\x1b");
     process.expect_absent("Keyboard Shortcuts");
+    process.resize(80, 24);
+    run_action(&mut process, "Tabs", 2);
+    process.expect("Line ending: CRLF");
+    process.send(b"\x1b");
+    process.expect_absent("Tab Details");
     process.send(b"\r\x1b[200~first\nsecond\x1b[201~");
     process.expect_body("secondseed", TIMEOUT);
     process.send(b"\x13");
@@ -3100,6 +3140,10 @@ fn default_line_ending_applies_to_open_documents_without_endings() {
     );
     process.send(b"\x1b");
     process.expect_absent("Default line ending");
+    run_action(&mut process, "Tabs", 2);
+    process.expect("Line ending: CRLF");
+    process.send(b"\x1b");
+    process.expect_absent("Tab Details");
     process.send(b"\r\x1b[200~third\nfourth\x1b[201~");
     process.expect_body("fourthseed", TIMEOUT);
     process.send(b"\x13");
@@ -3109,7 +3153,12 @@ fn default_line_ending_applies_to_open_documents_without_endings() {
         b"\r\nfirst\r\nsecond\r\nthird\r\nfourthseed"
     );
 
-    process.send(b"\x01\x7f\x1b[200~clean\r\nend\x1b[201~");
+    process.send(b"\x01\x7f");
+    run_action(&mut process, "Tabs", 2);
+    process.expect("Line ending: LF");
+    process.send(b"\x1b");
+    process.expect_absent("Tab Details");
+    process.send(b"\x1b[200~clean\r\nend\x1b[201~");
     process.expect_body("clean", TIMEOUT);
     process.send(b"\x13");
     process.expect_status("Saved");

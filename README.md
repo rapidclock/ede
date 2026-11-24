@@ -164,6 +164,7 @@ new or open document with no LF or CRLF, **Settings → Editor → Default line
 ending** selects LF or CRLF, with LF as the default. The change applies as soon
 as you save Settings. In `config.toml`, use `default_line_ending = "lf"` or
 `"crlf"` under `[editor]`.
+**Menu → Tabs → Tab details** shows the line ending the tab will use.
 For example, on macOS Cmd+V typically belongs to the terminal. All paste paths
 support large contents using disk staging. A paste commits as one undoable edit
 or leaves the document unchanged on validation, staging, space, or pre-commit

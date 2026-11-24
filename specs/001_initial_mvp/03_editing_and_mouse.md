@@ -175,6 +175,7 @@ cutoff, subject to the existing text-validity and available-storage contracts.
 All document paste routes normalize LF, CRLF, and standalone CR to the first
 LF or CRLF in the destination, using the same rule as Enter. When the current
 document has no LF or CRLF, both commands use the applied default line ending.
+Tab Details shows the effective line ending for the selected editable tab.
 Copy retains the exact selection, and fields accept the bytes their own input
 rules allow.
 Receive large bracketed pastes incrementally into private disk staging with bounded
@@ -481,6 +482,10 @@ the caret after conversion, and the effect of changing the saved default on
 an open file with and without an existing line ending. On macOS arm64,
 371 workspace tests passed, along with formatting, Clippy, and independent
 review.
+
+The Tab Details PTY checks cover the saved default on an open file with no
+line endings, fallback after deleting the last line ending, and the first
+line ending of a mixed file changing during a parked tab's external refresh.
 
 In the Ubuntu 26.10 arm64 UTM guest, the original installed build displayed
 `<U+000D>` when the terminal pasted two lines copied from Text Editor. An

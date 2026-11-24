@@ -1,7 +1,7 @@
 //! Document ownership, stable opening, revisions and transaction publication.
 use super::{
-    Cancellation, DocumentId, Edit, Error, Format, IoPoint, Newline, OpenOptions, OpenProgress,
-    Revision, Snapshot, StagedTransaction, StorageStats, TextRange,
+    Cancellation, DocumentId, Edit, Error, Format, IoPoint, OpenOptions, OpenProgress, Revision,
+    Snapshot, StagedTransaction, StorageStats, TextRange,
     history::{History, State},
     index::Validator,
     platform::{self, Version},
@@ -265,27 +265,8 @@ impl Document {
             return Err(Error::StaleRevision);
         }
         let store = self.store.lock().map_err(|_| Error::CorruptStorage)?;
-        let first_line_ending = if let Some(cancel) = cancel
-            && self.current.root.entry.lines != 0
-        {
-            let limits = &store.source.limits;
-            let _buffers = store
-                .source
-                .resources
-                .buffers
-                .acquire(limits.text_page_bytes.max(limits.node_page_bytes) * 2 + 256)?;
-            let after_lf = store
-                .tree
-                .after_lf(self.current.root, 0, &store.source, cancel)?;
-            let mut preceding = [0];
-            if after_lf >= 2 {
-                store.read(self.current, after_lf - 2, &mut preceding)?;
-            }
-            Some(if preceding[0] == b'\r' {
-                Newline::CrLf
-            } else {
-                Newline::Lf
-            })
+        let first_line_ending = if let Some(cancel) = cancel {
+            super::source::first_line_ending(&store.source, &store.tree, self.current, cancel)?
         } else {
             None
         };
