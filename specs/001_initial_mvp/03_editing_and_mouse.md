@@ -472,6 +472,22 @@ transport matrix remains explicit validation work.
 
 ## Validation record
 
+### Terminal paste line endings (E05)
+
+The macOS arm64 PTY regression first reproduced standalone CR in the saved
+file. With the fix, `cargo test --locked` passed all 367 runnable checks, and
+`cargo fmt --check` and `cargo clippy --locked --all-targets -- -D warnings`
+passed. The paste cases cover LF and CRLF, split input and output, the caret
+after an expanding replacement, and literal paste and settings reset.
+
+In the Ubuntu 26.10 arm64 UTM guest, `cargo test --locked paste` passed,
+including eight PTY checks. In the guest desktop, copying two lines from
+Text Editor and using the terminal's Ctrl+Shift+V reproduced `<U+000D>`
+in the installed baseline. The patched build restored two lines. Exact byte
+comparisons confirmed the baseline saved bare CR, the empty file saved LF,
+and both paste and Enter inserted CRLF in the CRLF file. Windows Terminal
+with WSL and the opt-in memory benchmark remain unverified for this fix.
+
 **Local implementation reviewed — 2026-11-03 and 2026-11-04.** The requested thorough
 code review includes fixes and regression coverage below. Available local checks
 are recorded here; full Stage 03 acceptance remains pending unavailable terminal,
