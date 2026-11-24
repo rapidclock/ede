@@ -228,7 +228,10 @@ pub(crate) enum Action {
         observed: u64,
     },
     Insert(String),
-    Paste(Arc<Spool>),
+    Paste {
+        spool: Arc<Spool>,
+        literal: bool,
+    },
     FieldPaste(Arc<Spool>, u64),
     Open(PathBuf),
     Follow(PathBuf),
@@ -640,7 +643,7 @@ impl Editor {
         }
         let paste = matches!(
             inner,
-            Action::Paste(_)
+            Action::Paste { .. }
                 | Action::FieldPaste(..)
                 | Action::Command(Command::Paste)
                 | Action::NativePaste { .. }
@@ -873,6 +876,13 @@ struct Coordinator {
     settings_generation: u64,
     export: Option<streams::Export>,
 }
+/// Text or staged bytes to insert in one replacement.
+enum Replacement<'a> {
+    Text(String),
+    LiteralPaste(&'a Spool),
+    TerminalPaste(&'a Spool),
+}
+
 impl Coordinator {
     /// Initialize empty interaction metadata; storage owns document contents.
     fn new(
@@ -1277,17 +1287,15 @@ impl Coordinator {
     /// Apply one atomic replacement, publishing view history only after successful commit.
     fn replace(
         &mut self,
-        text: Option<String>,
-        paste: Option<Arc<Spool>>,
+        replacement: Replacement<'_>,
         range: std::ops::Range<u64>,
     ) -> Result<(), Error> {
-        self.replace_authorized(text, paste, range, None)
+        self.replace_authorized(replacement, range, None)
     }
 
     fn replace_authorized(
         &mut self,
-        text: Option<String>,
-        paste: Option<Arc<Spool>>,
+        replacement: Replacement<'_>,
         range: std::ops::Range<u64>,
         authority: Option<(clipboard::Target, Cancellation)>,
     ) -> Result<(), Error> {
@@ -1310,9 +1318,6 @@ impl Coordinator {
         let info = self.tab.info.as_ref().ok_or(Error::Busy)?;
         let expected = info.revision;
         let before = self.tab.screen.position;
-        let inserted = text
-            .as_ref()
-            .map_or_else(|| paste.as_ref().map_or(0, |p| p.len), |s| s.len() as u64);
         let document = self.document()?;
         let authority = if let Some((target, authority)) = authority {
             if self.clipboard_target() != Some(target) {
@@ -1323,36 +1328,46 @@ impl Coordinator {
         } else {
             None
         };
-        let response = if let Some(text) = text {
-            self.call_authorized(
-                Request::Replace {
-                    document,
-                    expected,
-                    range: TextRange::new(range.start, range.end)?,
-                    text,
-                },
-                authority,
-            )?
-        } else {
-            let mut transaction =
-                match self.call(Request::BeginTransaction { document, expected })? {
-                    Response::Transaction(transaction) => transaction,
-                    _ => return Err(Error::CorruptStorage),
+        let edit_range = TextRange::new(range.start, range.end)?;
+        let (request, inserted) = match replacement {
+            Replacement::Text(text) => {
+                let inserted = text.len() as u64;
+                (
+                    Request::Replace {
+                        document,
+                        expected,
+                        range: edit_range,
+                        text,
+                    },
+                    inserted,
+                )
+            }
+            Replacement::LiteralPaste(spool) | Replacement::TerminalPaste(spool) => {
+                let mut transaction =
+                    match self.call(Request::BeginTransaction { document, expected })? {
+                        Response::Transaction(transaction) => transaction,
+                        _ => return Err(Error::CorruptStorage),
+                    };
+                let cancel = authority.as_ref().unwrap_or(&self.cancel);
+                let inserted = if matches!(replacement, Replacement::TerminalPaste(_)) {
+                    transaction.replace_counted(
+                        edit_range,
+                        spool.terminal_paste_reader(transaction.newline),
+                        cancel,
+                    )?
+                } else {
+                    transaction.replace_counted(edit_range, spool.reader(), cancel)?
                 };
-            let paste = paste.ok_or(Error::CorruptStorage)?;
-            transaction.replace(
-                TextRange::new(range.start, range.end)?,
-                paste.reader(),
-                authority.as_ref().unwrap_or(&self.cancel),
-            )?;
-            self.call_authorized(
-                Request::Apply {
-                    document,
-                    transaction,
-                },
-                authority,
-            )?
+                (
+                    Request::Apply {
+                        document,
+                        transaction,
+                    },
+                    inserted,
+                )
+            }
         };
+        let response = self.call_authorized(request, authority)?;
         if let Response::Changed {
             revision,
             history_pruned,
@@ -1520,7 +1535,7 @@ impl Coordinator {
         if matches!(
             action,
             Action::Insert(_)
-                | Action::Paste(_)
+                | Action::Paste { .. }
                 | Action::Clipboard { .. }
                 | Action::Command(_)
                 | Action::NativeCopy { cut: true, .. }
@@ -1696,11 +1711,17 @@ impl Coordinator {
             Action::SaveGuard(after, path) => self.save_for_guard(after, path)?,
             Action::Discard(after, acknowledged) => self.discard(after, acknowledged),
             Action::ForTab(tab, action) => self.tab_action(tab, *action)?,
-            Action::Insert(text) => {
-                self.replace(Some(text), None, self.tab.screen.position.selection())?
-            }
-            Action::Paste(paste) => {
-                self.replace(None, Some(paste), self.tab.screen.position.selection())?
+            Action::Insert(text) => self.replace(
+                Replacement::Text(text),
+                self.tab.screen.position.selection(),
+            )?,
+            Action::Paste { spool, literal } => {
+                let replacement = if literal {
+                    Replacement::LiteralPaste(&spool)
+                } else {
+                    Replacement::TerminalPaste(&spool)
+                };
+                self.replace(replacement, self.tab.screen.position.selection())?
             }
             Action::Size(width, height, generation) => {
                 self.width = width;
@@ -1829,7 +1850,10 @@ impl Coordinator {
                 Command::Cut => self.copy(true, None)?,
                 Command::Paste => {
                     if let Some(paste) = self.clipboard.clone() {
-                        self.replace(None, Some(paste), self.tab.screen.position.selection())?;
+                        self.replace(
+                            Replacement::LiteralPaste(&paste),
+                            self.tab.screen.position.selection(),
+                        )?;
                     } else {
                         self.tab.screen.message = "Nothing copied in ede".into();
                     }
@@ -1837,14 +1861,11 @@ impl Coordinator {
                 Command::Newline | Command::Tab => {
                     let text = if command == Command::Tab {
                         "\t"
-                    } else if self.snapshot()?.format().newline == document::Newline::CrLf {
-                        "\r\n"
                     } else {
-                        "\n"
+                        self.snapshot()?.format().newline.as_str()
                     };
                     self.replace(
-                        Some(text.into()),
-                        None,
+                        Replacement::Text(text.into()),
                         self.tab.screen.position.selection(),
                     )?;
                 }
@@ -1859,7 +1880,7 @@ impl Coordinator {
                             range.end = text.next(range.end)?;
                         }
                     }
-                    self.replace(Some(String::new()), None, range)?;
+                    self.replace(Replacement::Text(String::new()), range)?;
                 }
                 Command::Undo | Command::Redo => {
                     let expected = self.tab.info.as_ref().ok_or(Error::Busy)?.revision;
@@ -2161,7 +2182,12 @@ mod tests {
         }
         let length = paste.len;
         assert!(length > 1 << 20);
-        worker.action(Action::Paste(Arc::new(paste))).unwrap();
+        worker
+            .action(Action::Paste {
+                spool: Arc::new(paste),
+                literal: false,
+            })
+            .unwrap();
         assert_eq!(worker.snapshot().unwrap().len(), length);
         worker.action(Action::Command(Command::Undo)).unwrap();
         assert_eq!(worker.snapshot().unwrap().len(), 0);
@@ -2176,7 +2202,14 @@ mod tests {
         let position = worker.tab.screen.position;
         let mut invalid = Spool::new().unwrap();
         invalid.append(b"valid\xffinvalid").unwrap();
-        assert!(worker.action(Action::Paste(Arc::new(invalid))).is_err());
+        assert!(
+            worker
+                .action(Action::Paste {
+                    spool: Arc::new(invalid),
+                    literal: false,
+                })
+                .is_err()
+        );
         assert_eq!(worker.tab.screen.position, position);
         assert_eq!(worker.snapshot().unwrap().len(), length * 2);
     }
@@ -2975,7 +3008,10 @@ mod ordering_tests {
         drop(inbox.recv().unwrap());
         let mut spool = Spool::new().unwrap();
         spool.append(b"cancel this").unwrap();
-        assert!(editor.submit(Action::Paste(Arc::new(spool))));
+        assert!(editor.submit(Action::Paste {
+            spool: Arc::new(spool),
+            literal: false,
+        }));
         editor.cancel();
         let envelope = inbox.recv().unwrap();
         assert!(envelope.paste_cancel.as_ref().unwrap().is_cancelled());

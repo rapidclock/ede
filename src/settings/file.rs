@@ -154,6 +154,13 @@ fn parse(text: &str) -> io::Result<Revision> {
             return Err(invalid("clipboard: use mode or copy_to_system, not both"));
         }
         for (key, value) in entries {
+            if key == "literal_terminal_paste" {
+                let literal = value
+                    .as_bool()
+                    .ok_or_else(|| invalid("clipboard.literal_terminal_paste: expected boolean"))?;
+                settings.values.literal_terminal_paste = Some(literal);
+                continue;
+            }
             settings.values.clipboard_override = Some(match key.as_str() {
                 "mode" => value
                     .as_str()
@@ -321,6 +328,15 @@ fn serialize(base: &Base, draft: &Revision) -> io::Result<String> {
             change(clipboard, "mode", toml_edit::value(mode.id()));
         } else {
             remove(clipboard, "mode", &mut comments);
+        }
+    }
+    if previous.values.literal_terminal_paste != draft.values.literal_terminal_paste {
+        let clipboard = table(doc.as_table_mut(), "clipboard")?;
+        let key = "literal_terminal_paste";
+        if let Some(literal) = draft.values.literal_terminal_paste {
+            change(clipboard, key, toml_edit::value(literal));
+        } else {
+            remove(clipboard, key, &mut comments);
         }
     }
     for (before, after) in previous.map.rows.iter().zip(&draft.map.rows) {
@@ -694,6 +710,23 @@ mod tests {
         }
         assert!(parse("[clipboard]\nmode = \"auto\"").is_err());
         assert!(parse("[clipboard]\nmode = \"both\"\ncopy_to_system = false").is_err());
+    }
+
+    /// An unrelated settings save preserves literal paste and Restore Defaults clears it.
+    #[test]
+    fn literal_terminal_paste_preserves_and_restores_settings() {
+        let root = tempfile::tempdir().unwrap();
+        for enabled in [true, false] {
+            let text =
+                format!("[clipboard]\nliteral_terminal_paste = {enabled} # paste preference\n");
+            fs::write(root.path().join("config.toml"), &text).unwrap();
+            let (mut draft, base) = load(root.path()).unwrap();
+            draft.values.set(Scalar::Checkpoint, Some(12));
+            assert!(serialize(&base, &draft).unwrap().contains(&text));
+            let restored = serialize(&base, &Revision::default()).unwrap();
+            assert!(!restored.contains("literal_terminal_paste"));
+            assert!(restored.contains("# paste preference"));
+        }
     }
 
     #[test]

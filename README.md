@@ -157,6 +157,10 @@ The Ubuntu desktop route uses X11 CLIPBOARD through Xorg or through the GNOME
 Wayland session's Xwayland clipboard bridge.
 
 The terminal's own Paste command sends client text through bracketed paste.
+In the document, a standalone carriage return from the terminal becomes the
+same LF or CRLF that Enter would insert. LF and CRLF received intact are
+preserved. Set `literal_terminal_paste = true` under `[clipboard]` to insert
+the terminal payload byte for byte.
 For example, on macOS Cmd+V typically belongs to the terminal. All paste paths
 support large contents using disk staging. A paste commits as one undoable edit
 or leaves the document unchanged on validation, staging, space, or pre-commit

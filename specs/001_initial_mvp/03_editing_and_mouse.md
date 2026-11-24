@@ -172,6 +172,11 @@ bracketed paste, received characters behave as ordinary key input; do not promis
 safe recognition of a paste the terminal does not identify. Stage 03 must support
 external and internal pastes larger than 1 MiB without an arbitrary total-size
 cutoff, subject to the existing text-validity and available-storage contracts.
+For document paste, restore standalone CR from the terminal using the document's
+Enter convention. Preserve LF and CRLF received intact. The
+`clipboard.literal_terminal_paste` setting preserves all received bytes when
+enabled. Internal and desktop clipboard paste and terminal paste into fields
+use their literal behavior.
 Receive large bracketed pastes incrementally into private disk staging with bounded
 buffers, then commit the complete paste as one edit. While `Receiving paste` is
 displayed, use the shown `kill -USR1 PID` command from another shell on the editor
@@ -404,7 +409,7 @@ layout adapter, not separate keyboard/mouse estimates.
 | E02 | Movement, insertion/deletion and selection agree for ASCII, tabs, combining marks, CJK, emoji/ZWJ, isolated combining clusters, LF/CRLF/mixed endings, empty text, EOF and no final newline. Test chunk boundaries and round-trip bytes. |
 | E03 | Keyboard and cell hit-testing choose the same boundaries, including ties, escaped controls, clipped wide glyphs and blank cells. No document/path/error control sequence can affect terminal state. |
 | E04 | Forward/reverse multiline drag, Shift-click, wheel and timer autoscroll preserve selection; release/focus loss/resize/suspend/modal changes stop capture. Stale frame/completion events cannot move the caret or revive retired content. |
-| E05 | Cut/copy/internal paste and terminal paste preserve original bytes. External and internal pastes larger than 1 MiB succeed with sufficient storage, use bounded ingress/staging buffers, and each commit as one undo unit. Measure parser-to-storage peak memory as paste size grows. Delivered Cmd+C/X/V and Ctrl+C/X/V invoke the same internal commands. Terminal-handled Cmd+V inserts the received payload exactly once, never the internal clipboard too. No-selection copy is harmless; paste controls do not invoke shortcuts. Failed/cancelled large cut or paste leaves document/clipboard/history unchanged. Verify both capture modes and remote clipboard fallback. |
+| E05 | Cut/copy/internal paste and literal terminal paste preserve original bytes. Default terminal document paste restores standalone CR using the Enter convention and preserves received LF and CRLF. External and internal pastes larger than 1 MiB succeed with sufficient storage, use bounded ingress/staging buffers, and each commit as one undo unit. Measure parser-to-storage peak memory as paste size grows. Delivered Cmd+C/X/V and Ctrl+C/X/V invoke the same internal commands. Terminal-handled Cmd+V inserts its text once. No-selection copy is harmless; paste controls do not invoke shortcuts. Failed/cancelled large cut or paste leaves document/clipboard/history unchanged. Verify both capture modes and remote clipboard fallback. |
 | E06 | Undo/redo restores text and caret/selection, keeps redo after failure, skips no-ops, follows pruning and returns clean at the save point. Ordinary typing, multiline selection replacement and large disk-spooled paste each have the specified undo units. |
 | E07 | Keyboard/mouse Save/Save As and New/Open/Quit prompts protect work. Test path errors, existing Save As destination, permission/metadata/link refusals, external conflicts, cancellation before/after publication, uncertainty and save-R finishing after edit-R+1. |
 | E08 | All controls/dialogs are reachable by keyboard and mouse at 40×8; Tab inserts text only in editor context. Test every listed delivered Cmd alias against its portable command, including Shift distinctions, focus/modal rules and quit protection. Verify translated terminal mappings, unavailable/unanswered enhancement fallback, intercepted shortcuts and protocol restoration on error/exit/suspend/resume. Tiny/zero sizes retain work and confirmation state. Existing help, Ctrl+S flow-control, signals, suspend/resume and restoration tests remain green. |

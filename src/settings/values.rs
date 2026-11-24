@@ -102,6 +102,8 @@ impl ClipboardMode {
 pub(crate) struct Values {
     scalars: [Option<u64>; 4],
     pub(crate) clipboard_override: Option<ClipboardMode>,
+    /// Preserve the bytes received in terminal document paste.
+    pub(crate) literal_terminal_paste: Option<bool>,
 }
 
 impl Values {

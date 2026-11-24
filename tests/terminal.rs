@@ -3008,6 +3008,63 @@ fn open_edit_save_and_dirty_quit_round_trip() {
     );
 }
 
+/// Terminal paste restores bare CRs with the document's Enter convention.
+#[test]
+fn terminal_paste_restores_line_breaks() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("pasted.txt");
+    for (original, expected) in [
+        (&b""[..], &b"one\ntwo\n\nthree\r\nfour\nfive\n!"[..]),
+        (
+            &b"original\r\nother\n"[..],
+            &b"one\r\ntwo\r\n\r\nthree\r\nfour\nfive\r\n!original\r\nother\n"[..],
+        ),
+    ] {
+        std::fs::write(&path, original).unwrap();
+        let mut process = PtyChild::editor_with_path(Some("xterm-256color"), Some(&path));
+        process.expect_status("Ready");
+        process.send(b"\x1b[200~one\rtwo\r\rthree\r\nfour\nfive\r\x1b[201~");
+        process.expect_body("five", TIMEOUT);
+        process.send(b"!\x13");
+        process.expect_status("Saved");
+        assert_eq!(std::fs::read(&path).unwrap(), expected);
+        process.send(b"\x11");
+        assert!(process.wait().success());
+        process.assert_restored();
+    }
+}
+
+/// Users can retain standalone carriage returns received in a terminal paste.
+#[test]
+fn terminal_paste_can_preserve_literal_bytes() {
+    let directory = tempfile::tempdir().unwrap();
+    let config = directory.path().join("ede");
+    std::fs::create_dir(&config).unwrap();
+    std::fs::write(
+        config.join("config.toml"),
+        "[clipboard]\nliteral_terminal_paste = true\n",
+    )
+    .unwrap();
+    let path = directory.path().join("literal.txt");
+    std::fs::write(&path, "").unwrap();
+    let mut process = PtyChild::editor_with_options(
+        Some("xterm-256color"),
+        [&path],
+        None,
+        Some(directory.path()),
+        None,
+    );
+    process.expect_status("Ready");
+    process.send(b"\x1b[200~first\rsecond\x1b[201~");
+    process.expect_body("first<U+000D>second", TIMEOUT);
+    process.send(b"\x13");
+    process.expect_status("Saved");
+    assert_eq!(std::fs::read(&path).unwrap(), b"first\rsecond");
+    process.send(b"\x11");
+    assert!(process.wait().success());
+    process.assert_restored();
+}
+
 /// The terminal parser and document path accept a multi-megabyte paste with one undo unit.
 #[test]
 fn external_large_paste_save_undo_and_redo() {

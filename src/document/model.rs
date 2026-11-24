@@ -260,6 +260,7 @@ impl Document {
             file: tempfile::tempfile_in(store.directory.path())?,
             document: self.id,
             expected,
+            newline: self.current.format.newline,
             count: 0,
             last_end: 0,
             length: 0,

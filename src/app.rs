@@ -869,7 +869,15 @@ impl AppState {
                     }
                     PasteTarget::Tab(Some(tab)) => Some(Intent::Editor(Action::ForTab(
                         tab,
-                        Box::new(Action::Paste(paste)),
+                        Box::new(Action::Paste {
+                            spool: paste,
+                            literal: self
+                                .settings
+                                .applied
+                                .values
+                                .literal_terminal_paste
+                                .unwrap_or_default(),
+                        }),
                     ))),
                     PasteTarget::ReadOnly => {
                         self.message("Document is read-only");

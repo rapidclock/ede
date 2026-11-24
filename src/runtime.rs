@@ -524,7 +524,7 @@ fn effect(
                         | Action::NativeCopy { .. }
                         | Action::NativePaste { .. }
                         | Action::Insert(_)
-                        | Action::Paste(_)
+                        | Action::Paste { .. }
                         | Action::Save(_)
                         | Action::Scroll(..)
                         | Action::Hit { .. }

@@ -81,6 +81,15 @@ pub enum Newline {
     /// A CR followed by LF.
     CrLf,
 }
+impl Newline {
+    /// Text used when the editor inserts a line ending.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Lf => "\n",
+            Self::CrLf => "\r\n",
+        }
+    }
+}
 /// Serialization metadata, retained through edits and save points.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Format {

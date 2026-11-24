@@ -66,7 +66,7 @@ impl Coordinator {
         authority: Option<(Target, Cancellation)>,
     ) -> Result<(), Error> {
         self.cut_clipboard = Some(spool);
-        let result = self.replace_authorized(Some(String::new()), None, range, authority);
+        let result = self.replace_authorized(Replacement::Text(String::new()), range, authority);
         self.cut_clipboard = None;
         result
     }
@@ -241,8 +241,7 @@ impl Coordinator {
             return;
         }
         let result = self.replace_authorized(
-            None,
-            Some(Arc::new(spool)),
+            Replacement::LiteralPaste(&spool),
             target.position.selection(),
             Some((target, cancel)),
         );

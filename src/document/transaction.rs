@@ -1,6 +1,6 @@
 //! Incremental disk-spooled batches with sorted, non-overlapping logical ranges.
 use super::{
-    Cancellation, DocumentId, Error, Revision, TextRange,
+    Cancellation, DocumentId, Error, Newline, Revision, TextRange,
     index::Validator,
     platform,
     resources::{Permit, Resources},
@@ -17,6 +17,8 @@ pub struct StagedTransaction {
     pub(super) file: File,
     pub(super) document: DocumentId,
     pub(super) expected: Revision,
+    /// Enter convention from the same revision the staged edit will target.
+    pub(crate) newline: Newline,
     pub(super) count: u64,
     pub(super) last_end: u64,
     pub(super) length: u64,
@@ -32,9 +34,19 @@ impl StagedTransaction {
     pub fn replace(
         &mut self,
         range: TextRange,
-        mut text: impl Read,
+        text: impl Read,
         cancel: &Cancellation,
     ) -> Result<(), Error> {
+        self.replace_counted(range, text, cancel).map(|_| ())
+    }
+
+    /// Stage a replacement and report its actual byte count for the editor caret.
+    pub(crate) fn replace_counted(
+        &mut self,
+        range: TextRange,
+        mut text: impl Read,
+        cancel: &Cancellation,
+    ) -> Result<u64, Error> {
         if self.count != 0 && range.start < self.last_end {
             return Err(Error::InvalidRange);
         }
@@ -89,7 +101,7 @@ impl StagedTransaction {
                     .ok_or(Error::ResourceLimit("transaction offset overflow"))?;
                 self.last_end = range.end;
                 self.count += 1;
-                Ok(())
+                Ok(written)
             }
             Err(error) => {
                 self.file.set_len(start)?;
