@@ -1414,6 +1414,57 @@ mod tests {
         assert!(draft.editing());
     }
 
+    /// Dispatch the same key before and after restoring the Settings overlay.
+    #[test]
+    fn hidden_settings_cancel_preserves_the_inline_edit() {
+        let mut app = AppState::new();
+        app.open_settings();
+        app.switch_settings(Page::Edit(Operation::Scalar(Scalar::Checkpoint)));
+        app.settings_ui.as_mut().unwrap().field = "x".into();
+        let escape = Input::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        let hidden = LayoutSnapshot::for_app(Rect::new(0, 0, 20, 4), &app, 1);
+        app.input(escape.clone(), &hidden);
+        let draft = app.settings_ui.as_deref().unwrap();
+        assert_eq!(
+            draft.page,
+            Page::Edit(Operation::Scalar(Scalar::Checkpoint))
+        );
+        assert_eq!(draft.field, "x");
+        assert_eq!(app.focus, Some(Control::SettingsField));
+
+        let visible = LayoutSnapshot::for_app(Rect::new(0, 0, 40, 8), &app, 2);
+        app.input(escape, &visible);
+        let draft = app.settings_ui.as_deref().unwrap();
+        assert_eq!(draft.page, Page::List);
+        assert!(!draft.dirty());
+    }
+
+    /// Hidden Settings confirmation actions preserve the draft and its focus.
+    #[test]
+    fn hidden_settings_confirmation_ignores_activation() {
+        let mut app = AppState::new();
+        app.open_settings();
+        app.settings_ui
+            .as_mut()
+            .unwrap()
+            .revision
+            .values
+            .set(Scalar::Checkpoint, Some(31));
+        app.switch_settings(Page::Confirm(Confirmation::Exit));
+        let hidden = LayoutSnapshot::for_app(Rect::new(0, 0, 20, 4), &app, 1);
+        for code in [KeyCode::Tab, KeyCode::Enter] {
+            app.input(Input::Key(KeyEvent::new(code, KeyModifiers::NONE)), &hidden);
+        }
+        let draft = app.settings_ui.as_deref().unwrap();
+        assert_eq!(draft.page, Page::Confirm(Confirmation::Exit));
+        assert_eq!(
+            app.focus,
+            Some(Control::SettingsButton(Button::KeepEditing))
+        );
+        assert_eq!(draft.revision.values.get(Scalar::Checkpoint), 31);
+    }
+
     #[test]
     fn legacy_config_shortcut_opens_about_and_returns_to_the_draft() {
         let mut app = AppState::new();

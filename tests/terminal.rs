@@ -324,7 +324,7 @@ fn actions_outside_click_and_direct_settings_at_minimum_size() {
     assert!(process.wait().success());
 }
 
-/// Save commits a still-focused inline scalar in a single gesture.
+/// Save commits a still-focused scalar, and a failed scalar edit survives a resize.
 #[test]
 fn settings_footer_saves_pending_value() {
     let root = tempfile::tempdir().unwrap();
@@ -356,7 +356,6 @@ fn settings_footer_saves_pending_value() {
     process.expect("Enter a whole number from 1 to 3600");
     process.resize(20, 4);
     process.expect("Resize to 40x8");
-    process.send(b"\x1b");
     process.resize(40, 8);
     process.expect("Checkpoint interval (s) x");
     assert_eq!(
@@ -1854,7 +1853,6 @@ fn settings_capture_and_dirty_confirmation_at_minimum_size() {
     process.expect(">Keep Editing<");
     process.resize(20, 4);
     process.expect("Escape Cancel");
-    process.send(b"\t\r");
     process.resize(40, 8);
     process.expect(">Keep Editing<");
     process.send(b"\r");
@@ -3174,7 +3172,7 @@ fn external_large_paste_save_undo_and_redo() {
     process.assert_restored();
 }
 
-/// A prompt at tiny geometry cannot accept a hidden Discard/Save button.
+/// A dirty Quit prompt requested at tiny geometry is usable once visible.
 #[test]
 fn dirty_quit_at_tiny_size_requires_visible_confirmation() {
     let directory = tempfile::tempdir().unwrap();
@@ -3187,14 +3185,11 @@ fn dirty_quit_at_tiny_size_requires_visible_confirmation() {
     process.resize(20, 4);
     process.expect("Resize");
     process.send(b"\x11");
-    thread::sleep(Duration::from_millis(30));
-    process.send(b"\t\t\r\x1b");
-    thread::sleep(Duration::from_millis(30));
-    assert!(process.child.try_wait().unwrap().is_none());
+    process.expect("Escape Cancel");
     process.resize(80, 24);
     process.expect("Unsaved changes");
     process.send(b"\x1b");
-    thread::sleep(Duration::from_millis(60));
+    process.expect_absent("Unsaved changes");
     process.send(b"\x11");
     process.expect("Unsaved changes");
     process.send(b"\t\t\r");

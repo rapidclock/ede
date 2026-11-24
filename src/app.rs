@@ -2936,12 +2936,23 @@ mod settings_guard_tests {
         app.event(Event::Guard(1, After::Quit, true));
         assert_eq!(app.focus, Some(Control::ConfirmCancel));
         let visible = LayoutSnapshot::for_app(area, &app, 2);
+        let obscured = LayoutSnapshot::for_app(Rect::new(0, 0, 39, 8), &app, 3);
+        for code in [KeyCode::Tab, KeyCode::Tab, KeyCode::Enter, KeyCode::Esc] {
+            assert!(
+                app.input(
+                    Input::Key(KeyEvent::new(code, KeyModifiers::NONE)),
+                    &obscured
+                )
+                .is_none()
+            );
+        }
+        assert!(matches!(app.modal, Some(Modal::Confirm(After::Quit, _))));
+        assert_eq!(app.focus, Some(Control::ConfirmCancel));
         assert!(
             app.input(Input::Key(key), &visible).is_none(),
             "Discard requires the Discard control to own focus"
         );
         app.focus = Some(Control::ConfirmDiscard);
-        let obscured = LayoutSnapshot::for_app(Rect::new(0, 0, 39, 8), &app, 3);
         assert!(
             app.input(Input::Key(key), &obscured).is_none(),
             "a hidden Discard target must stay inactive"

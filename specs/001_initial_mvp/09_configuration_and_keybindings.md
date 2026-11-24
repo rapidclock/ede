@@ -416,6 +416,12 @@ verify changed guards with deliberate mutations in isolated copies per
   Reducer checks cover captured Escape and release, held presses, and preservation
   of a typed field across asynchronous reload. Picker, search, scratch and stream
   regressions passed.
+- [macOS CI run 103](https://github.com/rapidclock/ede/actions/runs/45306751499)
+  exposed a race between the Settings PTY test's standalone Escape and its
+  immediate resize. PTY tests now wait for visible resize and confirmation
+  states. Reducer checks dispatch the hidden Settings and Quit keys with an
+  explicit small layout. On macOS arm64, all three affected PTY tests passed
+  32 repetitions each, and the full suite passed with the CI descriptor limit.
 - **K05 — Publication.** Real files and barriers cover stale base, same-inode
   edits, replacement, chmod, new hard links, symlinks, replaced directories,
   creation during publication, contention, cancellation and shutdown on both
