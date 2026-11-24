@@ -4,12 +4,32 @@
 - Always be direct and concise.
 - Do not be lazy!
 
-## Branching Strategy
+## Branching and versioning
 
-- Do not make changes directly on `main`.
-- Top level Features will branch off of `main` and use the format `feat/PROJECT_NAME` for the project specifications.
-- When working on a step/stage of a project, we branch off of the feat branch and create a branch in the format `stage/STAGE_NAME`.
-- Always PR the Stage branch to the Feature/Project Branch and project branch PRs into `main`.
+Do not make changes directly on `main`. Branch from `main` and open a PR back
+to `main` for each of these workflows.
+
+| Workflow | Branch | Package version |
+| --- | --- | --- |
+| Bug or defect fix | `bug/NAME` | Increment patch by one. |
+| Feature | `feat/PROJECT_NAME` | Increment minor or major by one. Record the human's choice when drafting the feature overview, specification, or outline. |
+| Simple enhancement | `enhance/NAME` | For a small improvement, confirm a patch or minor increment with the human before work begins. |
+| Ad hoc maintenance | `adhoc/NAME` | No bump for changes limited to AI rules, documentation (including the README), or CI, with no application code changes. |
+
+For a staged feature, create `stage/STAGE_NAME` branches from the feature branch
+and open their PRs against that feature branch. All stages share the feature's
+target release version.
+
+- Use the package version in `Cargo.toml` on `main` as the baseline. A major
+  bump resets minor and patch to zero. A minor bump resets patch to zero.
+  Recheck `main` before finalizing and confirm any revised target with the human.
+- For a versioned change, development iterations may use prereleases of the
+  target version, such as `0.2.0-dev.1` and `0.2.0-dev.2`. Keep the package
+  version in `Cargo.toml` and its entry in `Cargo.lock` in sync.
+- Finalize the version on the work branch after final review and explicit human
+  approval, before merging the PR into `main`. Remove any development suffix
+  and verify the manifest and lockfile agree. If the human handles finalization,
+  check for their version change and clarify the target or ownership if needed.
 
 ## Specification Documents
 
