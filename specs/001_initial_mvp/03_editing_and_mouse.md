@@ -489,6 +489,13 @@ comparisons confirmed the baseline saved bare CR, the empty file saved LF,
 and both paste and Enter inserted CRLF in the CRLF file. Windows Terminal
 with WSL and the opt-in memory benchmark remain unverified for this fix.
 
+The `0.1.1-dev.2` Settings regression passed on macOS and in the Ubuntu UTM
+guest. It covers keyboard and mouse navigation, discard and save, Keyboard
+Shortcuts at 64×8, and the effect of each saved setting on document paste.
+The full macOS suite passed all 368 runnable tests, and formatting and Clippy
+passed. In the Ubuntu terminal, the Paste section displayed the option and
+reported a successful save in each position using a temporary config.
+
 **Local implementation reviewed — 2026-11-03 and 2026-11-04.** The requested thorough
 code review includes fixes and regression coverage below. Available local checks
 are recorded here; full Stage 03 acceptance remains pending unavailable terminal,
