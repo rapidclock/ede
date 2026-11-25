@@ -29,13 +29,14 @@ must stay the same size as result counts grow. When a jump would place the match
 under the window, reveal the match start by repositioning the window or scrolling
 the editor. Show the whole match when it fits in the exposed area.
 
-The sketches show the two modes with results loaded. Options and the selected
-result are visible by label and state, including in monochrome terminals.
+The sketches show Find with Options collapsed and Find & Replace with Options
+expanded after a replacement. The colored Find button, disclosure marker, and
+result status have distinct text cues for monochrome terminals.
 
 ```text
 ┌─ Find ─────────────────────────────────────────── [×] ┐
-│ Find  [ apple                        ] [Find]         │
-│ [▸ Options]  Case on · Whole word off · Current       │
+│ Find    [ apple                              ] [Find] │
+│ › Options  Case on · Whole word off · Current         │
 │ [Previous] [Next]                     2 of 18 matches │
 │   3:7    green apple                                  │
 │ > 12:1   apple tree                                   │
@@ -43,24 +44,33 @@ result are visible by label and state, including in monochrome terminals.
 └───────────────────────────────────────────────────────┘
 
 ┌─ Find & Replace ───────────────────────────────── [×] ┐
-│ Find     [ apple                     ] [Find]         │
-│ Replace  [ pear                                     ] │
-│ [▾ Options]  [x] Match case  [ ] Whole word           │
-│ Scope [All open]  Insert [Tab] [LF] [CRLF]            │
-│ [Previous] [Next]                     2 of 27 matches │
-│ [Replace next] [Replace all…]                         │
-│   notes.txt  3:7    green apple                       │
+│ Find    [ apple                              ] [Find] │
+│ Replace [ pear                                      ] │
+│                         [Replace next] [Replace all…] │
+│ ⌄ Options                                             │
+│   [x] Match case  [ ] Whole word  Scope [All open]    │
+│   Insert [Tab] [LF] [CRLF]                            │
+│ [Previous] [Next]                     1 of 26 matches │
+│   notes.txt  3:7    Replaced · green apple            │
 │ > notes.txt 12:1    apple tree                        │
-│   todo.txt   2:5    buy apple                         │
 └───────────────────────────────────────────────────────┘
 ```
 
-- Open with the Find field focused. Start with Options collapsed and show the
-  current case, whole-word, and scope values beside the toggle. Expanding it
-  exposes labeled, clickable controls. Use **Match case**, **Whole word** and
-  **Scope** to describe the existing flags. Keep Insert Tab, Insert LF and
-  Insert CRLF reachable in the expanded section for the last focused text field.
-  If collapse hides the focused control, return focus to Options.
+- Open with the Find field focused. In both modes put **Find** at the right
+  edge of the query row. Use the existing green foreground and focus treatment
+  from the Settings Save action for the enabled Find button. In Find & Replace,
+  put **Replace next** and **Replace all…** on their own row immediately below
+  the replacement field, with the group aligned to the same right edge.
+- Put **Options** and all its controls below those actions in both modes,
+  before result navigation. Use an unboxed heading like the Actions category
+  rows and Settings sidebar groups. A leading `›` indicates collapsed and `⌄`
+  indicates expanded. The whole heading is clickable and shows keyboard focus.
+  Click or Enter toggles it, Right expands it, and Left collapses it with the
+  heading focused. Start collapsed with the case, whole-word, and scope values
+  alongside the heading. Indent the labeled **Match case**, **Whole word** and
+  **Scope** controls when expanded. Keep Insert Tab, Insert LF and Insert CRLF
+  there for the last focused text field. If collapse hides the focused
+  control, return focus to Options.
 - At `40×8`, use a compact scrollable form and results view with at least three
   full editor rows exposed. Show a clickable way to switch between form and
   results and to scroll to offscreen form controls. Preserve the equivalent
@@ -91,15 +101,15 @@ result are visible by label and state, including in monochrome terminals.
   results and invalidates pending replacement intent. Each field keeps the
   existing 4096-byte UTF-8 limit, literal paste, and safe display of controls.
 - **List focus** — Down from the last form row enters the list and focuses the
-  current result, or the first available result. Left returns to the form. Up
-  and Down select and reveal the adjacent occurrence. Page Up and Page Down
-  advance by one visible list page and reveal the selected occurrence. Home and
-  End reach the first and last available results. List movement stops at the
-  ends. Previous and Next, including F3 and Shift+F3, retain existing wrap
-  behavior and keep the selection and list viewport in sync with the jump.
-  Enter on a result reveals it. A click on a result selects and reveals it in
-  one action. The wheel over results scrolls the list without changing the
-  current match, caret, active tab, or editor scroll position.
+  current match or the first available row. Left returns to the form. Up and
+  Down move by one row, Page Up and Page Down by one visible page, and Home and
+  End reach the first and last available rows. Movement stops at the ends.
+  Moving onto a live match reveals it. Enter or one click reveals a live match
+  directly. A replacement feedback row can receive focus for browsing and
+  leaves the editor position unchanged. Previous and Next, including F3 and
+  Shift+F3, wrap through live matches and keep the selection and list viewport
+  in sync with the jump. The wheel over results scrolls the list without
+  changing the current match, caret, active tab, or editor scroll position.
 - **Result rows** — Include every canonical occurrence in the requested scope.
   Show one row per match in tab creation order, then by document offset. Each
   row shows the 1-based line and editor cell column of the start, a clipped and
@@ -136,33 +146,52 @@ result are visible by label and state, including in monochrome terminals.
   It applies to the captured search scope and matching rules, including results
   outside the visible list page. Preserve one Undo step per changed document,
   literal replacement, read-only handling, and reporting of partial outcomes.
-  Refresh or explicitly invalidate affected rows after replacement. Selecting
-  or opening a result only navigates, including in Find & Replace.
+  Refresh or explicitly invalidate affected live matches after replacement.
+- **Replacement feedback** — Once an edit is acknowledged, show the occurrence
+  in the Find & Replace list with its original preview and a visible text
+  label. Use **Replaced** for changed text and **Removed** when an empty
+  replacement deleted the occurrence. Keep the label visible when the preview
+  is clipped. Replace next shows the feedback promptly and keeps the next live
+  match visible alongside it where space allows. Feedback covers the latest
+  replacement action that changed text, including successfully changed
+  documents in a partial Replace all. Use the same bounded list mechanism for
+  large batches. Only edits that changed text and were committed get a label.
+- Feedback rows record where a change was made. They are excluded from the live
+  match count, Next and Previous, and replacement actions. When inserted text
+  still matches the query, list its live match separately from the feedback
+  row. Clear feedback when the window closes or a new query, option, or scope
+  takes effect. Clear a document's feedback when it changes again through
+  edit, undo, redo, or refresh, or when the tab becomes unavailable.
+  Rescanning live matches after replacement preserves that action's feedback.
 
 ## Acceptance criteria
 
 | ID | Observable outcome |
 | --- | --- |
-| A1 | Find and Find & Replace open from existing entry points with matching labels and distinct controls. At `80×24`, `40×8`, and after resize, the window leaves the editor visible and the active match can be revealed outside the window. Options and their current state are discoverable when collapsed. |
-| A2 | Starting in Find, use arrow keys and Enter to reach flags, browse results, and reach the available actions without Tab. Repeat with mouse only, including wheel and a single result click. Verify Tab, Shift+Tab, F6, the remapped command routes, and Escape and outside-click behavior. |
+| A1 | Both modes open from existing entry points and show a green, right-aligned Find action. Find & Replace places its right-aligned replacement actions on the row immediately below the replacement field. In both modes, the unboxed Options heading follows the actions and shows its state and collapsed summary. Labels and focus are visible in monochrome. At `80×24`, `40×8`, and after resize, the window exposes the editor and the active match can be revealed outside it. |
+| A2 | Starting in Find, use arrow keys and Enter to expand and collapse Options, reach flags, browse results, and reach the available actions without Tab. Repeat with mouse only, including clicking the Options heading, wheel scrolling, and a single result click. Verify Tab, Shift+Tab, F6, the remapped command routes, and Escape and outside-click behavior. |
 | A3 | Browse matches beyond the first page of a dense document and jump to the first and last occurrence. In All open, choose a result in another unsaved tab. Verify same-line matches, locations and previews for multibyte/multiline text, selected-row synchronization after Next/Previous, and wheel scrolling without a jump. |
 | A4 | Verify empty, no-match, busy, cancelled, and partial outcomes. During controlled search or row-fetch delays, change query, scope, revision, or tab availability and verify stale rows cannot navigate or replace. Verify a press followed by a resize or row change cannot activate the new target. |
 | A5 | Select a specific match from Find & Replace, replace it, and verify non-wrapping advancement and refreshed results. Confirm and cancel Replace all in both scopes. Verify one Undo step per changed document, read-only handling, and reporting if work stops partway. Check literal field paste and case and whole-word regressions. |
+| A6 | Verify Replaced for changed text and Removed for deletion, including a partial batch and feedback beyond the first page. Verify identical, skipped, and uncommitted edits leave no new marker. Browse feedback without jumping or changing the live count, including when inserted text itself matches. Verify feedback clears on undo, subsequent edits, and search changes. |
 
 ## Validation record
 
 - Draft basis — Inspected `main` at `3004bb3`, including search command routing,
   rendering, search state, and existing search and terminal tests. Current
   behavior was established by source inspection.
+- Layout revision — Checked the Actions category and Settings sidebar group
+  rendering and the Settings Save button styling in `src/ui.rs`. Incorporated
+  the requested action placement and disclosure style into both sketches.
 - Pending — A1–A2 layout and input checks in a PTY and an interactive terminal
   with mouse capture. Check standard and minimum dimensions and resizing.
-- Pending — A3–A5 focused Rust and PTY tests for navigation, bounded result
-  access, invalidation, cancellation, and replacement integrity. Control the
-  ordering of delayed results and input in race tests. Check that a deliberate
-  break in any changed data-protection guard fails the corresponding assertion.
+- Pending — A3–A6 focused Rust and PTY tests for navigation, bounded result
+  access, invalidation, cancellation, replacement feedback, and integrity.
+  Control the ordering of delayed results and input in race tests. Check that
+  a deliberate break in any changed data-protection guard fails its assertion.
   Run relevant regressions, `cargo fmt --check`, and Clippy after implementation.
-- Open design choices — The window placement, collapsed default, and key map
-  above are proposed for review. The compact layout and bounded result storage
-  mechanism remain implementation choices subject to the acceptance criteria.
+- Open design choices — Window placement, the collapsed default, key mappings,
+  and the lifetime of replacement feedback are proposed for review. Compact
+  layout details and bounded result storage remain implementation choices.
 - Next step — Review the draft with the user. Implementation requires separate
   authorization. No runtime validation has been performed for this draft.
