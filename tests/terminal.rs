@@ -26,6 +26,141 @@ use nix::{
 /// Bounded timeouts turn a broken terminal loop into a useful test failure, not a hanging CI job.
 const TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Browse live search results with arrows and the mouse in the real terminal.
+#[test]
+fn search_window_browses_occurrences_without_tab() {
+    let root = tempfile::tempdir().unwrap();
+    let file = root.path().join("fruit.txt");
+    std::fs::write(&file, "green apple\napple tree\nbaked apple\n").unwrap();
+    let mut process = PtyChild::editor_with_path(Some("xterm-256color"), Some(&file));
+    process.expect_status("Ln 1 Col 1");
+    process.send(b"\x06");
+    process.expect("Options");
+    process.click_label("Options", 1);
+    process.expect("Match Whole Word");
+    process.click_label("Options", 1);
+    process.send(b"\x1b[Aapple\r");
+    process.expect("1 of 3 matches");
+    process.click_label("2:1", 1);
+    process.expect_status("Ln 2 Col 1");
+    process.send(b"\x1b[B");
+    process.expect_status("Ln 3 Col 7");
+    process.expect("3 of 3 matches");
+    process.send(b"\x1b");
+    process.expect_absent("Options");
+    process.send(b"\x11");
+    assert!(process.wait().success());
+}
+
+/// The end of a dense list is reachable, and scrolling the list never moves the caret.
+#[test]
+fn search_window_pages_and_replaces_a_deep_match() {
+    let root = tempfile::tempdir().unwrap();
+    let file = root.path().join("fruit.txt");
+    std::fs::write(&file, "apple\n".repeat(60)).unwrap();
+    let mut process = PtyChild::editor_with_path(Some("xterm-256color"), Some(&file));
+    process.expect_status("Ln 1 Col 1");
+    process.send(b"\x08apple\r");
+    process.expect("1 of 60 matches");
+    process.click_label("2:1", 1);
+    process.expect_status("Ln 2 Col 1");
+    process.send(b"\x1b[F");
+    process.expect_status("Ln 60 Col 1");
+    process.expect("60 of 60 matches");
+    let row = process
+        .parser
+        .screen()
+        .rows(0, 80)
+        .position(|row| row.contains("60:1"))
+        .unwrap()
+        + 1;
+    process.send(format!("\x1b[<64;35;{row}M").as_bytes());
+    process.expect("56:1");
+    process.expect_status("Ln 60 Col 1");
+    process.click_label("57:1", 1);
+    process.expect_status("Ln 57 Col 1");
+    process.click_label("[Replace Next]", 1);
+    process.expect("Removed · 57:1");
+    process.expect_status("Ln 58 Col 1");
+    process.expect("57 of 59 matches");
+    process.send(b"\x1b");
+    process.expect_absent("Options");
+    process.send(b"\x1a");
+    process.expect_body("apple", TIMEOUT);
+    process.send(b"\x11");
+    assert!(process.wait().success());
+}
+
+/// All-open occurrence navigation can activate a different tab's unsaved text.
+#[test]
+fn search_window_jumps_to_another_unsaved_tab() {
+    let root = tempfile::tempdir().unwrap();
+    let left = root.path().join("left.txt");
+    let right = root.path().join("right.txt");
+    std::fs::write(&left, "apple left\n").unwrap();
+    std::fs::write(&right, "prefix\nright\n").unwrap();
+    let mut process = PtyChild::editor_with_options(
+        Some("xterm-256color"),
+        [left.as_os_str(), right.as_os_str()],
+        None,
+        Some(root.path()),
+        None,
+    );
+    process.expect_body("apple left", TIMEOUT);
+    process.send(b"\x1b[19~");
+    process.expect_body("prefix", TIMEOUT);
+    process.expect_status("Ready | Ln 1 Col 1");
+    process.send(b"\x1b[B");
+    process.expect_status("Ln 2 Col 1");
+    process.send(b"\x1b[200~apple \x1b[201~");
+    process.expect_body("apple right", TIMEOUT);
+    process.send(b"\x1b[19~");
+    process.expect_body("apple left", TIMEOUT);
+    process.send(b"\x06");
+    process.click_label("Options", 1);
+    process.click_label("[Current]", 1);
+    process.click_label("Find:", 1);
+    process.send(b"apple\r");
+    process.expect("1 of 2 matches");
+    process.click_label("2:1 right.txt", 1);
+    process.expect_body("apple right", TIMEOUT);
+    process.expect_status("Ln 2 Col 1");
+    process.expect("2 of 2 matches");
+    process.send(b"\x1b");
+    process.expect_absent("Options");
+    process.send(b"\x1a");
+    process.expect_absent("apple");
+    process.expect_body("right", TIMEOUT);
+    process.send(b"\x11");
+    assert!(process.wait().success());
+}
+
+/// A compact search shows its result count and keeps list focus across terminal resize.
+#[test]
+fn search_window_compact_results_survive_resize() {
+    let root = tempfile::tempdir().unwrap();
+    let file = root.path().join("fruit.txt");
+    std::fs::write(&file, "apple\napple\napple\n").unwrap();
+    let mut process = PtyChild::editor_with_path(Some("xterm-256color"), Some(&file));
+    process.expect_status("Ln 1 Col 1");
+    process.resize(40, 8);
+    process.send(b"\x06apple\r");
+    process.expect("3 matches");
+    process.click_label("[Results]", 1);
+    process.expect("1 of 3 matches");
+    process.send(b"\x1b[B");
+    process.expect_status("Ln 2 Col 1");
+    process.expect("2 of 3 matches");
+    process.resize(80, 24);
+    process.expect("Match Whole Word off");
+    process.send(b"\x1b[B");
+    process.expect_status("Ln 3 Col 1");
+    process.send(b"\x1b");
+    process.expect_absent("Options");
+    process.send(b"\x11");
+    assert!(process.wait().success());
+}
+
 /// A dirty outside dismissal preserves the pending field and requires an explicit choice.
 #[test]
 fn settings_outside_click_protects_unaccepted_text() {
@@ -773,12 +908,20 @@ fn literal_replace_all_confirmation_and_undo() {
     terminal.expect("one two one");
     terminal.send(b"\x08");
     terminal.expect("Replace:");
-    terminal.send(b"one\t1\t\t\t\t\t\t\t\r");
+    terminal.send(b"one\t1");
+    terminal.click_label("[Replace All]", 1);
+    terminal.expect("Replace all — confirm scope");
+    terminal.expect(">Cancel<");
+    terminal.send(b"\x1b");
+    terminal.expect_absent("confirm scope");
+    terminal.expect_body("one two one", TIMEOUT);
+    terminal.send(b"\r");
     terminal.expect("Replace all — confirm scope");
     terminal.send(b"\t\r");
     terminal.expect("2 occurrences processed");
+    terminal.expect("Replaced ·");
     terminal.send(b"\x1b");
-    terminal.expect_absent("Replace all…");
+    terminal.expect_absent("Options");
     terminal.expect("1 two 1");
     terminal.send(b"\x1a");
     terminal.expect("one two one");
@@ -2190,12 +2333,13 @@ fn replaced_scratch_is_restored_after_normal_quit() {
         Some(&profile),
     );
     first.new_scratch();
-    first.send(b"one two one\x08one\t1\t\t\t\t\t\t\t\r");
+    first.send(b"one two one\x08one\t1");
+    first.click_label("[Replace All]", 1);
     first.expect("Replace all — confirm scope");
     first.send(b"\t\r");
     first.expect("2 occurrences processed");
     first.send(b"\x1b");
-    first.expect_absent("Replace all…");
+    first.expect_absent("Options");
     first.send(b"\x11");
     assert!(first.wait().success());
     first.assert_restored();
@@ -3664,7 +3808,8 @@ fn large_search_and_replace_benchmark() {
         thread::sleep(Duration::from_millis(1));
     };
     let cancellation = cancel_started.elapsed();
-    process.send(b"\x08\x7fSEEK_TOKEN\tFOUND_DONE\t\t\t\t\t\t\t\r");
+    process.send(b"\x08\x7fSEEK_TOKEN\tFOUND_DONE");
+    process.click_label("[Replace All]", 1);
     process.expect("Replace all — confirm scope");
     let replace_started = Instant::now();
     process.send(b"\t\r");
@@ -3680,7 +3825,7 @@ fn large_search_and_replace_benchmark() {
     let replacement = replace_started.elapsed();
     peak_rss = peak_rss.max(rss());
     process.send(b"\x1b");
-    process.expect_absent("Replace all…");
+    process.expect_absent("Options");
     let save_started = Instant::now();
     process.send(b"\x13");
     // Guarded Save rereads both the destination and the private captured revision.

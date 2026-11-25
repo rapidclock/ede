@@ -567,6 +567,10 @@ fn effect(
                         | Action::CancelOpen(_)
                         | Action::CancelActiveOpen(_)
                 ) || matches!(action, Action::RemoveTab(tab) if Some(tab) == app.screen.tab);
+                let search_page = match &action {
+                    Action::SearchPage(request) => Some(*request),
+                    _ => None,
+                };
                 if editor.submit(action) {
                     if let Some(after) = guard {
                         app.expect_guard_for(editor.sequence(), after);
@@ -580,6 +584,9 @@ fn effect(
                     app.pending = true;
                     app.dirty = true;
                 } else {
+                    if let Some(request) = search_page {
+                        app.search_page_rejected(request);
+                    }
                     let message = "Busy: input rejected; retry when ready";
                     // Keep rejection visible even when a pending worker immediately
                     // replaces the status row with its next ordinary completion.
@@ -1159,10 +1166,9 @@ mod tests {
         let area = Rect::new(0, 0, 80, 24);
         let layout = LayoutSnapshot::for_app(area, &app, 1);
         app.input(Input::Command(Command::Find), &layout);
-        app.screen.search = std::sync::Arc::new(crate::editor::search::Status {
-            busy: true,
-            ..Default::default()
-        });
+        let mut search = crate::editor::search::Status::default();
+        search.busy = true;
+        app.screen.search = std::sync::Arc::new(search);
         let layout = LayoutSnapshot::for_app(area, &app, 2);
         let outside = |kind| {
             Input::Pointer(MouseEvent {

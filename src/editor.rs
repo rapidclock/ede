@@ -211,6 +211,7 @@ pub(crate) enum After {
 #[derive(Clone, Debug)]
 pub(crate) enum Action {
     Search(search::SearchRequest),
+    SearchPage(search::results::PageRequest),
     CancelSearch,
     InvalidateSearch,
     InvalidateReplacement,
@@ -304,6 +305,7 @@ impl Action {
                     || matches!(
                         self,
                         Self::Search(_)
+                            | Self::SearchPage(search::results::PageRequest { jump: Some(_), .. })
                             | Self::Guard(_)
                             | Self::RemoveTab(_)
                             | Self::New
@@ -729,6 +731,11 @@ impl Editor {
             ) {
                 request.replacement_scope = Some(self.view_cancel.replacement_scope());
             }
+        }
+        if let Action::SearchPage(request) = dispatched
+            && request.jump.is_some()
+        {
+            request.navigation = Some(self.view_cancel.search_navigation.load(Ordering::Acquire));
         }
         let envelope = Envelope {
             action,
@@ -1590,11 +1597,13 @@ impl Coordinator {
                 | Action::OpenRetained { .. }
                 | Action::DiscardRetained { .. }
                 | Action::Size(..)
+                | Action::SearchPage(..)
         ) {
             self.reconcile_edit()?;
         }
         match action {
             Action::Search(request) => self.start_search(request)?,
+            Action::SearchPage(request) => self.search.page(request),
             Action::CancelSearch | Action::InvalidateSearch => self
                 .search
                 .cancel(matches!(action, Action::InvalidateSearch)),
@@ -3430,7 +3439,99 @@ mod search_tests {
             replacement: "123456789".into(),
             all: false,
             operation,
+            browse: false,
+            expected: None,
         }
+    }
+
+    /// A later replacement may not edit the previous match while a chosen row is unresolved.
+    #[test]
+    fn pending_result_selection_cannot_replace_previous_match() {
+        let (mut worker, reached, release) = gated("ede-search-page");
+        worker.add_new().unwrap();
+        worker.action(Action::Insert("one one".into())).unwrap();
+        worker
+            .action(Action::Command(Command::Move(Movement::Start, false)))
+            .unwrap();
+        let mut find = request(search::Operation::Next);
+        find.browse = true;
+        worker.action(Action::Search(find)).unwrap();
+        settle(&mut worker);
+        assert_eq!(worker.search.status.current.as_ref().unwrap().range, 0..3);
+        let generation = worker.search.status.rows.generation;
+        let navigation = worker
+            .view_cancel
+            .search_navigation
+            .fetch_add(1, Ordering::AcqRel)
+            + 1;
+        worker
+            .action(Action::SearchPage(search::results::PageRequest {
+                generation,
+                start: 0,
+                jump: Some(1),
+                navigation: Some(navigation),
+            }))
+            .unwrap();
+        worker.poll_background();
+        reached.recv_timeout(Duration::from_secs(5)).unwrap();
+        worker
+            .view_cancel
+            .search_navigation
+            .fetch_add(1, Ordering::AcqRel);
+        let mut replace = request(search::Operation::ReplaceNext);
+        replace.browse = true;
+        replace.expected = Some((generation, 1));
+        let result = worker.action(Action::Search(replace));
+        release.send(()).unwrap();
+        settle(&mut worker);
+        assert_eq!(super::tests::contents(&mut worker), "one one");
+        assert!(matches!(result, Err(Error::StaleRevision)));
+    }
+
+    /// A folded no-op stays live while a changed occurrence also gets a receipt.
+    #[test]
+    fn replacement_feedback_records_only_actual_changes_and_clears_on_undo() {
+        let mut worker = super::tests::coordinator(OpenOptions::default());
+        worker.action(Action::Insert("one ONE one".into())).unwrap();
+        let mut replace = request(search::Operation::ReplaceAll);
+        replace.browse = true;
+        replace.query.match_case = false;
+        replace.replacement = "one".into();
+        worker.action(Action::Search(replace)).unwrap();
+        settle(&mut worker);
+        let rows = &worker.search.status.rows;
+        assert_eq!((rows.count, rows.live), (4, 3));
+        worker
+            .action(Action::SearchPage(search::results::PageRequest {
+                generation: rows.generation,
+                start: 0,
+                jump: None,
+                navigation: None,
+            }))
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while worker.search.status.rows.page.is_empty() {
+            assert!(Instant::now() < deadline, "replacement page did not arrive");
+            worker.poll_background();
+            thread::yield_now();
+        }
+        let mut changed = worker
+            .search
+            .status
+            .rows
+            .page
+            .iter()
+            .filter(|row| row.change.is_some());
+        let receipt = changed.next().unwrap();
+        assert_eq!(
+            (receipt.column, receipt.matched.as_str(), receipt.change),
+            (5, "ONE", Some("Replaced"))
+        );
+        assert!(changed.next().is_none());
+        worker.action(Action::Command(Command::Undo)).unwrap();
+        worker.poll_background();
+        assert_eq!(super::tests::contents(&mut worker), "one ONE one");
+        assert_eq!(worker.search.status.rows.count, 0);
     }
 
     /// Cancelling automatic navigation retains the replacement already acknowledged.
@@ -3705,11 +3806,14 @@ mod search_tests {
         }
         let mut request = request(search::Operation::ReplaceAll);
         request.all = true;
+        request.browse = true;
         worker.action(Action::Search(request.clone())).unwrap();
         settle(&mut worker);
         assert_eq!(worker.search.status.processed, 64);
         assert_eq!(worker.search.status.changed, 64);
         assert_eq!(worker.search.status.outcomes.len(), 64);
+        assert_eq!(worker.search.status.rows.count, 64);
+        assert!(!worker.search.status.rows.feedback_incomplete);
         request.operation = search::Operation::Next;
         request.query.literal = request.replacement.clone();
         for _ in 0..20 {
@@ -3723,6 +3827,7 @@ mod search_tests {
         worker.action(Action::Search(request)).unwrap();
         settle(&mut worker);
         assert_eq!(worker.search.status.total(), 64);
+        assert_eq!(worker.search.status.rows.live, 64);
         let document = worker.document().unwrap();
         let Response::Stats { usage, .. } = worker.call(Request::Stats(document)).unwrap() else {
             panic!("expected storage usage");
@@ -4047,6 +4152,8 @@ mod search_tests {
             replacement: "1".into(),
             all: false,
             operation: search::Operation::Next,
+            browse: false,
+            expected: None,
         };
         worker.action(Action::Search(request.clone())).unwrap();
         settle(&mut worker);

@@ -374,6 +374,7 @@ impl AppState {
     }
     /// Preserve valid focus and invalidate capture after geometry or overlay changes.
     pub fn sync_layout(&mut self, layout: &LayoutSnapshot) {
+        self.search.visible_results = layout.search_result_rows();
         if let Some(Modal::Open(picker)) = &mut self.modal {
             picker.top = picker.list_start(layout.list_rows());
         }
@@ -461,6 +462,7 @@ impl AppState {
             .as_ref()
             .map_or(screen.message.as_str(), |feedback| feedback.message);
         self.notify(StatusMessage::new(Severity::Info, message));
+        self.sync_search_selection(&screen.search.rows);
         self.screen = screen;
         self.pending = pending;
         self.dirty = true;
@@ -636,11 +638,11 @@ impl AppState {
                 }
                 self.dirty = true;
                 if let Some(field) = pending.search_field {
-                    return Some(Intent::Editor(if field == 1 {
-                        Action::InvalidateReplacement
+                    return Some(if field == 1 {
+                        Intent::Editor(Action::InvalidateReplacement)
                     } else {
-                        Action::InvalidateSearch
-                    }));
+                        self.invalidate_search_rows()
+                    });
                 }
             }
         }
@@ -929,7 +931,12 @@ impl AppState {
             Some(Modal::Settings) => Context::Settings,
             Some(_) => Context::Dialog,
             None if self.help || self.guard_request.is_some() => Context::Dialog,
-            None if self.search.open && matches!(self.focus, Some(Control::Search(_))) => {
+            None if self.search.open
+                && matches!(
+                    self.focus,
+                    Some(Control::Search(_) | Control::SearchList | Control::SearchResult(_))
+                ) =>
+            {
                 Context::Search
             }
             None if self.focus == Some(Control::Content) => Context::Editor,
@@ -1867,24 +1874,19 @@ impl AppState {
             }
             return None;
         }
-        if self.search.open
-            && self.modal.is_none()
-            && matches!(
-                layout.hit(mouse.column, mouse.row),
-                Some(Control::Search(_))
-            )
+        if layout
+            .search_bounds()
+            .is_some_and(|area| area.contains((mouse.column, mouse.row).into()))
             && matches!(
                 mouse.kind,
                 MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
             )
         {
-            let controls = self.search.controls();
-            self.search.row = if mouse.kind == MouseEventKind::ScrollUp {
-                self.search.row.saturating_sub(1)
-            } else {
-                (self.search.row + 1).min(controls.len().saturating_sub(2))
-            };
-            self.dirty = true;
+            self.search_wheel(
+                mouse.kind == MouseEventKind::ScrollUp,
+                layout,
+                layout.search_result_hit(mouse.column, mouse.row),
+            );
             return None;
         }
         if matches!(
@@ -1946,7 +1948,13 @@ impl AppState {
                     y: mouse.row,
                 });
                 if let Some(control) = hit.filter(|control| {
-                    !matches!(control, Control::PaneOutside | Control::TabClose(_))
+                    !matches!(
+                        control,
+                        Control::PaneOutside
+                            | Control::TabClose(_)
+                            | Control::SearchSurface
+                            | Control::SearchList
+                    )
                 }) {
                     self.focus = Some(control);
                     self.dirty = true;
@@ -2196,6 +2204,9 @@ impl AppState {
                 .or(Some(Control::PathField));
             return self.command(Command::Newline, layout);
         }
+        if let Some(intent) = self.search_fetch(layout) {
+            return Some(intent);
+        }
         if now.saturating_sub(self.last_drag) < Duration::from_millis(50) {
             return None;
         }
@@ -2303,6 +2314,16 @@ impl AppState {
     }
     /// Paste completion targets its original field even after the user changes focus.
     fn apply_target_field_edit(&mut self, target: Option<u8>, edit: FieldEdit) -> bool {
+        use unicode_segmentation::UnicodeSegmentation;
+
+        let offset = target.map(|field| {
+            let text = if field == 1 {
+                &self.search.replacement
+            } else {
+                &self.search.query.literal
+            };
+            self.search.field_cursor(field, text)
+        });
         let field = if let Some(field) = target {
             if field == 1 {
                 &mut self.search.replacement
@@ -2320,17 +2341,32 @@ impl AppState {
                 _ => return false,
             }
         };
-        match edit {
+        let caret = match edit {
             FieldEdit::Text(text) => {
                 if field.len() + text.len() > 4096 || text.contains('\0') {
                     self.field_message("Invalid or oversized field paste/input");
                     return false;
                 }
-                field.push_str(&text);
+                let offset = offset.unwrap_or(field.len());
+                field.insert_str(offset, &text);
+                offset + text.len()
             }
             FieldEdit::Backspace => {
-                field.pop();
+                if let Some(offset) = offset {
+                    let start = field[..offset]
+                        .grapheme_indices(true)
+                        .next_back()
+                        .map_or(0, |(start, _)| start);
+                    field.replace_range(start..offset, "");
+                    start
+                } else {
+                    field.pop();
+                    field.len()
+                }
             }
+        };
+        if let Some(target) = target {
+            self.search.set_field_cursor(target, caret);
         }
         self.field_error = None;
         self.dirty = true;

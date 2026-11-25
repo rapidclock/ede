@@ -300,7 +300,7 @@ impl Default for Keymap {
                 C::Move(movement, true),
                 Some(Chord(code, modifiers | M::SHIFT)),
             );
-            for context in [X::Dialog, X::Picker, X::Settings] {
+            for context in [X::Search, X::Dialog, X::Picker, X::Settings] {
                 map.add(
                     context,
                     C::Move(movement, false),

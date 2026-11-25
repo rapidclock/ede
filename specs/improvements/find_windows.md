@@ -1,7 +1,8 @@
 # Improvement Spec — Find and Find & Replace windows
 
-**Status** — Design draft for review. Implementation and validation are pending.
+**Status** — Implemented and locally validated for review.
 **Release** — User-confirmed patch target `0.1.2`, from `0.1.1` on `main`.
+The review build is `0.1.2-dev.1`.
 **Branch** — `enhance/find-windows`, based on `main` at `3004bb3`.
 
 ## Current behavior and scope
@@ -48,8 +49,8 @@ result status have distinct text cues for monochrome terminals.
 │ Replace [ pear                                      ] │
 │                          [Replace Next] [Replace All] │
 │ ⌄ Options                                             │
-│   [x] Match case  [ ] Match Whole Word     [All open] │
-│   Insert [Tab] [LF] [CRLF]                            │
+│   [x] Match case  [ ] Match Whole Word                 │
+│   Insert [Tab] [LF] [CRLF]                  [All open] │
 │ [Previous] [Next]                     1 of 26 matches │
 │   notes.txt  3:7    Replaced · green apple            │
 │ > notes.txt 12:1    apple tree                        │
@@ -187,15 +188,31 @@ result status have distinct text cues for monochrome terminals.
   rendering and the Settings Save button styling in `src/ui.rs`. Incorporated
   the requested action placement, labels, color distinctions, and disclosure
   style into both sketches.
-- Pending — A1–A2 layout and input checks in a PTY and an interactive terminal
-  with mouse capture. Check standard and minimum dimensions and resizing.
-- Pending — A3–A6 focused Rust and PTY tests for navigation, bounded result
-  access, invalidation, cancellation, replacement feedback, and integrity.
-  Control the ordering of delayed results and input in race tests. Check that
-  a deliberate break in any changed data-protection guard fails its assertion.
-  Run relevant regressions, `cargo fmt --check`, and Clippy after implementation.
-- Open design choices — Window placement, the collapsed default, key mappings,
-  and the lifetime of replacement feedback are proposed for review. Compact
-  layout details and bounded result storage remain implementation choices.
-- Next step — Review the draft with the user. Implementation requires separate
-  authorization. No runtime validation has been performed for this draft.
+- Test-first check — The new occurrence-navigation PTY test failed against
+  the bottom dock because the Options heading was missing.
+- A1–A3 — Terminal-cell color and alignment assertions, plus real PTY tests
+  at `80×24` and `40×8`, cover Options, resizing, mouse and arrow navigation,
+  wheel scrolling without a caret jump, and a jump into an unsaved tab.
+  The 64-tab search and replacement test passed with a 256-file limit.
+- A4–A6 — A gated page-read test held a selection unresolved while a replace
+  request arrived. An isolated removal of the expected-selection guard made
+  the content assertion fail by replacing the preceding occurrence. Focused
+  tests cover confirmation and cancel, non-wrapping advancement, undo,
+  deletion deep in the list, and live versus replaced case-folded matches.
+- Implementation — The compact window switches between a scrollable form and
+  the list. The coordinator spools exact ranges to temporary storage and
+  prepares at most 16 previews per request on a worker. Single-occurrence
+  replacement feedback appears near its original match position.
+- Independent review — The separate reviewer rechecked selection authority,
+  snapshot leases, passive scrolling, and single-occurrence feedback after
+  the fixes. The review found no remaining high-severity issues in those
+  paths.
+- Regression run — On arm64 macOS with Rust `1.100.0`, formatting and
+  workspace Clippy passed. The full locked workspace suite passed with 379
+  tests passing and 10 existing ignored tests, with the CI 256-file limit and
+  native controlling-terminal access. Linux release benchmarks remain
+  unverified for this build.
+- Release baseline — Fetched upstream before handoff. `origin/main` remained
+  at `3004bb3` with package version `0.1.1`. Finalizing `0.1.2` awaits
+  explicit release approval.
+- Authorization — The user requested implementation on 2026-11-24.

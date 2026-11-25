@@ -716,15 +716,18 @@ impl Checkpoints {
 pub(crate) fn safe(text: &str) -> String {
     let mut result = String::new();
     for ch in text.chars() {
-        if ch.is_control()
-            || matches!(ch, '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
-        {
+        if ch.is_control() || is_bidi_format(ch) {
             result.push_str(&format!("<U+{:04X}>", ch as u32));
         } else {
             result.push(ch);
         }
     }
     result
+}
+
+/// Direction-changing formatting that the editor displays as escaped text.
+pub(crate) fn is_bidi_format(ch: char) -> bool {
+    matches!(ch, '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
 }
 
 #[cfg(test)]

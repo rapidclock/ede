@@ -16,6 +16,7 @@ use ratatui::{
 };
 use std::ops::Range;
 use unicode_width::UnicodeWidthStr;
+mod search;
 
 /// Blank terminal cells between adjacent workspace buttons.
 const WORKSPACE_BUTTON_GAP: u16 = 2;
@@ -31,6 +32,9 @@ pub(crate) enum Control {
     SettingsGroupStep(bool),
     UseDefaults,
     Search(u8),
+    SearchSurface,
+    SearchList,
+    SearchResult(u64),
     Content,
     WelcomeOpen,
     WelcomeNew,
@@ -91,11 +95,12 @@ impl Control {
             | Self::SettingsGroup(_)
             | Self::SettingsGroupStep(_)
             | Self::PaneOutside
+            | Self::SearchSurface
             | Self::TabClose(_)
             | Self::TabDivider => None,
             Self::UseDefaults => Some(Command::Cancel),
             Self::Search(0 | 1) => None,
-            Self::Search(_) => Some(Command::Activate),
+            Self::Search(_) | Self::SearchList | Self::SearchResult(_) => Some(Command::Activate),
             Self::Content
             | Self::PathField
             | Self::Tab(_)
@@ -129,7 +134,7 @@ impl Control {
             Self::UseDefaults => "Use defaults for this session",
             Self::WelcomeOpen => "Open File",
             Self::WelcomeNew => "New Scratch",
-            Self::Search(_) => "",
+            Self::Search(_) | Self::SearchSurface | Self::SearchList | Self::SearchResult(_) => "",
             Self::Content
             | Self::PathField
             | Self::Tab(_)
@@ -193,7 +198,7 @@ pub(crate) struct Signature {
     picker_revision: u64,
     picker_request: u64,
     switching: Option<u64>,
-    search: Option<(bool, usize)>,
+    search: Option<search::Signature>,
     stream: bool,
     stream_confirmation: bool,
     settings_epoch: u64,
@@ -212,15 +217,25 @@ pub(crate) struct LayoutSnapshot {
     pub signature: Signature,
     targets: Vec<Target>,
     list_rows: u16,
+    search_window: Option<Rect>,
+    search_list: Option<Rect>,
 }
 impl LayoutSnapshot {
-    /// The docked search controls and summary occupy three rows above the status bar.
+    /// The non-modal window covers part of the editor's otherwise full viewport.
     pub(crate) fn search_bounds(&self) -> Option<Rect> {
-        (self.area.width >= 40 && self.area.height >= 8 && self.signature.search.is_some())
-            .then(|| Rect::new(self.area.x, self.area.bottom() - 4, self.area.width, 3))
+        self.search_window
     }
 
-    /// Actual text viewport leaves room for the non-modal search controls.
+    pub(crate) fn search_result_rows(&self) -> u16 {
+        self.search_list.map_or(0, |list| list.height)
+    }
+
+    pub(crate) fn search_result_hit(&self, x: u16, y: u16) -> bool {
+        self.search_list
+            .is_some_and(|list| list.contains((x, y).into()))
+    }
+
+    /// Actual editor text viewport height, including cells underneath a floating window.
     pub(crate) fn content_height(&self) -> u16 {
         self.targets
             .iter()
@@ -240,6 +255,8 @@ impl LayoutSnapshot {
             },
             targets: Vec::new(),
             list_rows: 0,
+            search_window: None,
+            search_list: None,
         };
         if area.width < 40 || area.height < 8 {
             return result;
@@ -326,10 +343,7 @@ impl LayoutSnapshot {
             picker_revision,
             picker_request,
             switching: app.switching,
-            search: app
-                .search
-                .open
-                .then_some((app.search.replace, app.search.row)),
+            search: app.search.open.then(|| search::Signature::new(app)),
             stream: app.screen.stream.is_some(),
             stream_confirmation: app.stream_confirmation.is_some(),
             settings_epoch: app.settings_generation,
@@ -380,26 +394,7 @@ impl LayoutSnapshot {
                     );
                 }
                 if app.search.open {
-                    if let Some(content) = result
-                        .targets
-                        .iter_mut()
-                        .find(|t| t.control == Control::Content)
-                    {
-                        content.area.height = content.area.height.saturating_sub(3);
-                    }
-                    for (row, index) in app
-                        .search
-                        .controls()
-                        .into_iter()
-                        .skip(app.search.row)
-                        .take(2)
-                        .enumerate()
-                    {
-                        result.add(
-                            Control::Search(index),
-                            Rect::new(area.x, area.bottom() - 4 + row as u16, area.width, 1),
-                        );
-                    }
+                    result.add_search_window(app);
                 }
             }
             return result;
@@ -865,6 +860,8 @@ impl LayoutSnapshot {
                 Control::PickerRow(_)
                     | Control::TabListRow(_)
                     | Control::RecoveryRow(_)
+                    | Control::SearchSurface
+                    | Control::SearchResult(_)
                     | Control::TabDivider
             )
         })
@@ -1184,23 +1181,10 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &AppState, layout: &LayoutSnaps
                     if range.start >= span.bytes.end || range.end <= span.bytes.start {
                         continue;
                     }
-                    let (lo, hi) = if let Some((bytes, cells)) = span.unit {
-                        let (bytes, cells) = (u64::from(bytes), u64::from(cells));
-                        (
-                            span.column
-                                + range.start.saturating_sub(span.bytes.start) / bytes * cells,
-                            span.column
-                                + range
-                                    .end
-                                    .min(span.bytes.end)
-                                    .saturating_sub(span.bytes.start)
-                                    .div_ceil(bytes)
-                                    * cells,
-                        )
-                    } else {
-                        (span.column, span.column + span.width)
-                    };
-                    for column in lo.max(view.left)..hi.min(view.left + u64::from(area.width)) {
+                    let columns = columns_for_range(span, range);
+                    for column in columns.start.max(view.left)
+                        ..columns.end.min(view.left + u64::from(area.width))
+                    {
                         let style = Style::default()
                             .bg(if selected {
                                 Color::Magenta
@@ -1305,29 +1289,8 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &AppState, layout: &LayoutSnaps
             1,
         ),
     );
-    if app.search.open && app.modal.is_none() && !app.help {
-        let status = &app.screen.search;
-        let mut text = if status.busy {
-            format!(
-                "{} | {}/{} bytes; {} matches",
-                status.message,
-                status.progress.scanned,
-                status.progress.total,
-                status.progress.matches
-            )
-        } else {
-            status.message.clone()
-        };
-        if let Some(error) = &app.field_error {
-            text = error.clone();
-        }
-        if status.partial_highlighting {
-            text.push_str(" | Partial highlighting");
-        }
-        frame.render_widget(
-            Paragraph::new(text),
-            Rect::new(area.x, area.bottom() - 2, area.width, 1),
-        );
+    if let Some(window) = layout.search_bounds() {
+        search::render(frame, app, layout, window);
     }
     if let Some(overlay) = layout.overlay {
         if matches!(app.modal, Some(Modal::Settings)) {
@@ -1622,6 +1585,17 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &AppState, layout: &LayoutSnaps
         }
     }
     for target in &layout.targets {
+        if layout.search_bounds().is_some()
+            && matches!(
+                target.control,
+                Control::Search(_)
+                    | Control::SearchSurface
+                    | Control::SearchList
+                    | Control::SearchResult(_)
+            )
+        {
+            continue;
+        }
         if target.control == Control::TabDivider {
             frame.render_widget(Paragraph::new("│"), target.area);
             continue;
@@ -1769,62 +1743,25 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &AppState, layout: &LayoutSnaps
         ) {
             continue;
         }
-        if let Control::Search(index) = target.control {
-            let label = if index <= 1 {
-                let (prefix, field) = if index == 0 {
-                    ("Find: ", &app.search.query.literal)
-                } else {
-                    ("Replace: ", &app.search.replacement)
-                };
-                format!(
-                    "{prefix}{}",
-                    tail_cells(
-                        &crate::app::search::display(field),
-                        target.area.width.saturating_sub(prefix.len() as u16 + 2)
-                    )
-                )
-            } else {
-                let label = app.search.label(index);
-                let command = match index {
-                    5 => Some(Command::FindPrevious),
-                    6 => Some(Command::FindNext),
-                    7 => Some(Command::ReplaceNext),
-                    8 => Some(Command::ReplaceAll),
-                    9 => Some(Command::CancelSearch),
-                    _ => None,
-                };
-                let keys = command
-                    .map(|command| app.settings.applied.map.shortcuts(Context::Global, command))
-                    .unwrap_or_default();
-                if keys.is_empty() {
-                    label
-                } else {
-                    format!("{label} ({keys})")
-                }
-            };
+        if let Control::Search(index @ (15 | 16)) = target.control {
+            let label = app.search.label(index);
             let focused = app.focus == Some(target.control);
-            let style = if focused {
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD)
+            let text = if focused {
+                format!(">{label}<")
             } else {
-                Style::default()
+                format!("[{label}]")
+            };
+            let color = if index == 15 {
+                Some(Color::Yellow)
+            } else if focused {
+                Some(Color::Cyan)
+            } else {
+                None
             };
             frame.render_widget(
-                Paragraph::new(tail_cells(
-                    &format!("{}{label}", if focused { ">" } else { " " }),
-                    target.area.width,
-                ))
-                .style(style),
+                Paragraph::new(text).style(button_style(color, focused)),
                 target.area,
             );
-            if focused && index <= 1 {
-                frame.set_cursor_position((
-                    target.area.x
-                        + (label.width() as u16 + 1).min(target.area.width.saturating_sub(1)),
-                    target.area.y,
-                ));
-            }
             continue;
         }
         let focused = app.focus == Some(target.control);
@@ -2167,6 +2104,21 @@ fn render_run(frame: &mut Frame<'_>, span: &Span, selection: &Range<u64>, start:
     }
 }
 /// Shared occupied-cell selection styling for full and clipped run fragments.
+/// Convert a byte intersection into the terminal cells used to paint it.
+fn columns_for_range(span: &Span, range: &Range<u64>) -> Range<u64> {
+    let Some((bytes, cells)) = span.unit else {
+        return span.column..span.column + span.width;
+    };
+    let (bytes, cells) = (u64::from(bytes), u64::from(cells));
+    let start = range.start.saturating_sub(span.bytes.start) / bytes;
+    let end = range
+        .end
+        .min(span.bytes.end)
+        .saturating_sub(span.bytes.start)
+        .div_ceil(bytes);
+    span.column + start * cells..span.column + end * cells
+}
+
 fn selection_style(selected: bool) -> Style {
     if selected {
         Style::default().bg(Color::Blue).fg(Color::White)

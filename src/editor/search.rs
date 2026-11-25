@@ -2,6 +2,8 @@
 use super::*;
 use crate::search::{Progress, Query, ScanOptions, validate_field};
 use std::ops::Range;
+pub(crate) mod results;
+use results::{Index, PageRequest, Results, Rows, Writer};
 
 /// Named search intent, independent of keyboard, mouse, and panel focus.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -11,6 +13,7 @@ pub(crate) enum Operation {
     ReplaceNext,
     ReplaceAll,
     Decorate,
+    List,
 }
 
 /// Bounded captured fields; all-open membership is captured when admitted.
@@ -22,6 +25,8 @@ pub(crate) struct SearchRequest {
     pub replacement: String,
     pub all: bool,
     pub operation: Operation,
+    pub browse: bool,
+    pub expected: Option<(u64, u64)>,
 }
 
 /// Replacement authority at queue admission, including streams that must be skipped.
@@ -32,7 +37,7 @@ pub(crate) struct ReplacementScope {
 }
 
 /// Exact search range is separate from the grapheme-safe ordinary caret/selection.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct Found {
     pub tab: TabId,
     pub document: DocumentId,
@@ -66,6 +71,8 @@ pub(crate) struct Status {
     pub changed: usize,
     /// One completed ReplaceNext remains distinct from its follow-up match counts.
     pub replacement_ack: Option<Outcome>,
+    replacement_outcomes: Vec<Outcome>,
+    pub rows: Rows,
 }
 impl Status {
     pub(crate) fn total(&self) -> u64 {
@@ -93,6 +100,23 @@ impl Status {
                 outcome.count, outcome.message
             ));
         }
+        for outcome in &self.replacement_outcomes {
+            let label = tabs.iter().find(|tab| tab.id == outcome.tab).map_or_else(
+                || format!("Closed tab {}", outcome.tab.0),
+                |tab| tab.label.to_string(),
+            );
+            text.push_str(&format!(
+                "\nReplacement: {label}; {} processed; {}",
+                outcome.count, outcome.message
+            ));
+        }
+        if self.rows.feedback_incomplete {
+            text.push_str("\nReplacement feedback incomplete");
+        }
+        if let Some(error) = &self.rows.error {
+            text.push('\n');
+            text.push_str(error);
+        }
         text
     }
 }
@@ -113,6 +137,8 @@ pub(super) struct State {
     operation: Option<Operation>,
     maintenance: Vec<(TabId, Option<u64>)>,
     maintaining: Option<Maintenance>,
+    results: Results,
+    result_scope: Option<(bool, Option<TabId>)>,
 }
 /// One private reclamation shares the search worker budget and yields to user work.
 struct Maintenance {
@@ -139,6 +165,7 @@ struct Run {
     read_only: Vec<TabId>,
     progress: Arc<Mutex<Progress>>,
     previous_message: String,
+    receipts_started: bool,
 }
 struct Worker {
     tab: TabId,
@@ -146,9 +173,10 @@ struct Worker {
 }
 enum Finished {
     Scanned(ScanResult),
-    Prepared(Box<document::PreparedEdit>, u64),
-    Mapped(Box<document::PreparedEdit>, u64, Mapping),
+    Prepared(Box<document::PreparedEdit>, u64, Receipt),
+    Mapped(Box<document::PreparedEdit>, u64, Mapping, Receipt),
 }
+type Receipt = (Option<Index>, bool);
 struct ScanResult {
     document: DocumentId,
     revision: document::Revision,
@@ -164,6 +192,7 @@ struct ScanResult {
     layout: u64,
     top: u64,
     left: u64,
+    index: Receipt,
 }
 #[derive(Clone, Copy, PartialEq)]
 struct ViewState {
@@ -195,6 +224,7 @@ pub(super) fn revokes_navigation(action: &Action) -> bool {
             | Action::Clipboard { cut: false, .. }
             | Action::NativeCopy { cut: false, .. }
             | Action::RecoveryPage { .. }
+            | Action::SearchPage(PageRequest { jump: None, .. })
     )
 }
 pub(super) fn clears_anchor(action: &Action) -> bool {
@@ -248,6 +278,10 @@ pub(super) fn mutates(action: &Action) -> bool {
 }
 
 impl State {
+    pub(super) fn page(&mut self, request: PageRequest) {
+        self.results.request(request, &self.status.rows);
+    }
+
     pub(super) fn holds_stream(&self, tab: TabId) -> bool {
         self.run.as_ref().is_some_and(|run| {
             !run.cancel.is_cancelled()
@@ -360,6 +394,14 @@ impl State {
             self.status.decorations.clear();
             self.status.decorated = None;
             self.query = None;
+            self.result_scope = None;
+            self.results.live.clear();
+            self.results.changes.clear();
+            self.status.rows.error = None;
+            self.status.rows.feedback_incomplete = false;
+            self.results.reset_page(&mut self.status.rows);
+            self.status.outcomes.clear();
+            self.status.message = "Enter search text or press Find".into();
         }
     }
     /// Lifecycle decisions wait for every possible publication to be reconciled.
@@ -382,6 +424,7 @@ impl State {
     }
     pub(super) fn shutdown(&mut self) {
         self.cancel(true);
+        self.results.shutdown();
         if let Some(work) = self.maintaining.take() {
             let _ = work.handle.join();
         }
@@ -399,6 +442,12 @@ impl State {
     ) -> Result<(), Error> {
         validate_field(&request.query.literal)?;
         validate_field(&request.replacement)?;
+        if request.operation == Operation::ReplaceNext
+            && let Some((generation, row)) = request.expected
+            && (self.status.rows.generation != generation || self.status.rows.current != Some(row))
+        {
+            return Err(Error::StaleRevision);
+        }
         if self.metadata.is_none() {
             self.metadata = Some(owner.service.reserve_interaction(256 << 10)?);
         }
@@ -510,6 +559,7 @@ impl State {
             read_only,
             progress: Arc::new(Mutex::new(Progress::default())),
             previous_message: self.status.message.clone(),
+            receipts_started: false,
         };
         if self.run.is_some() || self.maintaining.is_some() {
             self.cancel(false);
@@ -541,10 +591,30 @@ impl State {
             self.status.busy = false;
             self.status.replacing = false;
         } else {
+            let scope = (
+                run.request.all,
+                (!run.request.all)
+                    .then(|| run.targets.first().copied())
+                    .flatten(),
+            );
+            let same_search =
+                self.query.as_ref() == Some(&run.request.query) && self.result_scope == Some(scope);
+            if !same_search {
+                self.results.changes.clear();
+            }
+            self.result_scope = Some(scope);
+            if !same_search || !replacing {
+                self.results.live.clear();
+            }
+            let mut rows = std::mem::take(&mut self.status.rows);
+            rows.error = None;
+            rows.feedback_incomplete &= same_search;
+            self.results.reset_page(&mut rows);
             self.status = Status {
                 busy: !run.request.query.literal.is_empty(),
                 replacing,
                 message: "Searching".into(),
+                rows,
                 ..Status::default()
             };
         }
@@ -604,7 +674,8 @@ impl State {
             run.request.operation,
             Operation::ReplaceAll | Operation::ReplaceNext
         );
-        let candidate = if successful && !replaced && !decorating {
+        let listing = run.request.operation == Operation::List;
+        let candidate = if successful && !replaced && !decorating && !listing {
             self.navigation_candidate(owner, &mut run)?
         } else {
             None
@@ -646,13 +717,18 @@ impl State {
                 owner.layout(true)?;
                 self.stream_anchor = owner.tab.live.is_some().then(|| found.clone());
                 self.status.current = Some(found);
+                if self.status.rows.count != 0 {
+                    self.results.reset_page(&mut self.status.rows);
+                }
             }
             format!(
                 "{} matches{}; exact match differs from ordinary selection",
                 self.status.total(),
                 if wrapped { "; Wrapped" } else { "" }
             )
-        } else if run.wrap {
+        } else if listing && self.status.total() != 0 {
+            format!("{} matches", self.status.total())
+        } else if run.wrap || listing {
             "No matches".into()
         } else {
             "No further matches".into()
@@ -680,8 +756,11 @@ impl State {
         }
         if !replaced && !decorating && successful && self.status.processed != 0 {
             self.status.message = format!(
-                "{} processed; {} changed documents; {}",
-                self.status.processed, self.status.changed, self.status.message
+                "{}{} processed; {} changed documents; {}",
+                self.status.processed,
+                if listing { " occurrences" } else { "" },
+                self.status.changed,
+                self.status.message
             );
         }
         let auto = replaced
@@ -689,6 +768,13 @@ impl State {
             && run.request.operation == Operation::ReplaceNext
             && !run.cancel.is_cancelled()
             && run.navigation == owner.view_cancel.search_navigation.load(Ordering::Acquire);
+        let refresh_list = replaced
+            && successful
+            && run.request.browse
+            && run.request.operation == Operation::ReplaceAll
+            && self.query.as_ref() == Some(&run.request.query)
+            && self.status.changed != 0
+            && self.deferred.is_none();
         // The completed worker is joined and publication reconciled. Its full
         // reservation must be released before admitting a continuation/retry.
         drop(run._permit);
@@ -717,6 +803,16 @@ impl State {
             self.status.processed = processed;
             self.status.changed = changed;
             self.status.replacement_ack = acknowledged;
+        } else if refresh_list {
+            let processed = self.status.processed;
+            let changed = self.status.changed;
+            let outcomes = self.status.outcomes.clone();
+            let mut request = run.request;
+            request.operation = Operation::List;
+            self.start(owner, request, false)?;
+            self.status.processed = processed;
+            self.status.changed = changed;
+            self.status.replacement_outcomes = outcomes;
         } else if let Some(run) = self.pending.take() {
             self.admit(owner, run)?;
         }
@@ -902,11 +998,42 @@ impl Coordinator {
 
 impl State {
     fn poll(&mut self, owner: &mut Coordinator) -> Result<bool, Error> {
+        let different_target = self
+            .result_scope
+            .is_some_and(|(all, tab)| !all && tab != owner.tab.screen.tab);
+        let results_changed = if different_target {
+            self.result_scope = None;
+            self.results.live.clear();
+            self.results.changes.clear();
+            self.status.outcomes.clear();
+            self.status.current = None;
+            self.status.rows.feedback_incomplete = false;
+            self.status.message = "Current tab changed; press Find".into();
+            true
+        } else {
+            self.results.prune(owner)
+        };
+        if results_changed {
+            self.results.reset_page(&mut self.status.rows);
+        }
+        let (page_changed, jump) =
+            self.results
+                .poll(owner, &mut self.status, self.run.is_none())?;
+        if let Some(jump) = jump {
+            owner.activate(jump.found.tab);
+            owner.tab.pause_follow();
+            owner.tab.screen.position.move_to(jump.caret, false);
+            owner.tab.preferred = None;
+            owner.layout(true)?;
+            self.stream_anchor = owner.tab.live.is_some().then(|| jump.found.clone());
+            self.status.current = Some(jump.found);
+            self.status.rows.current = Some(jump.row);
+        }
         if self.maintaining.is_some() {
             return self.poll_maintenance(owner);
         }
         // Refresh/undo/edit invalidate counts without ever applying old ranges.
-        let mut invalidated = false;
+        let mut invalidated = results_changed;
         for outcome in &mut self.status.outcomes {
             if outcome.revision.is_some_and(|revision| {
                 owner
@@ -929,6 +1056,10 @@ impl State {
                 .is_none_or(|i| i.revision != found.revision)
         }) {
             self.status.current = None;
+        }
+        if self.status.current.is_none() && self.status.rows.current.take().is_some() {
+            self.status.rows.ordinal = None;
+            invalidated = true;
         }
         let Some(mut run) = self.run.take() else {
             self.start_maintenance(owner);
@@ -954,13 +1085,15 @@ impl State {
                             replacement: String::new(),
                             all: false,
                             operation: Operation::Decorate,
+                            browse: false,
+                            expected: None,
                         },
                         false,
                     )?;
                     return Ok(true);
                 }
             }
-            return Ok(invalidated);
+            return Ok(invalidated || page_changed);
         };
         self.status.progress = *run.progress.lock().map_err(|_| Error::CorruptStorage)?;
         if let Some(worker) = run.worker.take() {
@@ -1019,6 +1152,18 @@ impl State {
                         .into(),
                     });
                     if valid {
+                        let (index, failed) = scan.index;
+                        if self.query.as_ref() == Some(&run.request.query)
+                            && self.result_scope.is_some()
+                        {
+                            if let Some(index) = index {
+                                self.results.live.push(index);
+                                self.results.reset_page(&mut self.status.rows);
+                            }
+                            if failed {
+                                self.status.rows.error = Some("Occurrence index incomplete".into());
+                            }
+                        }
                         let index = run.next - 1;
                         let previous = run.request.operation == Operation::Previous;
                         let n = run.targets.len();
@@ -1073,7 +1218,7 @@ impl State {
                         }
                     }
                 }
-                Ok(Finished::Prepared(prepared, count)) => {
+                Ok(Finished::Prepared(prepared, count, receipt)) => {
                     if run.cancel.is_cancelled() {
                         self.finish(owner, run, Some("Cancelled before publication".into()))?;
                         return Ok(true);
@@ -1119,13 +1264,14 @@ impl State {
                                         top,
                                         left,
                                     },
+                                    receipt,
                                 ))
                             })?;
                     run.worker = Some(Worker { tab, handle });
                     self.run = Some(run);
                     return Ok(true);
                 }
-                Ok(Finished::Mapped(prepared, count, mapping)) => {
+                Ok(Finished::Mapped(prepared, count, mapping, receipt)) => {
                     if owner.state(tab).is_none_or(|target| {
                         target.capability == crate::search::Capability::ReadOnly
                     }) {
@@ -1139,7 +1285,8 @@ impl State {
                         return Ok(true);
                     }
                     if owner.search_view(tab)? != mapping.before {
-                        let handle = thread::spawn(move || Ok(Finished::Prepared(prepared, count)));
+                        let handle =
+                            thread::spawn(move || Ok(Finished::Prepared(prepared, count, receipt)));
                         run.worker = Some(Worker { tab, handle });
                         self.run = Some(run);
                         return Ok(true);
@@ -1186,6 +1333,25 @@ impl State {
                         .checked_add(count)
                         .ok_or(Error::ResourceLimit("replacement count overflow"))?;
                     self.status.changed += usize::from(report.changed);
+                    if report.changed
+                        && run.request.browse
+                        && self.query.as_ref() == Some(&run.request.query)
+                        && self.result_scope.is_some()
+                    {
+                        if !run.receipts_started {
+                            self.results.changes.clear();
+                            self.status.rows.feedback_incomplete = false;
+                            run.receipts_started = true;
+                        }
+                        self.results.live.retain(|index| index.tab != tab);
+                        let (index, failed) = receipt;
+                        if let Some(mut index) = index {
+                            index.revision = report.info.revision;
+                            self.results.changes.push(index);
+                        }
+                        self.status.rows.feedback_incomplete |= failed;
+                        self.results.reset_page(&mut self.status.rows);
+                    }
                     self.status.outcomes.push(Outcome {
                         tab,
                         count,
@@ -1307,15 +1473,23 @@ impl State {
             let handle = thread::Builder::new()
                 .name("ede-search-plan".into())
                 .spawn(move || {
+                    let mut index = Writer::new(request.browse);
+                    let record_change = |index: &mut Writer, range: TextRange| {
+                        if request.browse {
+                            match replacement_changes(task.snapshot(), &request, range, &cancel) {
+                                Ok(true) => index.push(&(range.start().0..range.end().0)),
+                                Ok(false) => {}
+                                Err(_) => index.failed = true,
+                            }
+                        }
+                    };
                     let count = if let Some(exact) = exact {
                         if exact.document != document || exact.revision != revision {
                             return Err(Error::StaleRevision);
                         }
-                        transaction.replace(
-                            TextRange::new(exact.range.start, exact.range.end)?,
-                            request.replacement.as_bytes(),
-                            &cancel,
-                        )?;
+                        let range = TextRange::new(exact.range.start, exact.range.end)?;
+                        record_change(&mut index, range);
+                        transaction.replace(range, request.replacement.as_bytes(), &cancel)?;
                         1
                     } else {
                         request
@@ -1326,6 +1500,7 @@ impl State {
                                 &cancel,
                                 ScanOptions::default(),
                                 |range| {
+                                    record_change(&mut index, range);
                                     transaction.replace(
                                         range,
                                         request.replacement.as_bytes(),
@@ -1341,13 +1516,33 @@ impl State {
                             )?
                             .matches
                     };
+                    let change = if request.replacement.is_empty() {
+                        "Removed"
+                    } else {
+                        "Replaced"
+                    };
+                    let receipt = if index.has_records() {
+                        match task.snapshot().duplicate_live() {
+                            Ok(snapshot) => {
+                                index.finish(tab, document, revision, Some(snapshot), Some(change))
+                            }
+                            Err(_) => {
+                                index.failed = true;
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    };
                     Ok(Finished::Prepared(
                         Box::new(task.run(transaction, &cancel)?),
                         count,
+                        (receipt, index.failed),
                     ))
                 })?;
             run.worker = Some(Worker { tab, handle });
         } else {
+            let change_start = self.results.single_change_start(tab);
             let snapshot = owner.background_snapshot(tab, document)?;
             let resume = run
                 .stream_resume
@@ -1364,6 +1559,9 @@ impl State {
             let handle = thread::Builder::new()
                 .name("ede-search-scan".into())
                 .spawn(move || {
+                    let mut index =
+                        Writer::new(request.browse && request.operation != Operation::Decorate);
+                    let mut before_change = 0;
                     let mut result = ScanResult {
                         document,
                         revision,
@@ -1379,6 +1577,7 @@ impl State {
                         layout,
                         top,
                         left,
+                        index: (None, false),
                     };
                     request
                         .query
@@ -1393,6 +1592,10 @@ impl State {
                             },
                             |range| {
                                 let range = range.start().0..range.end().0;
+                                if change_start.is_some_and(|start| range.start < start) {
+                                    before_change += 1;
+                                }
+                                index.push(&range);
                                 if result.first.is_none() {
                                     result.first = Some(range.clone());
                                 }
@@ -1426,6 +1629,14 @@ impl State {
                             },
                         )
                         .map(|p| result.count = p.matches)?;
+                    let finished =
+                        index
+                            .finish(tab, document, revision, None, None)
+                            .map(|mut index| {
+                                index.before_change = change_start.map(|_| before_change);
+                                index
+                            });
+                    result.index = (finished, index.failed);
                     Ok(Finished::Scanned(result))
                 })?;
             run.worker = Some(Worker { tab, handle });
@@ -1433,6 +1644,27 @@ impl State {
         self.run = Some(run);
         Ok(true)
     }
+}
+
+/// Case-folded matches may use the same bytes as the replacement.
+fn replacement_changes(
+    snapshot: &Snapshot,
+    request: &SearchRequest,
+    range: TextRange,
+    cancel: &Cancellation,
+) -> Result<bool, Error> {
+    let length = range.end().0 - range.start().0;
+    if length != request.replacement.len() as u64 {
+        return Ok(true);
+    }
+    if request.query.match_case {
+        return Ok(request.query.literal != request.replacement);
+    }
+    snapshot
+        .read_window_with_cancel(range.start(), (length as usize).max(4), cancel)
+        .map(|window| {
+            window.text().as_bytes().get(..length as usize) != Some(request.replacement.as_bytes())
+        })
 }
 
 fn target_is_stream(owner: &Coordinator, tab: TabId) -> bool {
