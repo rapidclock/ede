@@ -26,6 +26,76 @@ use nix::{
 /// Bounded timeouts turn a broken terminal loop into a useful test failure, not a hanging CI job.
 const TIMEOUT: Duration = Duration::from_secs(5);
 
+/// A fresh search starts at the first match and gives its arrow keys to the list.
+#[test]
+fn search_submission_selects_first_and_tabs_between_sections() {
+    let root = tempfile::tempdir().unwrap();
+    let file = root.path().join("fruit.txt");
+    std::fs::write(&file, "green apple\napple tree\napple baked").unwrap();
+    for shortcut in [b"\x06", b"\x08"] {
+        let mut process = PtyChild::editor_with_path(Some("xterm-256color"), Some(&file));
+        process.expect_status("Ln 1 Col 1");
+        process.send(b"\x1b[B\x1b[B");
+        process.expect_status("Ln 3 Col 1");
+        process.send(shortcut);
+        process.expect(">Find:");
+        process.send(b"apple\r");
+        process.expect("1 of 3 matches");
+        process.expect_status("Ln 1 Col 7");
+        process.send(b"\x1b[B");
+        process.expect_status("Ln 2 Col 1");
+        process.send(b"\t");
+        process.expect(">Find: apple");
+        process.send(b"\t\x1b[B");
+        process.expect_status("Ln 3 Col 1");
+        process.send(b"\x1b[B\x1b[A");
+        process.expect_status("Ln 2 Col 1");
+        process.send(b"\x1b[Z");
+        process.expect(">Find: apple");
+        process.send(b"z\r");
+        process.expect("No matches");
+        process.expect(">Find: applez");
+        process.send(b"\x1b");
+        process.expect_absent("Options");
+        process.send(b"\x11");
+        assert!(process.wait().success());
+    }
+}
+
+/// Search Details has real lines for individual outcomes and a divider above the form.
+#[test]
+fn search_details_use_separate_lines_and_a_soft_divider() {
+    let root = tempfile::tempdir().unwrap();
+    let file = root.path().join("fruit.txt");
+    std::fs::write(&file, "green apple\napple tree\n").unwrap();
+    let mut process = PtyChild::editor_with_path(Some("xterm-256color"), Some(&file));
+    process.expect_status("Ln 1 Col 1");
+    process.send(b"\x06apple");
+    process.expect(">Find: apple");
+    process.click_label("[Find]", 1);
+    process.expect("2 matches");
+    process.expect("2:1 apple tree");
+    let screen: Vec<_> = process.parser.screen().rows(0, 80).collect();
+    let result = screen
+        .iter()
+        .position(|row| row.contains("2:1 apple tree"))
+        .unwrap();
+    assert!(
+        screen[result + 1].contains("│─────────"),
+        "expected a divider below the last result"
+    );
+    process.click_label("[Summary]", 1);
+    process.expect("Search Details");
+    process.expect("fruit.txt · 2 matches · Complete");
+    assert!(!process.parser.screen().contents().contains("<U+000A>"));
+    process.send(b"\x1b");
+    process.expect_absent("Search Details");
+    process.send(b"\x1b");
+    process.expect_absent("Options");
+    process.send(b"\x11");
+    assert!(process.wait().success());
+}
+
 /// Browse live search results with arrows and the mouse in the real terminal.
 #[test]
 fn search_window_browses_occurrences_without_tab() {
@@ -42,8 +112,6 @@ fn search_window_browses_occurrences_without_tab() {
     process.expect(">› Options");
     process.send(b"\x1b[Aapple\r");
     process.expect("1 of 3 matches");
-    process.send(b"\x1b[A\x1b[D");
-    process.expect(">Find:");
     process.click_label("2:1", 1);
     process.expect_status("Ln 2 Col 1");
     process.send(b"\x1b[B");
@@ -254,14 +322,13 @@ fn search_window_jumps_to_another_unsaved_tab() {
     process.expect_status("Ln 2 Col 1");
     process.send(b"\x1b[200~apple \x1b[201~");
     process.expect_body("apple right", TIMEOUT);
-    process.send(b"\x1b[19~");
-    process.expect_body("apple left", TIMEOUT);
     process.send(b"\x06");
     process.click_label("Options", 1);
     process.click_label("[Current tab]", 1);
     process.click_label("Find:", 1);
     process.send(b"apple\r");
     process.expect("1 of 2 matches");
+    process.expect_body("apple left", TIMEOUT);
     process.click_label("2:1 right.txt", 1);
     process.expect_body("apple right", TIMEOUT);
     process.expect_status("Ln 2 Col 1");
@@ -285,15 +352,14 @@ fn search_window_compact_results_survive_resize() {
     process.expect_status("Ln 1 Col 1");
     process.resize(40, 8);
     process.send(b"\x06apple\r");
-    process.expect("3 matches");
-    process.click_label("[Results]", 1);
     process.expect("1 of 3 matches");
+    process.expect("[Form]");
     process.send(b"\x1b[B");
     process.expect_status("Ln 2 Col 1");
     process.expect("2 of 3 matches");
     process.resize(80, 24);
     process.expect("Match Whole Word off");
-    process.send(b"\x1b[D");
+    process.send(b"\t");
     process.expect(">Find:");
     process.click_label("3:1 apple", 1);
     process.expect_status("Ln 3 Col 1");

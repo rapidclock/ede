@@ -223,6 +223,7 @@ pub(crate) struct LayoutSnapshot {
     list_rows: u16,
     search_window: Option<Rect>,
     search_list: Option<Rect>,
+    pub(crate) search_details_scroll_limit: u16,
 }
 impl LayoutSnapshot {
     /// The non-modal window covers part of the editor's otherwise full viewport.
@@ -261,6 +262,7 @@ impl LayoutSnapshot {
             list_rows: 0,
             search_window: None,
             search_list: None,
+            search_details_scroll_limit: 0,
         };
         if area.width < 40 || area.height < 8 {
             return result;
@@ -299,6 +301,7 @@ impl LayoutSnapshot {
             Some(Modal::Path(..)) => (2, 0),
             Some(Modal::Confirm(after, _)) => (3, after.target().map_or(0, |tab| tab.0)),
             Some(Modal::Details(_)) => (4, u64::from(app.details_refresh_target().is_some())),
+            Some(Modal::SearchDetails(_)) => (18, 0),
             Some(Modal::TabDetails { tab, .. }) => (
                 13,
                 tab.map_or(0, |tab| tab.0.wrapping_mul(2))
@@ -413,6 +416,14 @@ impl LayoutSnapshot {
                 width,
                 height,
             )
+        } else if let Some(Modal::SearchDetails(report)) = &app.modal {
+            let width = result.overlay_rect(76, 22).width - 2;
+            let lines = search::details(report, width).line_count(width);
+            let overlay = result.overlay_rect(76, (lines + 5).clamp(8, 22) as u16);
+            result.search_details_scroll_limit = lines
+                .saturating_sub(usize::from(overlay.height - 3))
+                .min(usize::from(u16::MAX)) as u16;
+            overlay
         } else {
             result.overlay_rect(76, 22)
         };
@@ -727,6 +738,7 @@ impl LayoutSnapshot {
             }
             Some(
                 Modal::Details(_)
+                | Modal::SearchDetails(_)
                 | Modal::TabDetails { .. }
                 | Modal::About { .. }
                 | Modal::SettingsDiagnostic { .. },
@@ -1340,6 +1352,7 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &AppState, layout: &LayoutSnaps
             }
             Some(Modal::Confirm(..)) => " Unsaved changes ",
             Some(Modal::Details(_)) => " Details ",
+            Some(Modal::SearchDetails(_)) => " Search Details ",
             Some(Modal::TabDetails { .. }) => " Tab Details ",
             Some(Modal::About { .. }) => " About ",
             Some(Modal::SettingsDiagnostic { .. }) => " Settings Details ",
@@ -1376,6 +1389,7 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &AppState, layout: &LayoutSnaps
                 Modal::Menu(_)
                 | Modal::Language { .. }
                 | Modal::SyntaxTheme { .. }
+                | Modal::SearchDetails(_)
                 | Modal::Path(..)
                 | Modal::Open(_)
                 | Modal::Tabs(_),
@@ -1572,13 +1586,19 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &AppState, layout: &LayoutSnaps
                 );
             }
         } else {
+            let paragraph = if let Some(Modal::SearchDetails(report)) = &app.modal {
+                search::details(report, inner.width)
+            } else {
+                Paragraph::new(text)
+            };
             frame.render_widget(
-                Paragraph::new(text).wrap(Wrap { trim: false }).scroll((
+                paragraph.wrap(Wrap { trim: false }).scroll((
                     if app.help
                         || matches!(
                             app.modal,
                             Some(
                                 Modal::Details(_)
+                                    | Modal::SearchDetails(_)
                                     | Modal::TabDetails { .. }
                                     | Modal::About { .. }
                                     | Modal::SettingsDiagnostic { .. }

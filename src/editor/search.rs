@@ -8,6 +8,7 @@ use results::{Index, PageRequest, Results, Rows, Writer};
 /// Named search intent, independent of keyboard, mouse, and panel focus.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Operation {
+    First,
     Next,
     Previous,
     ReplaceNext,
@@ -55,6 +56,15 @@ pub(crate) struct Outcome {
     pub message: String,
 }
 
+/// Independent logical lines for the Search Details dialog.
+#[derive(Clone, Debug)]
+pub(crate) struct Summary {
+    pub headline: String,
+    pub tabs: Vec<String>,
+    pub replacements: Vec<String>,
+    pub notices: Vec<String>,
+}
+
 /// Small prepared UI data; no snapshot, matcher, or document text crosses this boundary.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Status {
@@ -62,6 +72,8 @@ pub(crate) struct Status {
     pub replacing: bool,
     pub message: String,
     pub current: Option<Found>,
+    /// Completed explicit Find invocation, correlated with UI admission.
+    pub find_submission: Option<u64>,
     pub outcomes: Vec<Outcome>,
     pub progress: Progress,
     pub decorations: Vec<Range<u64>>,
@@ -78,46 +90,54 @@ impl Status {
     pub(crate) fn total(&self) -> u64 {
         self.outcomes.iter().map(|o| o.count).sum()
     }
-    pub(crate) fn summary(&self, tabs: &[TabSummary]) -> String {
-        let mut text = self.message.clone();
-        if let Some(ack) = &self.replacement_ack {
-            let label = tabs.iter().find(|tab| tab.id == ack.tab).map_or_else(
-                || format!("Closed tab {}", ack.tab.0),
+    pub(crate) fn summary(&self, tabs: &[TabSummary]) -> Summary {
+        let label = |id: TabId| {
+            tabs.iter().find(|tab| tab.id == id).map_or_else(
+                || format!("Closed tab {}", id.0),
                 |tab| tab.label.to_string(),
-            );
-            text.push_str(&format!(
-                "\nReplacement: {label}; {} processed; {}",
-                ack.count, ack.message
-            ));
-        }
-        for outcome in &self.outcomes {
-            let label = tabs.iter().find(|tab| tab.id == outcome.tab).map_or_else(
-                || format!("Closed tab {}", outcome.tab.0),
-                |tab| tab.label.to_string(),
-            );
-            text.push_str(&format!(
-                "\n{label}: {} matches; {}",
-                outcome.count, outcome.message
-            ));
-        }
-        for outcome in &self.replacement_outcomes {
-            let label = tabs.iter().find(|tab| tab.id == outcome.tab).map_or_else(
-                || format!("Closed tab {}", outcome.tab.0),
-                |tab| tab.label.to_string(),
-            );
-            text.push_str(&format!(
-                "\nReplacement: {label}; {} processed; {}",
-                outcome.count, outcome.message
-            ));
-        }
+            )
+        };
+        let mut notices = Vec::new();
         if self.rows.feedback_incomplete {
-            text.push_str("\nReplacement feedback incomplete");
+            notices.push("Replacement feedback incomplete".into());
         }
         if let Some(error) = &self.rows.error {
-            text.push('\n');
-            text.push_str(error);
+            notices.push(error.clone());
         }
-        text
+        Summary {
+            headline: self.message.clone(),
+            tabs: self
+                .outcomes
+                .iter()
+                .map(|outcome| {
+                    let matches = if outcome.count == 1 {
+                        "match"
+                    } else {
+                        "matches"
+                    };
+                    format!(
+                        "{} · {} {matches} · {}",
+                        label(outcome.tab),
+                        outcome.count,
+                        outcome.message
+                    )
+                })
+                .collect(),
+            replacements: self
+                .replacement_ack
+                .iter()
+                .chain(&self.replacement_outcomes)
+                .map(|outcome| {
+                    format!(
+                        "{} · {} processed · {}",
+                        label(outcome.tab),
+                        outcome.count,
+                        outcome.message
+                    )
+                })
+                .collect(),
+            notices,
+        }
     }
 }
 
@@ -156,6 +176,7 @@ struct Run {
     next: usize,
     cancel: Cancellation,
     navigation: u64,
+    submission: Option<u64>,
     worker: Option<Worker>,
     candidates: Vec<(usize, bool, Found)>,
     held_stream: Option<TabId>,
@@ -285,7 +306,10 @@ impl State {
     pub(super) fn holds_stream(&self, tab: TabId) -> bool {
         self.run.as_ref().is_some_and(|run| {
             !run.cancel.is_cancelled()
-                && matches!(run.request.operation, Operation::Next | Operation::Previous)
+                && matches!(
+                    run.request.operation,
+                    Operation::First | Operation::Next | Operation::Previous
+                )
                 && run.held_stream == Some(tab)
         })
     }
@@ -391,6 +415,7 @@ impl State {
         }
         if invalidate {
             self.status.current = None;
+            self.status.find_submission = None;
             self.status.decorations.clear();
             self.status.decorated = None;
             self.query = None;
@@ -518,21 +543,30 @@ impl State {
         if request.operation == Operation::ReplaceNext && exact.is_none() {
             request.operation = Operation::Next;
         }
-        let anchor = targets
-            .iter()
-            .position(|id| Some(*id) == active)
-            .unwrap_or(0);
+        let first = request.operation == Operation::First;
+        let anchor = if first {
+            0
+        } else {
+            targets
+                .iter()
+                .position(|id| Some(*id) == active)
+                .unwrap_or(0)
+        };
         let backwards = request.operation == Operation::Previous;
-        let bound = current
-            .as_ref()
-            .filter(|found| Some(found.tab) == active)
-            .map_or(owner.tab.screen.position.caret, |found| {
-                if backwards {
-                    found.range.start
-                } else {
-                    found.range.end
-                }
-            });
+        let bound = if first {
+            0
+        } else {
+            current
+                .as_ref()
+                .filter(|found| Some(found.tab) == active)
+                .map_or(owner.tab.screen.position.caret, |found| {
+                    if backwards {
+                        found.range.start
+                    } else {
+                        found.range.end
+                    }
+                })
+        };
         let cancel = Cancellation::default();
         let navigation = request
             .navigation
@@ -550,6 +584,7 @@ impl State {
             next: 0,
             cancel,
             navigation,
+            submission: first.then_some(owner.active_sequence),
             worker: None,
             candidates: Vec::new(),
             held_stream: None,
@@ -738,6 +773,9 @@ impl State {
                 "Cancelled; {} processed; {} changed documents",
                 self.status.processed, self.status.changed
             );
+        }
+        if let Some(submission) = run.submission {
+            self.status.find_submission = Some(submission);
         }
         if !replaced
             && !decorating

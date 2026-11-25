@@ -34,6 +34,7 @@ pub(crate) struct Panel {
     hidden: Option<u64>,
     requested: Option<(u64, u64)>,
     expected: Option<(u64, u64)>,
+    pub(super) focus_after_find: Option<u64>,
     cursor: [Option<usize>; 2],
 }
 
@@ -178,10 +179,44 @@ pub(crate) fn display(text: &str) -> String {
 }
 
 impl AppState {
+    /// Scroll the wrapped report by one row, one viewport, or to an endpoint.
+    pub(super) fn move_search_details(&mut self, movement: Movement, layout: &LayoutSnapshot) {
+        let page = layout
+            .overlay
+            .map_or(1, |area| area.height.saturating_sub(3).max(1)) as i16;
+        let step = match movement {
+            Movement::Up => -1,
+            Movement::Down => 1,
+            Movement::PageUp => -page,
+            Movement::PageDown => page,
+            Movement::Home | Movement::Start => {
+                self.help_scroll = 0;
+                self.dirty = true;
+                return;
+            }
+            Movement::End | Movement::Finish => {
+                self.help_scroll = layout.search_details_scroll_limit;
+                self.dirty = true;
+                return;
+            }
+            _ => return,
+        };
+        self.scroll_search_details(step, layout);
+    }
+
+    pub(super) fn scroll_search_details(&mut self, delta: i16, layout: &LayoutSnapshot) {
+        self.help_scroll = self
+            .help_scroll
+            .saturating_add_signed(delta)
+            .min(layout.search_details_scroll_limit);
+        self.dirty = true;
+    }
+
     /// Retire the window before returning focus to the editor.
     pub(crate) fn close_search(&mut self) {
         self.revoke_native_clipboard();
         self.search.open = false;
+        self.search.focus_after_find = None;
         self.field_generation = self.field_generation.wrapping_add(1);
         self.field_paste = None;
         self.field_submit = None;
@@ -200,12 +235,42 @@ impl AppState {
     }
 
     pub(super) fn invalidate_search_rows(&mut self) -> Intent {
+        self.search.focus_after_find = None;
         self.search.hidden = Some(self.screen.search.rows.generation);
         self.search.result_top = 0;
         self.search.result_focus = None;
         self.search.requested = None;
         self.search.expected = None;
         Intent::Editor(Action::InvalidateSearch)
+    }
+
+    /// A completed Find can transfer focus only for its own accepted submission.
+    pub(crate) fn expect_find_focus(&mut self, sequence: u64) {
+        self.search.focus_after_find = Some(sequence);
+    }
+
+    pub(super) fn sync_find_focus(&mut self) {
+        let status = &self.screen.search;
+        if let Some(sequence) = self.search.focus_after_find
+            && status.find_submission == Some(sequence)
+        {
+            if self.search.open
+                && self.modal.is_none()
+                && !self.help
+                && matches!(self.focus, Some(Control::Search(0 | SUBMIT)))
+                && status.current.is_some()
+                && status.rows.live != 0
+            {
+                if status.rows.current.is_some() {
+                    self.list_focus();
+                    return;
+                }
+                if status.rows.page.is_empty() && status.rows.error.is_none() {
+                    return;
+                }
+            }
+            self.search.focus_after_find = None;
+        }
     }
 
     pub(super) fn sync_search_selection(&mut self, rows: &Rows) {
@@ -248,7 +313,13 @@ impl AppState {
     }
 
     pub(super) fn search_fetch(&mut self, layout: &LayoutSnapshot) -> Option<Intent> {
-        let capacity = layout.search_result_rows();
+        // Compact form view has no result cells until the first row is identified.
+        let waiting_for_selection = layout.search_bounds().is_some()
+            && self.search.focus_after_find.is_some()
+            && self.search.focus_after_find == self.screen.search.find_submission;
+        let capacity = layout
+            .search_result_rows()
+            .max(u16::from(waiting_for_selection));
         let rows = self.search.current_rows(&self.screen.search.rows)?;
         if capacity == 0 || rows.count == 0 {
             return None;
@@ -301,6 +372,7 @@ impl AppState {
             && matches!(self.focus, Some(Control::Search(0 | 1)))
     }
     pub(super) fn search_focus(&mut self, index: u8) {
+        self.search.focus_after_find = None;
         if index <= 1 {
             self.search.field = index;
         }
@@ -328,6 +400,7 @@ impl AppState {
     }
 
     fn list_focus(&mut self) {
+        self.search.focus_after_find = None;
         self.search.list_open = true;
         let rows = &self.screen.search.rows;
         let selected = rows.current.unwrap_or(0);
@@ -342,6 +415,7 @@ impl AppState {
     }
 
     fn search_select(&mut self, row: u64, layout: &LayoutSnapshot) -> Option<Intent> {
+        self.search.focus_after_find = None;
         let rows = self.search.current_rows(&self.screen.search.rows)?;
         if row >= rows.count {
             return None;
@@ -375,6 +449,7 @@ impl AppState {
         movement: Movement,
         layout: &LayoutSnapshot,
     ) -> Option<Intent> {
+        self.search.focus_after_find = None;
         if matches!(control, Control::SearchList | Control::SearchResult(_)) {
             let count = self.screen.search.rows.count;
             let row = self
@@ -382,12 +457,6 @@ impl AppState {
                 .result_focus
                 .or(self.screen.search.rows.current)
                 .unwrap_or(0);
-            if movement == Movement::Left
-                || movement == Movement::Down && row >= count.saturating_sub(1)
-            {
-                self.search_focus(0);
-                return None;
-            }
             if count == 0 {
                 return None;
             }
@@ -402,7 +471,9 @@ impl AppState {
                 _ => return None,
             }
             .min(count - 1);
-            return self.search_select(next, layout);
+            return (next != row)
+                .then(|| self.search_select(next, layout))
+                .flatten();
         }
         let Control::Search(index) = control else {
             return None;
@@ -427,18 +498,19 @@ impl AppState {
                     row.checked_add_signed(step).and_then(|row| groups.get(row))
                 {
                     self.search_focus(target[0]);
-                } else if !down
-                    && self
-                        .search
-                        .current_rows(&self.screen.search.rows)
-                        .is_some_and(|rows| rows.count != 0)
-                {
-                    self.list_focus();
                 }
             }
             Movement::Left | Movement::Right if index == OPTIONS => {
                 self.search.expanded = movement == Movement::Right;
                 self.dirty = true;
+            }
+            Movement::Right
+                if index == 0
+                    && self.field_paste.is_none()
+                    && self.search.field_cursor(0, &self.search.query.literal)
+                        == self.search.query.literal.len() =>
+            {
+                self.search_focus(SUBMIT);
             }
             Movement::Left
             | Movement::Right
@@ -556,6 +628,7 @@ impl AppState {
                 | Command::ReplaceAll
                 | Command::CancelSearch
         ) {
+            self.search.focus_after_find = None;
             if command == Command::CancelSearch {
                 return Some(Some(Intent::Editor(Action::CancelSearch)));
             }
@@ -611,6 +684,7 @@ impl AppState {
             return None;
         }
         if command == Command::Cancel {
+            self.search.focus_after_find = None;
             if self.screen.search.busy {
                 return Some(Some(Intent::Editor(Action::CancelSearch)));
             }
@@ -622,6 +696,7 @@ impl AppState {
                 Some(Control::Search(_) | Control::SearchList | Control::SearchResult(_))
             )
         {
+            self.search.focus_after_find = None;
             self.focus = Some(Control::Content);
             self.dirty = true;
             return Some(None);
@@ -660,12 +735,7 @@ impl AppState {
                     Some(row.and_then(|row| self.search_select(row, layout)))
                 }
                 Command::Tab | Command::PreviousControl => {
-                    let controls = self.search.controls(self.screen.search.busy);
-                    self.search_focus(if command == Command::Tab {
-                        0
-                    } else {
-                        *controls.last().unwrap_or(&0)
-                    });
+                    self.search_focus(0);
                     Some(None)
                 }
                 _ => None,
@@ -679,18 +749,16 @@ impl AppState {
                 self.field_message("Wait for field paste before changing controls");
                 return Some(None);
             }
-            let controls = self.search.controls(self.screen.search.busy);
-            let current = controls.iter().position(|i| *i == index).unwrap_or(0);
-            if command == Command::Tab
-                && current + 1 == controls.len()
-                && self
-                    .search
-                    .current_rows(&self.screen.search.rows)
-                    .is_some_and(|rows| rows.count != 0)
+            if self
+                .search
+                .current_rows(&self.screen.search.rows)
+                .is_some_and(|rows| rows.count != 0)
             {
                 self.list_focus();
                 return Some(None);
             }
+            let controls = self.search.controls(self.screen.search.busy);
+            let current = controls.iter().position(|i| *i == index).unwrap_or(0);
             self.search_focus(
                 controls[(current
                     + if command == Command::PreviousControl {
@@ -727,7 +795,14 @@ impl AppState {
             return Some(None);
         }
         Some(match index {
-            0 | SUBMIT => self.search_command(Command::FindNext, layout).flatten(),
+            0 | SUBMIT => {
+                self.search.focus_after_find = None;
+                self.search.expected = None;
+                self.field_error = None;
+                Some(Intent::Editor(Action::Search(
+                    self.search.request(Operation::First),
+                )))
+            }
             1 | 7 => self.search_command(Command::ReplaceNext, layout).flatten(),
             2 => {
                 self.search.query.match_case = !self.search.query.match_case;
@@ -764,7 +839,7 @@ impl AppState {
             }
             14 => {
                 self.opener = self.focus;
-                self.modal = Some(Modal::Details(
+                self.modal = Some(Modal::SearchDetails(
                     self.screen.search.summary(&self.screen.tabs),
                 ));
                 self.focus = Some(Control::DetailsClose);

@@ -26,6 +26,8 @@ Anchor both windows to the bottom right above the status bar, with the result
 list above the form. Cap the width at 60 columns and keep at least three editor
 rows exposed. Omit the result area when there are no results. Add blank rows
 between the list, fields and actions, Options, and navigation when room allows.
+Draw a dim horizontal divider when the results and form share the window and
+there is room for the divider and at least one result.
 Keep the selected match visible by scrolling the editor as needed. The list
 scrolls independently of the editor.
 
@@ -46,7 +48,7 @@ result status have distinct text cues for monochrome terminals.
 │   3:7    green apple                                  │
 │ > 12:1   apple tree                                   │
 │   15:7   baked apple                                  │
-│                                                       │
+│───────────────────────────────────────────────────────│
 │ Find    [ apple                              ] [Find] │
 │                                                       │
 │ › Options  Case on · Match Whole Word off · Current tab│
@@ -57,7 +59,7 @@ result status have distinct text cues for monochrome terminals.
 ┌─ Find & Replace ───────────────────────────────── [×] ┐
 │   3:7  notes.txt  Replaced · green apple               │
 │ > 12:1 notes.txt  apple tree                           │
-│                                                       │
+│───────────────────────────────────────────────────────│
 │ Find    [ apple                              ] [Find] │
 │ Replace [ pear                                      ] │
 │                          [Replace Next] [Replace All] │
@@ -108,20 +110,24 @@ result status have distinct text cues for monochrome terminals.
 - **Form focus** — Up and Down move between form rows. When Options is
   expanded, they reach each control in order, including controls on the same
   row. Left and Right move within the active text field or between controls on
-  the same row. Tab and Shift+Tab remain available. Enter activates the focused
-  control. Every visible control has a mouse hit target.
+  the same row. Tab and Shift+Tab switch between the form and available
+  results, returning to Find from any result. Before results are available,
+  Tab and Shift+Tab may still cycle the form controls. Enter activates the
+  focused control. Every visible control has a mouse hit target.
 - **Search** — Enter in Find or click Find to submit the current literal query.
-  Preserve the current initial Next behavior from the caret. Empty queries
-  clear results and disable match and replacement actions. Query or option
+  Select and reveal the first live result in list order regardless of the
+  editor caret, and focus the list once the submitted search finds a match.
+  A no-match, cancelled, or superseded search leaves form focus alone.
+  F3, Shift+F3, and the Next and Previous actions keep their existing relative
+  navigation. Empty queries clear results and disable match and replacement
+  actions. Query or option
   changes invalidate the prior list and cancel superseded search work. The UI
   prompts to search again. Editing only the replacement preserves search
   results and invalidates pending replacement intent. Each field keeps the
   existing 4096-byte UTF-8 limit, literal paste, and safe display of controls.
-- **List focus** — Up from the Find field enters the list and focuses the
-  current match or the first available row. Left or Down past the final row
-  returns to the Find field. Up and
-  Down move by one row, Page Up and Page Down by one visible page, and Home and
-  End reach the first and last available rows. Movement stops at the ends.
+- **List focus** — Tab moves immediately between results and the form. Up and
+  Down move by one result row and stop at the ends. Page Up and Page Down move
+  by one visible page. Home and End reach the first and last available rows.
   Moving onto a live match reveals it. Enter or one click reveals a live match
   directly. A replacement feedback row can receive focus for browsing and
   leaves the editor position unchanged. Previous and Next, including F3 and
@@ -139,9 +145,13 @@ result status have distinct text cues for monochrome terminals.
   boundary. Focus stays in the window when a result is chosen there.
 - **Progress and scale** — Show the match count and current ordinal when known.
   Identify scanning, cancelled, incomplete or stale results, and complete
-  searches with zero matches. Keep Search summary reachable for per-tab
-  outcomes. Every match from a successfully scanned target must be reachable,
-  including matches beyond the first page. Load result rows in bounded pages or
+  searches with zero matches. Show Search Details with separate lines for
+  per-tab counts and outcomes, a separate replacement section when applicable,
+  and readable separators. Escape controls within individual values while
+  rendering actual layout line breaks. Up, Down, Page Up, Page Down, Home, End,
+  and the mouse wheel scroll long reports within the available content. Every
+  match from a successfully scanned target must be reachable, including matches
+  beyond the first page. Load result rows in bounded pages or
   through an equivalent bounded mechanism. Keep document I/O and scan work
   cancellable and off the UI event path. A partial or unavailable result set
   must report that state explicitly.
@@ -193,8 +203,28 @@ result status have distinct text cues for monochrome terminals.
 | A5 | Select a specific match from Find & Replace, replace it, and verify non-wrapping advancement and refreshed results. Confirm and cancel Replace All in both scopes. Verify one Undo step per changed document, read-only handling, and reporting if work stops partway. Check literal field paste and case and whole-word regressions. |
 | A6 | Verify Replaced for changed text and Removed for deletion, including a partial batch and feedback beyond the first page. Verify identical, skipped, and uncommitted edits leave no new marker. Browse feedback without jumping or changing the live count, including when inserted text itself matches. Verify feedback clears on undo, subsequent edits, and search changes. |
 | A7 | Both modes anchor at the bottom right and list results above the form. With no saved preference, show up to three result rows. The Settings stepper stops at 1 and 10, accepts keyboard and mouse input, and persists on Save. After restart the preference applies to both modes. Reduce rows as needed at compact sizes and keep the selected document occurrence visible above the window. |
+| A8 | With the editor caret at the last match or in a later tab, submit a search and verify the first result is selected. Use Down immediately after completion and Tab or Shift+Tab to return from anywhere in the list. A no-match query leaves the field usable. Verify a visible dim divider when both parts fit and Search Details with per-tab lines and no escaped layout newlines. |
 
 ## Validation record
+
+- Second follow-up (A2, A3, A8) — Authorized first-result selection, automatic
+  results focus, Tab between form and results, a soft divider, and structured
+  Search Details. A native terminal regression reproduced selection of the last
+  match when the caret started there. Native tests verify selecting the first
+  occurrence in both modes, first-tab ordering for All open tabs, immediate arrow
+  navigation, Tab and Shift+Tab, no-match editing, minimum-size layout, the divider,
+  and per-tab report lines. A gated scan verifies stale completions preserve newer
+  focus and that a replacement receipt cannot stand in for the first live row.
+  The wrapped report test checks bounded scrolling and escaping only within values.
+- Second follow-up regression runs — Formatting and Clippy passed on macOS 27.2.1
+  and the Ubuntu 26.10 UTM guest, with Rust `1.100.0` on arm64. The full locked
+  workspace suite passed 387 and 390 tests respectively with the CI 256-file limit.
+  Independent review rechecked the async focus, report scroll limits, and stale
+  replacement guard and found no remaining actionable issues.
+- Second follow-up optimized Linux checks — Ten enabled native search tests and
+  the ordinary, dense-line, and long-line 256 MiB benchmark fixtures passed
+  on the Ubuntu guest. The benchmarks ran with a 256 MiB memory limit and swap
+  disabled. Ubuntu 26.04 verification is pending.
 
 - Follow-up (A1–A3, A7) — Approved bottom-right placement, matches above the
   form, a shared 1–10 row stepper with default 3, vertical arrow traversal

@@ -111,8 +111,9 @@ matches above the form. **Settings → Editor → Find match rows** controls the
 list height in both windows, from 1 to 10 rows (default 3). Short terminals can
 show fewer rows. In `config.toml`, set `find_match_rows` under `[editor]`.
 
-Enter the query and press Enter or click **Find**. Expand **Options** with a click,
-Enter, or Right to change **Match case**, **Match Whole Word**, or the search
+Enter the query and press Enter or click **Find** to select the first match and
+focus the results. Expand **Options** with a click, Enter, or Right to change
+**Match case**, **Match Whole Word**, or the search
 scope. **Current tab** searches the active tab. **All open tabs** also includes
 the unsaved text in other tabs. Queries are literal, with optional Unicode case
 folding. Fields accept up to 4096 UTF-8 bytes, including pasted Tab, LF and CRLF.
@@ -120,12 +121,12 @@ The expanded options also insert those characters directly. Portable Backspace
 uses DEL (`0x7f`).
 Ctrl+H (`0x08`) opens Find & Replace.
 
-Use Up and Down to move through the form and every expanded option. Tab and
-Shift+Tab are also available. Press Up from the Find field to enter the list.
+Use Tab or Shift+Tab to switch between the form and results. Use Up and Down
+to navigate the focused section, including every expanded option in the form.
 Click a result or use the arrow keys in the list to jump to its exact match.
 Page Up, Page Down, Home and End browse the list. The mouse wheel scrolls it
-without moving the caret. Left returns to the form and F6 returns to editor text.
-F3 and Shift+F3 wrap through live matches.
+without moving the caret. F6 returns to editor text. F3 and Shift+F3 wrap through
+live matches. **Summary** opens Search Details with per-tab counts and outcomes.
 
 **Replace Next** reveals a match before changing it and advances without
 wrapping. **Replace All** confirms the scope with Cancel focused. **Replaced**

@@ -577,7 +577,11 @@ fn effect(
                     Action::SearchPage(request) => Some(*request),
                     _ => None,
                 };
+                let find = matches!(&action, Action::Search(request) if request.operation == crate::editor::search::Operation::First);
                 if editor.submit(action) {
+                    if find {
+                        app.expect_find_focus(editor.sequence());
+                    }
                     if let Some(after) = guard {
                         app.expect_guard_for(editor.sequence(), after);
                     }

@@ -3495,6 +3495,78 @@ mod search_tests {
         }
     }
 
+    /// A completed scan must respect a newer focus choice or an outstanding submission.
+    #[test]
+    fn find_completion_respects_newer_focus_and_submissions() {
+        use crate::{
+            app::{AppState, search::OPTIONS},
+            input::Input,
+            ui::{Control, LayoutSnapshot},
+        };
+        use ratatui::layout::Rect;
+
+        let (mut worker, reached, release) = gated("ede-search-scan");
+        worker.action(Action::Insert("one one one".into())).unwrap();
+        worker.publish();
+        let mut app = AppState::new();
+        app.update(worker.tab.screen.clone(), false);
+        let layout = |app: &AppState| LayoutSnapshot::for_app(Rect::new(0, 0, 80, 24), app, 1);
+        app.input(Input::Command(Command::Find), &layout(&app));
+        let mut find = request(search::Operation::First);
+        find.browse = true;
+        app.expect_find_focus(1);
+        worker.active_sequence = 1;
+        worker.action(Action::Search(find.clone())).unwrap();
+        worker.poll_background();
+        reached.recv_timeout(Duration::from_secs(5)).unwrap();
+        app.input(
+            Input::Command(Command::Move(Movement::Down, false)),
+            &layout(&app),
+        );
+        release.send(()).unwrap();
+        settle(&mut worker);
+        worker.publish();
+        let first = worker.tab.screen.clone();
+        assert_eq!(first.search.find_submission, Some(1));
+        app.update(first.clone(), false);
+        assert_eq!(app.focus, Some(Control::Search(OPTIONS)));
+
+        let mut replace = request(search::Operation::ReplaceNext);
+        replace.replacement.clear();
+        replace.browse = true;
+        worker.action(Action::Search(replace)).unwrap();
+        settle(&mut worker);
+        app.input(Input::Command(Command::Find), &layout(&app));
+        app.expect_find_focus(2);
+        app.update(first, false);
+        assert_eq!(app.focus, Some(Control::Search(0)));
+        worker.active_sequence = 2;
+        worker.action(Action::Search(find)).unwrap();
+        settle(&mut worker);
+        worker.publish();
+        app.update(worker.tab.screen.clone(), false);
+        assert_eq!(app.focus, Some(Control::Search(0)));
+        let compact = LayoutSnapshot::for_app(Rect::new(0, 0, 40, 8), &app, 2);
+        let Some(crate::app::Intent::Editor(page)) = app.tick(Duration::ZERO, &compact) else {
+            panic!("compact form did not request the first live selection");
+        };
+        worker.action(page).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while worker.search.status.rows.current.is_none() {
+            worker.poll_background();
+            assert!(Instant::now() < deadline, "result page did not settle");
+            thread::yield_now();
+        }
+        worker.publish();
+        app.update(worker.tab.screen.clone(), false);
+        assert_eq!(app.focus, Some(Control::SearchList));
+        assert_eq!(
+            app.screen.search.rows.current,
+            Some(1),
+            "first live row follows a receipt"
+        );
+    }
+
     /// A later replacement may not edit the previous match while a chosen row is unresolved.
     #[test]
     fn pending_result_selection_cannot_replace_previous_match() {

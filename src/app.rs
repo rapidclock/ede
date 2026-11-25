@@ -79,6 +79,7 @@ pub(crate) enum Modal {
         settings_focus: Control,
     },
     Details(String),
+    SearchDetails(crate::editor::search::Summary),
     SaveError(String),
     PersistenceError(String),
     Recovery(Box<recovery::Dialog>),
@@ -375,6 +376,9 @@ impl AppState {
     /// Preserve valid focus and invalidate capture after geometry or overlay changes.
     pub fn sync_layout(&mut self, layout: &LayoutSnapshot) {
         self.search_resize_results(layout.search_result_rows());
+        if matches!(self.modal, Some(Modal::SearchDetails(_))) {
+            self.help_scroll = self.help_scroll.min(layout.search_details_scroll_limit);
+        }
         if let Some(Modal::Open(picker)) = &mut self.modal {
             picker.top = picker.list_start(layout.list_rows());
         }
@@ -473,6 +477,7 @@ impl AppState {
         self.notify(StatusMessage::new(Severity::Info, message));
         self.sync_search_selection(&screen.search.rows);
         self.screen = screen;
+        self.sync_find_focus();
         self.pending = pending;
         self.dirty = true;
     }
@@ -1454,6 +1459,7 @@ impl AppState {
             self.modal,
             Some(
                 Modal::Details(_)
+                    | Modal::SearchDetails(_)
                     | Modal::TabDetails { .. }
                     | Modal::About { .. }
                     | Modal::SettingsDiagnostic { .. }
@@ -1478,6 +1484,12 @@ impl AppState {
                 return self
                     .command(Command::Cancel, layout)
                     .or(Some(Intent::Editor(Action::RetryRefresh(tab))));
+            }
+            if let Command::Move(movement, _) = command
+                && matches!(self.modal, Some(Modal::SearchDetails(_)))
+            {
+                self.move_search_details(movement, layout);
+                return None;
             }
             if matches!(command, Command::Move(..)) {
                 self.help_scroll =
@@ -1921,6 +1933,13 @@ impl AppState {
                     let movement = if up { Movement::Up } else { Movement::Down };
                     menu.move_in(commands, movement, layout.list_rows());
                 }
+            } else if matches!(self.modal, Some(Modal::SearchDetails(_))) {
+                if layout
+                    .overlay
+                    .is_some_and(|area| area.contains((mouse.column, mouse.row).into()))
+                {
+                    self.scroll_search_details(if up { -3 } else { 3 }, layout);
+                }
             } else if self.help
                 || matches!(
                     self.modal,
@@ -1948,6 +1967,7 @@ impl AppState {
         }
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
+                self.search.focus_after_find = None;
                 self.pointer_press = self.pointer_press.wrapping_add(1);
                 self.capture = hit.map(|control| Capture {
                     control,
@@ -1966,7 +1986,11 @@ impl AppState {
                             | Control::SettingsFindRowsStep(_)
                     )
                 }) {
-                    self.focus = Some(control);
+                    if let Control::Search(index @ (0 | 1)) = control {
+                        self.search_focus(index);
+                    } else {
+                        self.focus = Some(control);
+                    }
                     self.dirty = true;
                 }
                 if hit == Some(Control::Content) {
@@ -2132,6 +2156,7 @@ impl AppState {
                 | Modal::Recovery(_)
                 | Modal::Path(..)
                 | Modal::Details(_)
+                | Modal::SearchDetails(_)
                 | Modal::TabDetails { .. }
                 | Modal::About { .. }
                 | Modal::SettingsDiagnostic { .. },

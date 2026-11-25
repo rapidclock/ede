@@ -2,7 +2,7 @@
 use super::*;
 use crate::{
     app::search::{FORM_DOWN, FORM_UP, OPTIONS, SHOW_RESULTS, SUBMIT, display},
-    editor::search::results::Row,
+    editor::search::{Summary, results::Row},
     settings::Scalar,
 };
 use ratatui::text::{Line, Span};
@@ -57,13 +57,13 @@ impl LayoutSnapshot {
         } else {
             form_rows.min(body_limit)
         };
-        let shown_results = desired_results.min(body_limit - shown_form);
+        let list_gap = u16::from(!compact && desired_results > 0 && body_limit > shown_form + 1);
+        let shown_results = desired_results.min(body_limit - shown_form - list_gap);
         let spare = if compact {
             0
         } else {
             body_limit - shown_form - shown_results
         };
-        let list_gap = u16::from(shown_results > 0 && shown_form > 0 && spare > 0);
         let options_gap = u16::from(spare > list_gap);
         let navigation_gap = u16::from(spare > list_gap + options_gap);
         let height = 2 + shown_form + shown_results + list_gap + options_gap + navigation_gap;
@@ -158,6 +158,31 @@ fn button_width(app: &AppState, index: u8) -> u16 {
     app.search.label(index).width() as u16 + if matches!(index, 2 | 3) { 0 } else { 2 }
 }
 
+fn divider(width: u16) -> Line<'static> {
+    Line::styled(
+        "─".repeat(usize::from(width)),
+        Style::default().add_modifier(Modifier::DIM),
+    )
+}
+
+/// Escape individual values and add genuine terminal rows for sections.
+pub(super) fn details(report: &Summary, width: u16) -> Paragraph<'static> {
+    let heading = Style::default().add_modifier(Modifier::BOLD);
+    let mut lines = vec![Line::styled(safe(&report.headline), heading)];
+    for (label, rows) in [
+        ("Tabs", &report.tabs),
+        ("Replacement", &report.replacements),
+        ("Notices", &report.notices),
+    ] {
+        if !rows.is_empty() {
+            lines.push(divider(width));
+            lines.push(Line::styled(label, heading));
+            lines.extend(rows.iter().map(|row| Line::from(safe(row))));
+        }
+    }
+    Paragraph::new(lines).wrap(Wrap { trim: false })
+}
+
 /// Paint the shared geometry in terminal cells; the same regions receive pointer events.
 pub(super) fn render(frame: &mut Frame<'_>, app: &AppState, layout: &LayoutSnapshot, window: Rect) {
     let status = &app.screen.search;
@@ -210,6 +235,17 @@ pub(super) fn render(frame: &mut Frame<'_>, app: &AppState, layout: &LayoutSnaps
     };
     frame.render_widget(Clear, window);
     frame.render_widget(Block::default().title(title).borders(Borders::ALL), window);
+    if let Some(list) = layout.search_list
+        && layout
+            .targets
+            .iter()
+            .any(|target| target.control == Control::Search(0) && target.area.y > list.bottom())
+    {
+        frame.render_widget(
+            Paragraph::new(divider(list.width)),
+            Rect::new(list.x, list.bottom(), list.width, 1),
+        );
+    }
     if !message.is_empty() {
         frame.render_widget(
             Paragraph::new(format!(" {message} ")),
@@ -393,6 +429,56 @@ mod tests {
     use super::*;
     use crate::editor::search::Operation;
     use ratatui::{Terminal, backend::TestBackend};
+
+    /// Long reports scroll to their last wrapped row and return to the headline.
+    #[test]
+    fn search_details_scroll_to_both_ends_and_escape_values() {
+        use crate::{command::Movement, input::Input};
+        let mut app = AppState::new();
+        let mut tabs = vec!["tab\nname · 1 match · Complete".into()];
+        tabs.extend((2..=24).map(|i| format!("tab {i} · 1 match · Complete")));
+        app.modal = Some(Modal::SearchDetails(Summary {
+            headline: "24 matches".into(),
+            tabs,
+            replacements: vec![],
+            notices: vec![],
+        }));
+        app.focus = Some(Control::DetailsClose);
+        let mut terminal = Terminal::new(TestBackend::new(65, 14)).unwrap();
+        let layout = LayoutSnapshot::for_app(Rect::new(0, 0, 65, 14), &app, 1);
+        let screen = |terminal: &mut Terminal<TestBackend>, app: &AppState| {
+            terminal
+                .draw(|frame| super::super::render(frame, app, &layout))
+                .unwrap();
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>()
+        };
+        let start = screen(&mut terminal, &app);
+        assert!(start.contains("24 matches") && start.contains("tab<U+000A>name"));
+
+        app.input(
+            Input::Command(Command::Move(Movement::PageDown, false)),
+            &layout,
+        );
+        assert_eq!(app.help_scroll, layout.overlay.unwrap().height - 3);
+        app.input(Input::Command(Command::Move(Movement::End, false)), &layout);
+        app.input(
+            Input::Command(Command::Move(Movement::Down, false)),
+            &layout,
+        );
+        assert_eq!(app.help_scroll, layout.search_details_scroll_limit);
+        assert!(screen(&mut terminal, &app).contains("tab 24 · 1 match · Complete"));
+        app.input(
+            Input::Command(Command::Move(Movement::Home, false)),
+            &layout,
+        );
+        assert!(screen(&mut terminal, &app).contains("24 matches"));
+    }
 
     /// An empty-page refresh cannot cancel a press on an unchanged form control.
     #[test]
