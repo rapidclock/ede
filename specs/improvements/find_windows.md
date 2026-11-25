@@ -36,7 +36,7 @@ result status have distinct text cues for monochrome terminals.
 ```text
 ┌─ Find ─────────────────────────────────────────── [×] ┐
 │ Find    [ apple                              ] [Find] │
-│ › Options  Case on · Whole word off · Current         │
+│ › Options  Case on · Match Whole Word off · Current   │
 │ [Previous] [Next]                     2 of 18 matches │
 │   3:7    green apple                                  │
 │ > 12:1   apple tree                                   │
@@ -46,9 +46,9 @@ result status have distinct text cues for monochrome terminals.
 ┌─ Find & Replace ───────────────────────────────── [×] ┐
 │ Find    [ apple                              ] [Find] │
 │ Replace [ pear                                      ] │
-│                         [Replace next] [Replace all…] │
+│                          [Replace Next] [Replace All] │
 │ ⌄ Options                                             │
-│   [x] Match case  [ ] Whole word  Scope [All open]    │
+│   [x] Match case  [ ] Match Whole Word     [All open] │
 │   Insert [Tab] [LF] [CRLF]                            │
 │ [Previous] [Next]                     1 of 26 matches │
 │   notes.txt  3:7    Replaced · green apple            │
@@ -59,18 +59,21 @@ result status have distinct text cues for monochrome terminals.
 - Open with the Find field focused. In both modes put **Find** at the right
   edge of the query row. Use the existing green foreground and focus treatment
   from the Settings Save action for the enabled Find button. In Find & Replace,
-  put **Replace next** and **Replace all…** on their own row immediately below
-  the replacement field, with the group aligned to the same right edge.
+  put **Replace Next** and **Replace All** on their own row immediately below
+  the replacement field, with the group aligned to the same right edge. Use
+  cyan for **Replace Next** and yellow for **Replace All**, including the
+  confirmation action. Preserve the text labels and focus cues in monochrome.
 - Put **Options** and all its controls below those actions in both modes,
   before result navigation. Use an unboxed heading like the Actions category
   rows and Settings sidebar groups. A leading `›` indicates collapsed and `⌄`
   indicates expanded. The whole heading is clickable and shows keyboard focus.
   Click or Enter toggles it, Right expands it, and Left collapses it with the
   heading focused. Start collapsed with the case, whole-word, and scope values
-  alongside the heading. Indent the labeled **Match case**, **Whole word** and
-  **Scope** controls when expanded. Keep Insert Tab, Insert LF and Insert CRLF
-  there for the last focused text field. If collapse hides the focused
-  control, return focus to Options.
+  alongside the heading. Indent **Match case** and **Match Whole Word** when
+  expanded. Give the scope selector its own visual position and show its
+  current value (**Current** or **All open**). Keep Insert Tab, Insert LF and
+  Insert CRLF there for the last focused text field. If collapse hides the
+  focused control, return focus to Options.
 - At `40×8`, use a compact scrollable form and results view with at least three
   full editor rows exposed. Show a clickable way to switch between form and
   results and to scroll to offscreen form controls. Preserve the equivalent
@@ -137,12 +140,12 @@ result status have distinct text cues for monochrome terminals.
 
 ## Replacement
 
-- **Replace next** and Enter in the Replace field use the existing exact-match
+- **Replace Next** and Enter in the Replace field use the existing exact-match
   behavior. Recheck the match against the current document revision and its
   editability. If no valid current match exists, reveal one and require another
   activation to edit. After a replacement, restore a coherent list for the new
   revision and synchronize it with the existing non-wrapping advancement.
-- **Replace all…** opens the existing scope confirmation with Cancel focused.
+- **Replace All** opens the existing scope confirmation with Cancel focused.
   It applies to the captured search scope and matching rules, including results
   outside the visible list page. Preserve one Undo step per changed document,
   literal replacement, read-only handling, and reporting of partial outcomes.
@@ -151,10 +154,10 @@ result status have distinct text cues for monochrome terminals.
   in the Find & Replace list with its original preview and a visible text
   label. Use **Replaced** for changed text and **Removed** when an empty
   replacement deleted the occurrence. Keep the label visible when the preview
-  is clipped. Replace next shows the feedback promptly and keeps the next live
+  is clipped. Replace Next shows the feedback promptly and keeps the next live
   match visible alongside it where space allows. Feedback covers the latest
   replacement action that changed text, including successfully changed
-  documents in a partial Replace all. Use the same bounded list mechanism for
+  documents in a partial Replace All. Use the same bounded list mechanism for
   large batches. Only edits that changed text and were committed get a label.
 - Feedback rows record where a change was made. They are excluded from the live
   match count, Next and Previous, and replacement actions. When inserted text
@@ -168,11 +171,11 @@ result status have distinct text cues for monochrome terminals.
 
 | ID | Observable outcome |
 | --- | --- |
-| A1 | Both modes open from existing entry points and show a green, right-aligned Find action. Find & Replace places its right-aligned replacement actions on the row immediately below the replacement field. In both modes, the unboxed Options heading follows the actions and shows its state and collapsed summary. Labels and focus are visible in monochrome. At `80×24`, `40×8`, and after resize, the window exposes the editor and the active match can be revealed outside it. |
+| A1 | Both modes open from existing entry points and show a green, right-aligned Find action. Find & Replace shows cyan Replace Next and yellow Replace All, right-aligned immediately below the replacement field. In both modes, the unboxed Options heading follows the actions, shows its collapsed summary, and expands to reveal Match Whole Word and the separate scope selector. Labels and focus are visible in monochrome. At `80×24`, `40×8`, and after resize, the window exposes the editor and the active match can be revealed outside it. |
 | A2 | Starting in Find, use arrow keys and Enter to expand and collapse Options, reach flags, browse results, and reach the available actions without Tab. Repeat with mouse only, including clicking the Options heading, wheel scrolling, and a single result click. Verify Tab, Shift+Tab, F6, the remapped command routes, and Escape and outside-click behavior. |
 | A3 | Browse matches beyond the first page of a dense document and jump to the first and last occurrence. In All open, choose a result in another unsaved tab. Verify same-line matches, locations and previews for multibyte/multiline text, selected-row synchronization after Next/Previous, and wheel scrolling without a jump. |
 | A4 | Verify empty, no-match, busy, cancelled, and partial outcomes. During controlled search or row-fetch delays, change query, scope, revision, or tab availability and verify stale rows cannot navigate or replace. Verify a press followed by a resize or row change cannot activate the new target. |
-| A5 | Select a specific match from Find & Replace, replace it, and verify non-wrapping advancement and refreshed results. Confirm and cancel Replace all in both scopes. Verify one Undo step per changed document, read-only handling, and reporting if work stops partway. Check literal field paste and case and whole-word regressions. |
+| A5 | Select a specific match from Find & Replace, replace it, and verify non-wrapping advancement and refreshed results. Confirm and cancel Replace All in both scopes. Verify one Undo step per changed document, read-only handling, and reporting if work stops partway. Check literal field paste and case and whole-word regressions. |
 | A6 | Verify Replaced for changed text and Removed for deletion, including a partial batch and feedback beyond the first page. Verify identical, skipped, and uncommitted edits leave no new marker. Browse feedback without jumping or changing the live count, including when inserted text itself matches. Verify feedback clears on undo, subsequent edits, and search changes. |
 
 ## Validation record
@@ -182,7 +185,8 @@ result status have distinct text cues for monochrome terminals.
   behavior was established by source inspection.
 - Layout revision — Checked the Actions category and Settings sidebar group
   rendering and the Settings Save button styling in `src/ui.rs`. Incorporated
-  the requested action placement and disclosure style into both sketches.
+  the requested action placement, labels, color distinctions, and disclosure
+  style into both sketches.
 - Pending — A1–A2 layout and input checks in a PTY and an interactive terminal
   with mouse capture. Check standard and minimum dimensions and resizing.
 - Pending — A3–A6 focused Rust and PTY tests for navigation, bounded result
