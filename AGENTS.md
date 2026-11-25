@@ -13,7 +13,7 @@ to `main` for each of these workflows.
 | --- | --- | --- |
 | Bug or defect fix | `bug/NAME` | Increment patch by one. |
 | Feature | `feat/PROJECT_NAME` | Increment minor or major by one. Record the human's choice when drafting the feature overview, specification, or outline. |
-| Simple enhancement | `enhance/NAME` | For a small improvement, confirm a patch or minor increment with the human before work begins. |
+| Small improvement | `enhance/NAME` | Confirm a patch or minor increment with the human before work begins. |
 | Ad hoc maintenance | `adhoc/NAME` | No bump for changes limited to AI rules, documentation (including the README), or CI, with no application code changes. |
 
 For a staged feature, create `stage/STAGE_NAME` branches from the feature branch
@@ -33,10 +33,29 @@ target release version.
 
 ## Specification Documents
 
-- Specifications are iterative working documents. Update them as decisions change;
-  distinguish requirements, proposals, open questions, and approved decisions.
-- Start each project at `specs/NNN_project_name/overview.md`. Capture the complete
-  functional scope, constraints, and unresolved decisions at a high level first.
+- A specification governs the work it describes while that work is active.
+  Edit only the specifications for the work in scope. Update them as decisions
+  change and distinguish requirements, proposals, open questions, and approved
+  decisions.
+- Treat specifications on `main` as historical records of their original
+  scope, decisions, and validation. Keep those documents intact unless the
+  human explicitly requests a historical correction.
+  When later work supersedes earlier behavior, record the new behavior and the
+  affected requirements in the new specification. Link to earlier sections when
+  useful. Check current code, tests, and later decisions before relying on an
+  earlier specification to determine current behavior.
+- Keep the root `README.md` focused on the project's current public behavior
+  and usage. It ships with the crate. Keep it self-contained and omit references
+  or links to specifications, stages, and their validation records.
+- Approval of a specification does not itself authorize implementation. Follow
+  the user's current scope and wait for authorization before creating application
+  scaffolding, implementation, stage files, or tests.
+
+### Features
+
+- Start each feature project at `specs/NNN_project_name/overview.md`. Capture the
+  complete functional scope, constraints, and unresolved decisions at a high
+  level first.
 - Obtain explicit user approval of the overview before breaking down the entire project into self-contained stages.
 - Then describe the observable outcome expected at the end of each stage in the overview, and elaborate stage details in `NN_stage_name.md` files.
 - Keep stage specifications concise, clear, and self-contained. Specify behavior,
@@ -46,20 +65,38 @@ target release version.
   check results, acceptance evidence, tested environments, limitations, and agreed
   deferrals there; do not create a separate validation Markdown file. While a
   stage is only a design draft, mark validation as pending. Link to this section
-  from the overview and other documentation, and update it as checks are run.
-
-- Approval of a specification does not itself authorize implementation. Follow the
-  user's current scope; do not create application scaffolding, implementation,
-  stage files, or tests before the corresponding work is authorized.
+  from the overview and other internal documentation, and update it as checks
+  are run.
 - A workflow where the agent writes functional/system tests and the user writes
   implementation is an option to discuss later, not an established requirement.
+
+### Defects and small improvements
+
+- Create one standalone **Defect Spec** at `specs/defects/NAME.md` on its
+  `bug/NAME` branch, or one **Improvement Spec** at `specs/improvements/NAME.md`
+  on its `enhance/NAME` branch. Reuse the branch's spec when resuming the same
+  work. Draft it before writing tests or changing implementation. These specs
+  use a single file. Ad hoc maintenance follows its existing workflow.
+- A Defect Spec records observed and expected behavior, reproduction steps and
+  environment, affected versions or scope, and regression acceptance criteria.
+  Record any reproduction gaps and add confirmed causes as investigation proceeds.
+- An Improvement Spec records the current behavior, the requested outcome,
+  scope, constraints, acceptance criteria, and the confirmed patch or minor
+  version target.
+- End each with a `Validation record`. Mark checks pending until run, then
+  record the checks and results, tested environments, limitations, and agreed
+  deferrals there. Before pausing or handing off, update the spec on the work
+  branch with approved decisions, open questions, current status, and next step.
+  Include the spec in the PR and give the branch or PR and spec path at handoff.
+- When resuming in another session, identify the branch or PR, read its spec,
+  and inspect its Git status and diff before editing. Use that evidence to
+  pick up the recorded next step and confirm what's already done.
 
 ## Test-first development and review
 
 1. Define the observable behavior and the constraints that must hold on success
-   and failure. For a small change, the test can be the behavior record. For
-   stage work, link the affected acceptance criteria to checks in the existing
-   `Validation record`.
+   and failure. Link the affected acceptance criteria to checks in the active
+   specification's `Validation record` for stage, defect, and improvement work.
 2. For a behavior change, write or extend the focused test before changing the
    implementation. Run it and confirm it fails for the expected reason. An
    existing test that reproduces the problem serves the same purpose. When
