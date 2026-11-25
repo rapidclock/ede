@@ -501,6 +501,16 @@ impl<'a> Text<'a> {
     }
     /// Build only visible rows and spans, charging retained strings and descriptors.
     pub fn view(&mut self, request: ViewRequest, cache: &mut Checkpoints) -> Result<View, Error> {
+        self.view_revealing_match(request, cache, None)
+    }
+
+    /// Reveal a match above the window while preparing the full document viewport.
+    pub fn view_revealing_match(
+        &mut self,
+        request: ViewRequest,
+        cache: &mut Checkpoints,
+        search: Option<(u16, u64)>,
+    ) -> Result<View, Error> {
         let mut lease = LayoutLease::acquire(self.cancel)?;
         let ViewRequest {
             position,
@@ -514,10 +524,23 @@ impl<'a> Text<'a> {
         cache.reset(self.snapshot.revision());
         let (line, column) = self.coordinates(position.caret, cache)?;
         if reveal {
+            let (visible, last) = if let Some((covered, last_byte)) = search {
+                let visible = height.saturating_sub(covered).max(1);
+                let last_byte = self.snapshot.floor_scalar(ByteOffset(last_byte))?;
+                let last = self.snapshot.line_of_offset(last_byte)?;
+                let last = if last.saturating_sub(line) < u64::from(visible) {
+                    last.max(line)
+                } else {
+                    line
+                };
+                (visible, last)
+            } else {
+                (height, line)
+            };
             if line < top {
                 top = line;
-            } else if line >= top.saturating_add(height as u64) {
-                top = line.saturating_sub(height.saturating_sub(1) as u64);
+            } else if last >= top.saturating_add(u64::from(visible)) {
+                top = last.saturating_sub(u64::from(visible.saturating_sub(1)));
             }
             if column < left {
                 left = column;

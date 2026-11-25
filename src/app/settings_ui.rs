@@ -9,8 +9,9 @@ mod shortcuts;
 pub(crate) use shortcuts::group_label;
 use shortcuts::{Category, command_label};
 
-const EDITOR_ROW: usize = Scalar::ALL.len();
-const GENERAL_ROWS: usize = EDITOR_ROW + 1;
+const EDITOR_ROW: usize = Scalar::FindMatchRows as usize;
+pub(crate) const FIND_MATCH_ROWS: usize = EDITOR_ROW + 1;
+const GENERAL_ROWS: usize = FIND_MATCH_ROWS + 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Operation {
@@ -231,6 +232,15 @@ impl Draft {
 
     /// Describe a general setting with its current draft value.
     pub(crate) fn row_label(&self, index: usize) -> String {
+        if index == FIND_MATCH_ROWS {
+            let value = Scalar::FindMatchRows;
+            return format!(
+                "{}    [−] {:>2}  [+]  1–{}",
+                value.label(),
+                self.find_match_rows(),
+                value.maximum()
+            );
+        }
         if index == EDITOR_ROW {
             return format!(
                 "Default line ending · {}",
@@ -248,6 +258,11 @@ impl Draft {
             scalar.label(),
             self.revision.values.get(scalar)
         )
+    }
+
+    /// Current draft height for the Find match list in either mode.
+    pub(crate) fn find_match_rows(&self) -> u64 {
+        self.revision.values.get(Scalar::FindMatchRows)
     }
 
     /// Returning to the applied value restores its original override state.
@@ -344,7 +359,7 @@ impl Draft {
         match self.selected {
             0 => Section::Recovery,
             1..EDITOR_ROW => Section::Highlighting,
-            EDITOR_ROW => Section::Editor,
+            EDITOR_ROW..GENERAL_ROWS => Section::Editor,
             _ => Section::Keyboard,
         }
     }
@@ -852,6 +867,12 @@ impl AppState {
             }
             Command::Move(movement, _) => {
                 let compact = area.width < crate::ui::SETTINGS_SPLIT_WIDTH;
+                if self.focus == Some(Control::SettingsRow(FIND_MATCH_ROWS))
+                    && matches!(movement, Movement::Left | Movement::Right)
+                {
+                    self.settings_step_find_rows(movement == Movement::Right, layout);
+                    return None;
+                }
                 if let Some(Control::SettingsGroup(_)) = self.focus {
                     let inline = crate::ui::settings_groups_inline(area);
                     let step = match movement {
@@ -1097,6 +1118,37 @@ impl AppState {
         }
     }
 
+    /// Adjust the selected stepper in the working draft for either input route.
+    pub(super) fn settings_step_find_rows(&mut self, increase: bool, layout: &LayoutSnapshot) {
+        if !layout.contains(Control::SettingsRow(FIND_MATCH_ROWS))
+            || self.config_location.user_directory().is_none()
+        {
+            return;
+        }
+        if let Some(draft) = self.settings_ui.as_deref_mut()
+            && draft.page == Page::List
+        {
+            let scalar = Scalar::FindMatchRows;
+            let current = draft.find_match_rows();
+            let next = if increase {
+                (current + 1).min(scalar.maximum())
+            } else {
+                (current - 1).max(1)
+            };
+            if next != current {
+                let original = draft.original.values;
+                let value = if next == original.get(scalar) {
+                    original.override_value(scalar)
+                } else {
+                    Some(next)
+                };
+                draft.revision.values.set(scalar, value);
+            }
+            draft.selected = FIND_MATCH_ROWS;
+            self.switch_settings(Page::List);
+        }
+    }
+
     fn settings_back(&mut self, layout: &LayoutSnapshot) {
         let Some(draft) = self.settings_ui.as_deref() else {
             return;
@@ -1163,7 +1215,9 @@ impl AppState {
             B::NextKey => self.settings_adjacent(1),
             B::Back | B::DiscardCapture => self.settings_back(layout),
             B::Edit => {
-                if draft.selected == EDITOR_ROW {
+                if draft.selected == FIND_MATCH_ROWS {
+                    self.switch_settings(Page::List);
+                } else if draft.selected == EDITOR_ROW {
                     if writable {
                         draft.toggle_default_line_ending();
                     }

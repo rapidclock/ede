@@ -374,7 +374,7 @@ impl AppState {
     }
     /// Preserve valid focus and invalidate capture after geometry or overlay changes.
     pub fn sync_layout(&mut self, layout: &LayoutSnapshot) {
-        self.search.visible_results = layout.search_result_rows();
+        self.search_resize_results(layout.search_result_rows());
         if let Some(Modal::Open(picker)) = &mut self.modal {
             picker.top = picker.list_start(layout.list_rows());
         }
@@ -393,11 +393,20 @@ impl AppState {
             });
         }
         if !self.focus.is_some_and(|focus| layout.contains(focus)) {
-            self.focus = if layout.contains(Control::Content) {
-                Some(Control::Content)
+            if layout.search_bounds().is_some()
+                && matches!(
+                    self.focus,
+                    Some(Control::Search(_) | Control::SearchList | Control::SearchResult(_))
+                )
+            {
+                self.search_focus(0);
             } else {
-                layout.next(None, false)
-            };
+                self.focus = if layout.contains(Control::Content) {
+                    Some(Control::Content)
+                } else {
+                    layout.next(None, false)
+                };
+            }
         }
         if self
             .capture
@@ -1954,6 +1963,7 @@ impl AppState {
                             | Control::TabClose(_)
                             | Control::SearchSurface
                             | Control::SearchList
+                            | Control::SettingsFindRowsStep(_)
                     )
                 }) {
                     self.focus = Some(control);
@@ -2042,7 +2052,10 @@ impl AppState {
                         }
                         // Keyboard focus may have changed while the button was held.
                         // Activate the clicked control, not another focused button.
-                        if !matches!(capture.control, Control::TabClose(_)) {
+                        if !matches!(
+                            capture.control,
+                            Control::TabClose(_) | Control::SettingsFindRowsStep(_)
+                        ) {
                             self.focus = Some(capture.control);
                         }
                         if let Control::SettingsButton(button) = capture.control {
@@ -2053,6 +2066,8 @@ impl AppState {
                             self.settings_group(group);
                         } else if let Control::SettingsGroupStep(next) = capture.control {
                             self.settings_group_adjacent(if next { 1 } else { -1 });
+                        } else if let Control::SettingsFindRowsStep(increase) = capture.control {
+                            self.settings_step_find_rows(increase, layout);
                         } else if let Control::SettingsRow(row) = capture.control {
                             self.settings_row(row, layout);
                         } else if let Some(Modal::Menu(menu)) = &mut self.modal {

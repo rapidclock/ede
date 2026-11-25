@@ -1,6 +1,6 @@
 # Improvement Spec — Find and Find & Replace windows
 
-**Status** — Implemented and locally validated for review.
+**Status** — Follow-up implemented and validated for review on macOS and Ubuntu.
 **Release** — User-confirmed patch target `0.1.2`, from `0.1.1` on `main`.
 The review build is `0.1.2-dev.1`.
 **Branch** — `enhance/find-windows`, based on `main` at `3004bb3`.
@@ -20,15 +20,22 @@ open tabs, including unsaved text. Keep literal matching, existing shortcuts
 and remaps, session field retention, cancellation, and replacement safeguards.
 This supersedes the dock and control-navigation design in [Stage 06](../001_initial_mvp/06_search_and_replace.md#commands-and-interaction).
 
-## Proposed windows
+## Windows
 
-The proposed layout places a bordered window in the upper-right of the editor
-area, leaving the tab strip and status bar visible. In normal terminals, cap
-the width at 60 columns and the height at half the editor area. The match list
-uses the remaining space and scrolls independently of the editor. The window
-must stay the same size as result counts grow. When a jump would place the match
-under the window, reveal the match start by repositioning the window or scrolling
-the editor. Show the whole match when it fits in the exposed area.
+Anchor both windows to the bottom right above the status bar, with the result
+list above the form. Cap the width at 60 columns and keep at least three editor
+rows exposed. Omit the result area when there are no results. Add blank rows
+between the list, fields and actions, Options, and navigation when room allows.
+Keep the selected match visible by scrolling the editor as needed. The list
+scrolls independently of the editor.
+
+**Settings → Editor → Find match rows** controls the maximum visible result
+rows in both modes. Default to 3 and accept integers from 1 to 10. Use a
+stepper with clickable minus and plus buttons and Left and Right on the focused
+setting. Up and Down select Settings rows. Save through the existing Settings
+action, using `find_match_rows` under `[editor]` in `config.toml`. Show fewer
+rows in short terminals or when fewer results exist. The dialog's Options
+continue to contain the search flags, scope, and literal inserts.
 
 The sketches show Find with Options collapsed and Find & Replace with Options
 expanded after a replacement. The colored Find button, disclosure marker, and
@@ -36,24 +43,31 @@ result status have distinct text cues for monochrome terminals.
 
 ```text
 ┌─ Find ─────────────────────────────────────────── [×] ┐
-│ Find    [ apple                              ] [Find] │
-│ › Options  Case on · Match Whole Word off · Current   │
-│ [Previous] [Next]                     2 of 18 matches │
 │   3:7    green apple                                  │
 │ > 12:1   apple tree                                   │
 │   15:7   baked apple                                  │
+│                                                       │
+│ Find    [ apple                              ] [Find] │
+│                                                       │
+│ › Options  Case on · Match Whole Word off · Current tab│
+│                                                       │
+│ [Previous] [Next]                     2 of 18 matches │
 └───────────────────────────────────────────────────────┘
 
 ┌─ Find & Replace ───────────────────────────────── [×] ┐
+│   3:7  notes.txt  Replaced · green apple               │
+│ > 12:1 notes.txt  apple tree                           │
+│                                                       │
 │ Find    [ apple                              ] [Find] │
 │ Replace [ pear                                      ] │
 │                          [Replace Next] [Replace All] │
+│                                                       │
 │ ⌄ Options                                             │
 │   [x] Match case  [ ] Match Whole Word                 │
-│   Insert [Tab] [LF] [CRLF]                  [All open] │
+│   Insert [Tab] [LF] [CRLF]                             │
+│   [All open tabs]                                     │
+│                                                       │
 │ [Previous] [Next]                     1 of 26 matches │
-│   notes.txt  3:7    Replaced · green apple            │
-│ > notes.txt 12:1    apple tree                        │
 └───────────────────────────────────────────────────────┘
 ```
 
@@ -72,7 +86,7 @@ result status have distinct text cues for monochrome terminals.
   heading focused. Start collapsed with the case, whole-word, and scope values
   alongside the heading. Indent **Match case** and **Match Whole Word** when
   expanded. Give the scope selector its own visual position and show its
-  current value (**Current** or **All open**). Keep Insert Tab, Insert LF and
+  current value (**Current tab** or **All open tabs**). Keep Insert Tab, Insert LF and
   Insert CRLF there for the last focused text field. If collapse hides the
   focused control, return focus to Options.
 - At `40×8`, use a compact scrollable form and results view with at least three
@@ -91,12 +105,11 @@ result status have distinct text cues for monochrome terminals.
 
 ## Input and results
 
-- **Form focus** — Up and Down move between visible form rows, including from a
-  text field into Options or the action rows. Left and Right move within the
-  active text field or between controls on the same row. Tab and Shift+Tab
-  remain available. Enter activates the focused control. Every visible control
-  has a mouse hit target. The form, list, options, actions, and dismissal are
-  reachable without Tab and without the mouse.
+- **Form focus** — Up and Down move between form rows. When Options is
+  expanded, they reach each control in order, including controls on the same
+  row. Left and Right move within the active text field or between controls on
+  the same row. Tab and Shift+Tab remain available. Enter activates the focused
+  control. Every visible control has a mouse hit target.
 - **Search** — Enter in Find or click Find to submit the current literal query.
   Preserve the current initial Next behavior from the caret. Empty queries
   clear results and disable match and replacement actions. Query or option
@@ -104,8 +117,9 @@ result status have distinct text cues for monochrome terminals.
   prompts to search again. Editing only the replacement preserves search
   results and invalidates pending replacement intent. Each field keeps the
   existing 4096-byte UTF-8 limit, literal paste, and safe display of controls.
-- **List focus** — Down from the last form row enters the list and focuses the
-  current match or the first available row. Left returns to the form. Up and
+- **List focus** — Up from the Find field enters the list and focuses the
+  current match or the first available row. Left or Down past the final row
+  returns to the Find field. Up and
   Down move by one row, Page Up and Page Down by one visible page, and Home and
   End reach the first and last available rows. Movement stops at the ends.
   Moving onto a live match reveals it. Enter or one click reveals a live match
@@ -178,9 +192,34 @@ result status have distinct text cues for monochrome terminals.
 | A4 | Verify empty, no-match, busy, cancelled, and partial outcomes. During controlled search or row-fetch delays, change query, scope, revision, or tab availability and verify stale rows cannot navigate or replace. Verify a press followed by a resize or row change cannot activate the new target. |
 | A5 | Select a specific match from Find & Replace, replace it, and verify non-wrapping advancement and refreshed results. Confirm and cancel Replace All in both scopes. Verify one Undo step per changed document, read-only handling, and reporting if work stops partway. Check literal field paste and case and whole-word regressions. |
 | A6 | Verify Replaced for changed text and Removed for deletion, including a partial batch and feedback beyond the first page. Verify identical, skipped, and uncommitted edits leave no new marker. Browse feedback without jumping or changing the live count, including when inserted text itself matches. Verify feedback clears on undo, subsequent edits, and search changes. |
+| A7 | Both modes anchor at the bottom right and list results above the form. With no saved preference, show up to three result rows. The Settings stepper stops at 1 and 10, accepts keyboard and mouse input, and persists on Save. After restart the preference applies to both modes. Reduce rows as needed at compact sizes and keep the selected document occurrence visible above the window. |
 
 ## Validation record
 
+- Follow-up (A1–A3, A7) — Approved bottom-right placement, matches above the
+  form, a shared 1–10 row stepper with default 3, vertical arrow traversal
+  through Options, clearer scope labels, and section spacing when room allows.
+  Before the fixes, real PTY tests reproduced Down skipping Match Whole Word
+  and a one-row wheel step skipping the next match. The settings schema tests
+  cover both bounds and reject invalid integers and value types.
+- Follow-up review (A1–A5, A7) — Independent review caught multibyte match
+  reveal, compact list focus, and an intermittent Replace All click dropped
+  during an empty result-page refresh. Native PTY regressions cover Unicode
+  reveal, resize in both directions, stepper persistence, arrow-only Options,
+  wheel-only browsing without a caret jump, and click-to-jump. The capture
+  signature test verifies visible result metadata still invalidates old hits.
+  The reviewer also verified twelve consecutive native Replace All runs and
+  rechecked selection preservation and one-row browsing after the fixes.
+- Follow-up regression runs — Formatting and locked workspace Clippy with
+  warnings denied passed on macOS 27.2.1 and the Ubuntu 26.10 UTM guest with
+  Rust `1.100.0` on arm64. The full locked workspace suite, with the CI
+  256-file limit, passed 383 tests on macOS and 386 on Ubuntu. The standard
+  run reported 10 and 11 existing ignored tests, respectively.
+- Linux release checks — The guest passed optimized native Find and Settings
+  tests and the search and replacement benchmark on ordinary, dense-line,
+  and long-line 256 MiB fixtures with a 256 MiB memory limit and no swap.
+  The available UTM guest reports Ubuntu 26.10. Ubuntu 26.04 and the full
+  1 GiB CI benchmark matrix remain unverified on the guest.
 - Draft basis — Inspected `main` at `3004bb3`, including search command routing,
   rendering, search state, and existing search and terminal tests. Current
   behavior was established by source inspection.
@@ -210,8 +249,8 @@ result status have distinct text cues for monochrome terminals.
 - Regression run — On arm64 macOS with Rust `1.100.0`, formatting and
   workspace Clippy passed. The full locked workspace suite passed with 379
   tests passing and 10 existing ignored tests, with the CI 256-file limit and
-  native controlling-terminal access. Linux release benchmarks remain
-  unverified for this build.
+  native controlling-terminal access. Linux release benchmarks were pending
+  at the initial handoff.
 - Release baseline — Fetched upstream before handoff. `origin/main` remained
   at `3004bb3` with package version `0.1.1`. Finalizing `0.1.2` awaits
   explicit release approval.

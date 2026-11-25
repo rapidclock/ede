@@ -121,7 +121,7 @@ impl ViewControl {
             .unwrap_or_else(|poison| poison.into_inner());
         let all = matches!(
             action,
-            Action::Size(..)
+            Action::Size { .. }
                 | Action::Switch(_)
                 | Action::CycleTab(_)
                 | Action::New
@@ -270,7 +270,12 @@ pub(crate) enum Action {
     SaveGuard(After, Option<PathBuf>),
     Guard(After),
     Discard(After, Option<JobId>),
-    Size(u16, u16, u64),
+    Size {
+        width: u16,
+        height: u16,
+        generation: u64,
+        search_cover: u16,
+    },
     Scroll(i64, i64),
     Hit {
         caret: u64,
@@ -696,7 +701,7 @@ impl Editor {
         // enqueueing so even a job that has not created its read token sees it.
         let layout_epoch = if matches!(
             inner,
-            Action::Size(..)
+            Action::Size { .. }
                 | Action::Scroll(..)
                 | Action::Guard(_)
                 | Action::Switch(_)
@@ -871,6 +876,7 @@ struct Coordinator {
     cache: Checkpoints,
     width: u16,
     height: u16,
+    search_cover: u16,
     generation: u64,
     counter: u64,
     active_sequence: u64,
@@ -935,6 +941,7 @@ impl Coordinator {
             cache: Checkpoints::default(),
             width: 80,
             height: 22,
+            search_cover: 0,
             generation: 0,
             counter: 0,
             active_sequence: 0,
@@ -974,7 +981,7 @@ impl Coordinator {
                     // navigation, and lifecycle intentions retain their exact ordering.
                     while let Ok(mut next) = self.inbox.try_recv() {
                         match (&envelope.action, &mut next.action) {
-                            (Action::Size(..), Action::Size(..)) => {}
+                            (Action::Size { .. }, Action::Size { .. }) => {}
                             (Action::Scroll(v, h), Action::Scroll(nv, nh))
                                 if scrolls_combine(*v, *h, *nv, *nh)
                                     && (*v == 0 || self.tab.left == 0) =>
@@ -1214,6 +1221,15 @@ impl Coordinator {
     }
     /// Render a fresh revision/geometry-tagged view; no snapshot is retained afterward.
     fn layout(&mut self, reveal: bool) -> Result<(), Error> {
+        self.prepare_layout(reveal, None)
+    }
+
+    /// Leave the selected occurrence above the floating search window.
+    fn layout_search(&mut self, last_byte: u64) -> Result<(), Error> {
+        self.prepare_layout(true, (self.search_cover != 0).then_some(last_byte))
+    }
+
+    fn prepare_layout(&mut self, reveal: bool, match_end: Option<u64>) -> Result<(), Error> {
         self.tab.screen.view = None;
         if self.parked_action {
             return Ok(());
@@ -1240,18 +1256,22 @@ impl Coordinator {
             self.tab.top = snapshot.line_count().saturating_sub(u64::from(self.height));
             self.tab.left = 0;
         }
-        let result = Text::new(&snapshot, &cancel).view(
-            ViewRequest {
-                position: self.tab.screen.position,
-                top: self.tab.top,
-                left: self.tab.left,
-                width: self.width,
-                height: self.height,
-                reveal: reveal || following,
-                generation: self.generation,
-            },
-            &mut self.cache,
-        );
+        let request = ViewRequest {
+            position: self.tab.screen.position,
+            top: self.tab.top,
+            left: self.tab.left,
+            width: self.width,
+            height: self.height,
+            reveal: reveal || following,
+            generation: self.generation,
+        };
+        let mut text = Text::new(&snapshot, &cancel);
+        let result = match match_end {
+            Some(last) => {
+                text.view_revealing_match(request, &mut self.cache, Some((self.search_cover, last)))
+            }
+            None => text.view(request, &mut self.cache),
+        };
         let view = match result {
             Ok(view) => view,
             Err(Error::Cancelled) if !self.cancel.is_cancelled() => {
@@ -1596,7 +1616,7 @@ impl Coordinator {
                 | Action::RecoveryPage { .. }
                 | Action::OpenRetained { .. }
                 | Action::DiscardRetained { .. }
-                | Action::Size(..)
+                | Action::Size { .. }
                 | Action::SearchPage(..)
         ) {
             self.reconcile_edit()?;
@@ -1743,12 +1763,31 @@ impl Coordinator {
                 Replacement::Paste(&spool),
                 self.tab.screen.position.selection(),
             )?,
-            Action::Size(width, height, generation) => {
+            Action::Size {
+                width,
+                height,
+                generation,
+                search_cover,
+            } => {
                 self.width = width;
                 self.height = height;
                 self.generation = generation;
+                self.search_cover = search_cover;
                 if self.tab.screen.document.is_some() {
-                    self.layout(false)?;
+                    let found = self.search.status.current.as_ref().filter(|found| {
+                        search_cover != 0
+                            && self.tab.screen.tab == Some(found.tab)
+                            && self
+                                .tab
+                                .info
+                                .as_ref()
+                                .is_some_and(|info| info.revision == found.revision)
+                    });
+                    if let Some(found) = found {
+                        self.layout_search(found.range.end.saturating_sub(1))?;
+                    } else {
+                        self.layout(false)?;
+                    }
                 }
             }
             Action::Scroll(vertical, horizontal) => {
@@ -2938,7 +2977,14 @@ mod tests {
             } else {
                 (80, 24)
             };
-            worker.action(Action::Size(width, height - 2, 7)).unwrap();
+            worker
+                .action(Action::Size {
+                    width,
+                    height: height - 2,
+                    generation: 7,
+                    search_cover: 0,
+                })
+                .unwrap();
             let mut app = crate::app::AppState::new();
             let layout =
                 crate::ui::LayoutSnapshot::for_app(Rect::new(0, 0, width, height), &app, 7);
@@ -3128,7 +3174,12 @@ mod ordering_tests {
         worker.action(Action::Insert("abc".into())).unwrap();
         assert!(editor.submit(Action::GoTo { line: 0, column: 1 }));
         let seek = inbox.recv().unwrap();
-        assert!(editor.submit(Action::Size(40, 6, 2)));
+        assert!(editor.submit(Action::Size {
+            width: 40,
+            height: 6,
+            generation: 2,
+            search_cover: 0,
+        }));
         worker.begin_envelope(&seek);
         worker.action(seek.action.clone()).unwrap();
         assert_eq!(worker.tab.screen.position.caret, 1);

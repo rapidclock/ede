@@ -362,10 +362,16 @@ fn event_loop_impl(
             area.width,
             layout.content_height(),
             layout.document_generation,
+            layout.search_bounds().map_or(0, |window| window.height),
         );
         if requested_geometry != Some(geometry) {
             if let Some(bridge) = editor.as_deref_mut() {
-                if bridge.submit(Action::Size(geometry.0, geometry.1, geometry.2)) {
+                if bridge.submit(Action::Size {
+                    width: geometry.0,
+                    height: geometry.1,
+                    generation: geometry.2,
+                    search_cover: geometry.3,
+                }) {
                     requested_geometry = Some(geometry);
                     app.pending = true;
                 }

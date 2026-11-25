@@ -215,7 +215,7 @@ struct Mapping {
 pub(super) fn revokes_navigation(action: &Action) -> bool {
     !matches!(
         action,
-        Action::Size(..)
+        Action::Size { .. }
             | Action::FieldPaste(..)
             | Action::Save(_)
             | Action::SaveGuard(..)
@@ -714,7 +714,7 @@ impl State {
                 };
                 owner.tab.screen.position.move_to(caret, false);
                 owner.tab.preferred = None;
-                owner.layout(true)?;
+                owner.layout_search(found.range.end.saturating_sub(1))?;
                 self.stream_anchor = owner.tab.live.is_some().then(|| found.clone());
                 self.status.current = Some(found);
                 if self.status.rows.count != 0 {
@@ -1024,7 +1024,7 @@ impl State {
             owner.tab.pause_follow();
             owner.tab.screen.position.move_to(jump.caret, false);
             owner.tab.preferred = None;
-            owner.layout(true)?;
+            owner.layout_search(jump.found.range.end.saturating_sub(1))?;
             self.stream_anchor = owner.tab.live.is_some().then(|| jump.found.clone());
             self.status.current = Some(jump.found);
             self.status.rows.current = Some(jump.row);

@@ -14,6 +14,7 @@ pub(crate) const OPTIONS: u8 = 18;
 pub(crate) const SHOW_RESULTS: u8 = 19;
 pub(crate) const FORM_UP: u8 = 20;
 pub(crate) const FORM_DOWN: u8 = 21;
+const EXPANDED_OPTIONS: [u8; 6] = [2, 3, 11, 12, 13, 4];
 
 /// Bounded session fields and the visible slice of keyboard/mouse controls.
 #[derive(Default)]
@@ -29,7 +30,7 @@ pub(crate) struct Panel {
     pub list_open: bool,
     pub result_top: u64,
     pub result_focus: Option<u64>,
-    pub(super) visible_results: u16,
+    visible_results: u16,
     hidden: Option<u64>,
     requested: Option<(u64, u64)>,
     expected: Option<(u64, u64)>,
@@ -45,7 +46,7 @@ impl Panel {
         }
         groups.push(vec![OPTIONS]);
         if self.expanded {
-            groups.extend([vec![2, 3], vec![11, 12, 13, 4]]);
+            groups.extend([vec![2, 3], vec![11, 12, 13], vec![4]]);
         }
         groups.push(vec![5, 6, 14]);
         if busy {
@@ -128,7 +129,7 @@ impl Panel {
                 "{} Match Whole Word",
                 if self.query.whole_word { "[x]" } else { "[ ]" }
             ),
-            4 => if self.all { "All open" } else { "Current" }.into(),
+            4 => self.scope_label().into(),
             5 => "Previous".into(),
             6 => "Next".into(),
             7 => "Replace Next".into(),
@@ -145,13 +146,21 @@ impl Panel {
                 "› Options  Case {} · Match Whole Word {} · {}",
                 if self.query.match_case { "on" } else { "off" },
                 if self.query.whole_word { "on" } else { "off" },
-                if self.all { "All open" } else { "Current" }
+                self.scope_label()
             ),
             SHOW_RESULTS if self.list_open => "Form".into(),
             SHOW_RESULTS => "Results".into(),
             FORM_UP => "↑".into(),
             FORM_DOWN => "↓".into(),
             _ => "Cancel".into(),
+        }
+    }
+
+    pub(crate) fn scope_label(&self) -> &'static str {
+        if self.all {
+            "All open tabs"
+        } else {
+            "Current tab"
         }
     }
 }
@@ -218,6 +227,26 @@ impl AppState {
         }
     }
 
+    /// Keep the selection visible when its viewport shrinks, even across a modal.
+    pub(super) fn search_resize_results(&mut self, capacity: u16) {
+        if capacity == 0 {
+            return;
+        }
+        let previous = std::mem::replace(&mut self.search.visible_results, capacity);
+        if previous > capacity
+            && let Some(row) = self.search.result_focus
+            && let Some(rows) = self.search.current_rows(&self.screen.search.rows)
+        {
+            let prior_top = self.search.result_offset(rows, previous);
+            let top = self.search.result_offset(rows, capacity);
+            let adjusted = top.clamp(row.saturating_sub(u64::from(capacity - 1)), row);
+            if (prior_top..prior_top + u64::from(previous)).contains(&row) && adjusted != top {
+                self.search.result_top = adjusted;
+                self.dirty = true;
+            }
+        }
+    }
+
     pub(super) fn search_fetch(&mut self, layout: &LayoutSnapshot) -> Option<Intent> {
         let capacity = layout.search_result_rows();
         let rows = self.search.current_rows(&self.screen.search.rows)?;
@@ -253,10 +282,13 @@ impl AppState {
     pub(super) fn search_wheel(&mut self, up: bool, layout: &LayoutSnapshot, over_list: bool) {
         if over_list {
             let rows = &self.screen.search.rows;
+            let capacity = layout.search_result_rows();
+            let step = i64::from(capacity.min(3));
             self.search.result_top = self
                 .search
-                .result_offset(rows, layout.search_result_rows())
-                .saturating_add_signed(if up { -3 } else { 3 });
+                .result_offset(rows, capacity)
+                .saturating_add_signed(if up { -step } else { step })
+                .min(rows.count.saturating_sub(u64::from(capacity)));
         } else {
             self.search_form_step(!up);
         }
@@ -297,7 +329,14 @@ impl AppState {
 
     fn list_focus(&mut self) {
         self.search.list_open = true;
-        self.search.result_focus = self.screen.search.rows.current.or(Some(0));
+        let rows = &self.screen.search.rows;
+        let selected = rows.current.unwrap_or(0);
+        let visible = self.search.visible_results.max(1);
+        let top = self.search.result_offset(rows, visible);
+        if selected < top || selected >= top + u64::from(visible) {
+            self.search.result_top = selected;
+        }
+        self.search.result_focus = Some(selected);
         self.focus = Some(Control::SearchList);
         self.dirty = true;
     }
@@ -315,6 +354,7 @@ impl AppState {
             .result_top
             .min(rows.count.saturating_sub(capacity));
         self.search.result_focus = Some(row);
+        self.search.list_open = true;
         self.focus = Some(Control::SearchList);
         self.dirty = true;
         let generation = rows.generation;
@@ -336,20 +376,21 @@ impl AppState {
         layout: &LayoutSnapshot,
     ) -> Option<Intent> {
         if matches!(control, Control::SearchList | Control::SearchResult(_)) {
-            if movement == Movement::Left {
-                let groups = self.search.groups(self.screen.search.busy);
-                self.search_focus(groups[groups.len() - 1][0]);
-                return None;
-            }
             let count = self.screen.search.rows.count;
-            if count == 0 {
-                return None;
-            }
             let row = self
                 .search
                 .result_focus
                 .or(self.screen.search.rows.current)
                 .unwrap_or(0);
+            if movement == Movement::Left
+                || movement == Movement::Down && row >= count.saturating_sub(1)
+            {
+                self.search_focus(0);
+                return None;
+            }
+            if count == 0 {
+                return None;
+            }
             let step = i64::from(layout.search_result_rows().max(1));
             let next = match movement {
                 Movement::Up => row.saturating_sub(1),
@@ -372,11 +413,28 @@ impl AppState {
             return None;
         };
         match movement {
-            Movement::Down if row + 1 == groups.len() => self.list_focus(),
             Movement::Down | Movement::Up => {
-                let target = (row as isize + if movement == Movement::Down { 1 } else { -1 }).max(0)
-                    as usize;
-                self.search_focus(groups[target][0]);
+                let down = movement == Movement::Down;
+                let step = if down { 1 } else { -1 };
+                if let Some(next) = EXPANDED_OPTIONS
+                    .iter()
+                    .position(|&option| index == option)
+                    .and_then(|option| option.checked_add_signed(step))
+                    .and_then(|option| EXPANDED_OPTIONS.get(option))
+                {
+                    self.search_focus(*next);
+                } else if let Some(target) =
+                    row.checked_add_signed(step).and_then(|row| groups.get(row))
+                {
+                    self.search_focus(target[0]);
+                } else if !down
+                    && self
+                        .search
+                        .current_rows(&self.screen.search.rows)
+                        .is_some_and(|rows| rows.count != 0)
+                {
+                    self.list_focus();
+                }
             }
             Movement::Left | Movement::Right if index == OPTIONS => {
                 self.search.expanded = movement == Movement::Right;
@@ -432,6 +490,15 @@ impl AppState {
                     self.dirty = true;
                     None
                 }
+                Command::Move(movement @ (Movement::Left | Movement::Right), _) => {
+                    self.focus = Some(Control::Search(if movement == Movement::Left {
+                        15
+                    } else {
+                        16
+                    }));
+                    self.dirty = true;
+                    None
+                }
                 Command::Move(movement, _) => {
                     self.help_scroll = if matches!(movement, Movement::Up | Movement::PageUp) {
                         self.help_scroll.saturating_sub(1)
@@ -469,6 +536,7 @@ impl AppState {
                 self.search.expanded = false;
                 self.search.result_top = 0;
                 self.search.result_focus = None;
+                self.search.visible_results = 0;
                 self.search.requested = None;
                 self.search.expected = None;
             }
@@ -613,7 +681,13 @@ impl AppState {
             }
             let controls = self.search.controls(self.screen.search.busy);
             let current = controls.iter().position(|i| *i == index).unwrap_or(0);
-            if command == Command::Tab && current + 1 == controls.len() {
+            if command == Command::Tab
+                && current + 1 == controls.len()
+                && self
+                    .search
+                    .current_rows(&self.screen.search.rows)
+                    .is_some_and(|rows| rows.count != 0)
+            {
                 self.list_focus();
                 return Some(None);
             }
@@ -792,8 +866,6 @@ mod tests {
             );
             app.command(Command::Tab, &geometry);
         }
-        assert_eq!(app.focus, Some(Control::SearchList));
-        app.command(Command::Tab, &layout(&app));
         assert_eq!(app.focus, Some(Control::Search(0)));
         app.search.query.literal = "keep".into();
         let small = LayoutSnapshot::for_app(Rect::new(0, 0, 39, 7), &app, 2);

@@ -2,7 +2,8 @@
 use super::*;
 use crate::{
     app::search::{FORM_DOWN, FORM_UP, OPTIONS, SHOW_RESULTS, SUBMIT, display},
-    editor::search::results::{PAGE_SIZE, Row},
+    editor::search::results::Row,
+    settings::Scalar,
 };
 use ratatui::text::{Line, Span};
 
@@ -17,36 +18,10 @@ pub(super) struct Signature {
     list_open: bool,
     list_top: u64,
     page: Option<(u64, u64, usize, u64)>,
-    caret: Option<(u16, u16)>,
-    highlight: Option<(u16, u16)>,
 }
 
 impl Signature {
     pub(super) fn new(app: &AppState) -> Self {
-        let current = app
-            .screen
-            .search
-            .current
-            .as_ref()
-            .zip(app.screen.view.as_ref())
-            .filter(|(found, view)| {
-                Some(found.tab) == app.screen.tab && found.revision == view.revision
-            });
-        let highlight = current.and_then(|(found, view)| {
-            let edge = u64::from(view.width.saturating_sub(60)) + view.left;
-            let mut rows = view.rows.iter().enumerate().filter(|(_, row)| {
-                row.spans.iter().any(|span| {
-                    span.bytes.start < found.range.end
-                        && span.bytes.end > found.range.start
-                        && columns_for_range(span, &found.range).end > edge
-                })
-            });
-            let first = rows.next()?.0 as u16;
-            Some((
-                first,
-                rows.next_back().map_or(first, |(last, _)| last as u16),
-            ))
-        });
         Self {
             replace: app.search.replace,
             expanded: app.search.expanded,
@@ -58,9 +33,8 @@ impl Signature {
             page: app
                 .search
                 .current_rows(&app.screen.search.rows)
+                .filter(|rows| rows.count != 0)
                 .map(|rows| (rows.generation, rows.start, rows.page.len(), rows.count)),
-            caret: current.and_then(|(_, view)| view.cursor),
-            highlight,
         }
     }
 }
@@ -69,32 +43,45 @@ impl LayoutSnapshot {
     /// Add hit regions above the ordinary editor without resizing its document view.
     pub(super) fn add_search_window(&mut self, app: &AppState) {
         let width = self.area.width.min(60);
-        let height = ((self.area.height - 2) / 2).min(PAGE_SIZE as u16 + 2);
-        let mut window = Rect::new(self.area.right() - width, self.area.y + 1, width, height);
-        let lower = self.area.height - height - 2;
-        if let Some(signature) = &self.signature.search {
-            let caret = signature
-                .caret
-                .filter(|(x, _)| *x >= self.area.width - width);
-            if caret.is_some_and(|(_, y)| y < height)
-                || (caret.is_none_or(|(_, y)| y < lower)
-                    && signature
-                        .highlight
-                        .is_some_and(|(first, last)| first < height && last < lower))
-            {
-                window.y = self.area.y + 1 + lower;
-            }
-        }
+        let groups = app.search.groups(app.screen.search.busy);
+        let form_rows = groups.len() as u16;
+        let rows = app.search.current_rows(&app.screen.search.rows);
+        let limit = app.settings.applied.values.get(Scalar::FindMatchRows);
+        let desired_results = rows.map_or(0, |rows| rows.count.min(limit) as u16);
+        // Keep three document rows visible, even at the minimum terminal size.
+        let body_limit = self.content_height() - 5;
+        let compact = form_rows + u16::from(desired_results > 0) > body_limit;
+        let list_only = compact && app.search.list_open && desired_results > 0;
+        let shown_form = if list_only {
+            0
+        } else {
+            form_rows.min(body_limit)
+        };
+        let shown_results = desired_results.min(body_limit - shown_form);
+        let spare = if compact {
+            0
+        } else {
+            body_limit - shown_form - shown_results
+        };
+        let list_gap = u16::from(shown_results > 0 && shown_form > 0 && spare > 0);
+        let options_gap = u16::from(spare > list_gap);
+        let navigation_gap = u16::from(spare > list_gap + options_gap);
+        let height = 2 + shown_form + shown_results + list_gap + options_gap + navigation_gap;
+        let window = Rect::new(
+            self.area.right() - width,
+            self.area.bottom() - 1 - height,
+            width,
+            height,
+        );
         self.search_window = Some(window);
         self.add(Control::SearchSurface, window);
-        let body = Rect::new(window.x + 1, window.y + 1, width - 2, height - 2);
-        let groups = app.search.groups(app.screen.search.busy);
-        let compact = body.height as usize <= groups.len();
         let mut right = window.right() - 1;
         let mut header = vec![10];
         if compact {
-            header.push(SHOW_RESULTS);
-            if !app.search.list_open {
+            if desired_results > 0 {
+                header.push(SHOW_RESULTS);
+            }
+            if !list_only && shown_form < form_rows {
                 header.extend([FORM_DOWN, FORM_UP]);
             }
         }
@@ -104,35 +91,12 @@ impl LayoutSnapshot {
             self.add(Control::Search(index), Rect::new(right, window.y, width, 1));
             right -= 1;
         }
-        let mut form_height = 0;
-        if !compact || !app.search.list_open {
-            let capacity = usize::from(body.height);
-            let start = if compact {
-                app.search.row.min(groups.len().saturating_sub(capacity))
-            } else {
-                0
-            };
-            for (row, group) in groups.iter().skip(start).take(capacity).enumerate() {
-                self.add_search_group(
-                    app,
-                    group,
-                    Rect::new(body.x, body.y + row as u16, body.width, 1),
-                );
-                form_height += 1;
-            }
-        }
-        let results = Rect::new(
-            body.x,
-            body.y + form_height,
-            body.width,
-            body.height - form_height,
-        );
-        if results.height == 0 {
-            return;
-        }
-        self.search_list = Some(results);
-        self.add(Control::SearchList, results);
-        if let Some(rows) = app.search.current_rows(&app.screen.search.rows) {
+        let inner_x = window.x + 1;
+        let inner_width = width - 2;
+        let results = Rect::new(inner_x, window.y + 1, inner_width, shown_results);
+        if let Some(rows) = rows.filter(|_| shown_results > 0) {
+            self.search_list = Some(results);
+            self.add(Control::SearchList, results);
             let top = app.search.result_offset(rows, results.height);
             for offset in 0..u64::from(results.height) {
                 let index = top + offset;
@@ -143,6 +107,18 @@ impl LayoutSnapshot {
                     );
                 }
             }
+        }
+        let capacity = usize::from(shown_form);
+        let start = app.search.row.min(groups.len().saturating_sub(capacity));
+        let mut y = results.bottom() + list_gap;
+        for group in groups.iter().skip(start).take(capacity) {
+            y += match group[0] {
+                OPTIONS => options_gap,
+                5 => navigation_gap,
+                _ => 0,
+            };
+            self.add_search_group(app, group, Rect::new(inner_x, y, inner_width, 1));
+            y += 1;
         }
     }
 
@@ -164,15 +140,12 @@ impl LayoutSnapshot {
                 add(self, 8, area.right() - all, all);
             }
             _ => {
-                let mut x = area.x + u16::from(matches!(group[0], 2 | 11)) * 2;
+                let mut x = area.x + u16::from(matches!(group[0], 2 | 4 | 11)) * 2;
                 if group[0] == 11 {
                     x += 7;
                 }
                 for &index in group {
                     let width = button_width(app, index);
-                    if index == 4 {
-                        x = area.right() - width;
-                    }
                     add(self, index, x, width.min(area.right().saturating_sub(x)));
                     x += width + 1;
                 }
@@ -298,10 +271,11 @@ pub(super) fn render(frame: &mut Frame<'_>, app: &AppState, layout: &LayoutSnaps
                 let label = app.search.label(index);
                 let label = if index == OPTIONS
                     && !app.search.expanded
-                    && label.width() > target.area.width as usize
+                    && label.width() + usize::from(focused) > target.area.width as usize
                 {
                     format!(
-                        "› Options Case:{} Word:{} {}",
+                        "› Options {} C:{} W:{}",
+                        app.search.scope_label(),
                         if app.search.query.match_case {
                             "on"
                         } else {
@@ -311,11 +285,6 @@ pub(super) fn render(frame: &mut Frame<'_>, app: &AppState, layout: &LayoutSnaps
                             "on"
                         } else {
                             "off"
-                        },
-                        if app.search.all {
-                            "All open"
-                        } else {
-                            "Current"
                         }
                     )
                 } else {
@@ -424,6 +393,26 @@ mod tests {
     use super::*;
     use crate::editor::search::Operation;
     use ratatui::{Terminal, backend::TestBackend};
+
+    /// An empty-page refresh cannot cancel a press on an unchanged form control.
+    #[test]
+    fn only_result_pages_with_rows_change_the_hit_signature() {
+        let mut app = AppState::new();
+        app.search.open = true;
+        let empty = Signature::new(&app);
+        std::sync::Arc::make_mut(&mut app.screen.search)
+            .rows
+            .generation += 1;
+        assert_eq!(Signature::new(&app), empty);
+
+        std::sync::Arc::make_mut(&mut app.screen.search).rows.count = 1;
+        let visible = Signature::new(&app);
+        assert_ne!(visible, empty);
+        std::sync::Arc::make_mut(&mut app.screen.search)
+            .rows
+            .generation += 1;
+        assert_ne!(Signature::new(&app), visible);
+    }
 
     /// Search action colors and alignment come from the same regions used for clicks.
     #[test]

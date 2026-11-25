@@ -37,10 +37,13 @@ fn search_window_browses_occurrences_without_tab() {
     process.send(b"\x06");
     process.expect("Options");
     process.click_label("Options", 1);
-    process.expect("Match Whole Word");
+    process.expect("[ ] Match Whole Word");
     process.click_label("Options", 1);
+    process.expect(">› Options");
     process.send(b"\x1b[Aapple\r");
     process.expect("1 of 3 matches");
+    process.send(b"\x1b[A\x1b[D");
+    process.expect(">Find:");
     process.click_label("2:1", 1);
     process.expect_status("Ln 2 Col 1");
     process.send(b"\x1b[B");
@@ -50,6 +53,143 @@ fn search_window_browses_occurrences_without_tab() {
     process.expect_absent("Options");
     process.send(b"\x11");
     assert!(process.wait().success());
+}
+
+/// Down and Up visit each expanded option in both modes without Tab.
+#[test]
+fn search_options_use_vertical_arrows() {
+    let root = tempfile::tempdir().unwrap();
+    let file = root.path().join("fruit.txt");
+    std::fs::write(&file, "apple\n").unwrap();
+    for (open, to_options) in [(b'\x06', 1), (b'\x08', 3)] {
+        let mut process = PtyChild::editor_with_path(Some("xterm-256color"), Some(&file));
+        process.expect_status("Ln 1 Col 1");
+        process.send(&[open]);
+        process.expect("Options");
+        process.send(&b"\x1b[B".repeat(to_options));
+        process.expect(">› Options");
+        process.send(b"\x1b[C\x1b[B\r\x1b[B\r");
+        process.expect("[ ] Match case");
+        process.expect("[x] Match Whole Word");
+        for label in [">Tab<", ">LF<", ">CRLF<", ">Current tab<"] {
+            process.send(b"\x1b[B");
+            process.expect(label);
+        }
+        process.send(b"\r");
+        process.expect(">All open tabs<");
+        process.send(&b"\x1b[A".repeat(6));
+        process.expect(">⌄ Options");
+        process.send(b"\x1b[D");
+        process.expect(">› Options");
+        process.send(b"\x1b");
+        process.expect_absent("Options");
+        process.send(b"\x11");
+        assert!(process.wait().success());
+    }
+}
+
+/// The workspace preference is bounded, saved, and shared by both bottom-right windows.
+#[test]
+fn find_match_rows_settings_stepper_controls_both_windows() {
+    let root = tempfile::tempdir().unwrap();
+    let file = root.path().join("fruit.txt");
+    std::fs::write(&file, "apple\n".repeat(15)).unwrap();
+    let open = || {
+        PtyChild::editor_with_options(
+            Some("xterm-256color"),
+            [file.as_os_str()],
+            None,
+            Some(root.path()),
+            None,
+        )
+    };
+    let config = root.path().join("ede/config.toml");
+    let check_list = |process: &mut PtyChild, rows: usize, close: bool| {
+        process.expect(&format!("{rows}:1 apple"));
+        let screen: Vec<_> = process.parser.screen().rows(0, 80).collect();
+        let form = screen.iter().position(|row| row.contains("Find:")).unwrap();
+        let last = screen
+            .iter()
+            .position(|row| row.contains(&format!("{rows}:1 apple")))
+            .unwrap();
+        assert!(
+            last + 1 < form,
+            "result list should be spaced above the form"
+        );
+        assert!(screen[last].find(&format!("{rows}:1 apple")).unwrap() >= 20);
+        assert!(screen[22].ends_with('┘'));
+        assert!(
+            !screen
+                .iter()
+                .any(|row| row.contains(&format!("{}:1 apple", rows + 1)))
+        );
+        if close {
+            process.send(b"\x1b");
+            process.expect_absent("Options");
+        }
+    };
+    let mut process = open();
+    process.expect_status("Ln 1 Col 1");
+    process.send(b"\x06apple\r");
+    check_list(&mut process, 3, true);
+    process.send(b"\x1b[15~");
+    process.click_label("[Editor]", 1);
+    process.expect("[−]  3  [+]");
+    process.click_label("Find match rows", 1);
+    process.send(&b"\x1b[D".repeat(4));
+    process.expect("[−]  1  [+]");
+    process.send(&b"\x1b[C".repeat(12));
+    process.expect("[−] 10  [+]");
+    process.click_label("[−]", 1);
+    process.expect("[−]  9  [+]");
+    process.click_label("[+]", 1);
+    process.expect("[−] 10  [+]");
+    assert!(!config.exists());
+    process.click_label("[Save]", 1);
+    process.expect_status("Settings saved");
+    assert!(
+        std::fs::read_to_string(config)
+            .unwrap()
+            .contains("find_match_rows = 10")
+    );
+    process.send(b"\x1b");
+    process.expect_absent("Find match rows");
+    process.send(b"\x08\r");
+    check_list(&mut process, 10, true);
+    process.send(b"\x11");
+    assert!(process.wait().success());
+
+    let mut restarted = open();
+    restarted.expect_status("Ln 1 Col 1");
+    restarted.send(b"\x06apple\r");
+    check_list(&mut restarted, 10, true);
+    restarted.send(b"\x1b[15~");
+    restarted.click_label("[Editor]", 1);
+    restarted.click_label("Find match rows", 1);
+    restarted.send(&b"\x1b[D".repeat(9));
+    restarted.expect("[−]  1  [+]");
+    restarted.click_label("[Save]", 1);
+    restarted.expect_status("Settings saved");
+    restarted.send(b"\x1b");
+    restarted.expect_absent("Find match rows");
+    restarted.send(b"\x06\r");
+    check_list(&mut restarted, 1, false);
+    let row = restarted
+        .parser
+        .screen()
+        .rows(0, 80)
+        .position(|row| row.contains("1:1 apple"))
+        .unwrap()
+        + 1;
+    restarted.send(format!("\x1b[<65;35;{row}M").as_bytes());
+    restarted.expect("2:1 apple");
+    restarted.expect_status("Ln 1 Col 1");
+    restarted.click_label("2:1 apple", 1);
+    restarted.expect_status("Ln 2 Col 1");
+    restarted.send(b"\x1b");
+    restarted.expect_absent("Options");
+    restarted.send(b"\x11");
+    assert!(restarted.wait().success());
 }
 
 /// The end of a dense list is reachable, and scrolling the list never moves the caret.
@@ -118,7 +258,7 @@ fn search_window_jumps_to_another_unsaved_tab() {
     process.expect_body("apple left", TIMEOUT);
     process.send(b"\x06");
     process.click_label("Options", 1);
-    process.click_label("[Current]", 1);
+    process.click_label("[Current tab]", 1);
     process.click_label("Find:", 1);
     process.send(b"apple\r");
     process.expect("1 of 2 matches");
@@ -153,8 +293,69 @@ fn search_window_compact_results_survive_resize() {
     process.expect("2 of 3 matches");
     process.resize(80, 24);
     process.expect("Match Whole Word off");
+    process.send(b"\x1b[D");
+    process.expect(">Find:");
+    process.click_label("3:1 apple", 1);
+    process.expect_status("Ln 3 Col 1");
+    process.resize(40, 8);
+    process.expect("[Form]");
+    process.expect("3:1 apple");
+    process.send(b"\x1b[A");
+    process.expect_status("Ln 2 Col 1");
+    process.resize(80, 24);
+    process.expect("Match Whole Word off");
     process.send(b"\x1b[B");
     process.expect_status("Ln 3 Col 1");
+    process.send(b"\x1b[A");
+    process.expect_status("Ln 2 Col 1");
+    let last = process
+        .parser
+        .screen()
+        .rows(0, 80)
+        .position(|row| row.contains("3:1 apple"))
+        .unwrap()
+        + 1;
+    process.send(format!("\x1b[<65;35;{last}M").as_bytes());
+    process.resize(40, 8);
+    process.expect("[Form]");
+    process.expect("2:1 apple");
+    process.send(b"\x1b");
+    process.expect_absent("[Form]");
+    process.send(b"\x11");
+    assert!(process.wait().success());
+}
+
+/// A right-side occurrence stays visible above the fixed lower-right overlay.
+#[test]
+fn search_jump_reveals_match_above_anchored_window() {
+    let root = tempfile::tempdir().unwrap();
+    let file = root.path().join("fruit.txt");
+    let body = format!("{}{}orchard poirée\n", "plain\n".repeat(40), " ".repeat(60));
+    std::fs::write(&file, body).unwrap();
+    let mut process = PtyChild::editor_with_path(Some("xterm-256color"), Some(&file));
+    process.expect_status("Ln 1 Col 1");
+    process.send("\x06poirée\r".as_bytes());
+    process.expect("1 of 1 match");
+    process.expect_status("Ln 41 Col 69");
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        process.drain();
+        let screen: Vec<_> = process.parser.screen().rows(0, 80).collect();
+        if let Some(window) = screen.iter().position(|row| row.contains("┌ Find "))
+            && screen[..window].iter().any(|row| {
+                row.get(60..)
+                    .is_some_and(|end| end.contains("orchard poirée"))
+            })
+        {
+            assert!(screen[22].ends_with('┘'));
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "match covered by the search window: {screen:?}"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
     process.send(b"\x1b");
     process.expect_absent("Options");
     process.send(b"\x11");
@@ -917,7 +1118,7 @@ fn literal_replace_all_confirmation_and_undo() {
     terminal.expect_body("one two one", TIMEOUT);
     terminal.send(b"\r");
     terminal.expect("Replace all — confirm scope");
-    terminal.send(b"\t\r");
+    terminal.send(b"\x1b[D\r");
     terminal.expect("2 occurrences processed");
     terminal.expect("Replaced ·");
     terminal.send(b"\x1b");

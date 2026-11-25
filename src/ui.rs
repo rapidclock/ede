@@ -30,6 +30,7 @@ pub(crate) enum Control {
     SettingsSection(settings_ui::Section),
     SettingsGroup(Context),
     SettingsGroupStep(bool),
+    SettingsFindRowsStep(bool),
     UseDefaults,
     Search(u8),
     SearchSurface,
@@ -94,6 +95,7 @@ impl Control {
             | Self::SettingsSection(_)
             | Self::SettingsGroup(_)
             | Self::SettingsGroupStep(_)
+            | Self::SettingsFindRowsStep(_)
             | Self::PaneOutside
             | Self::SearchSurface
             | Self::TabClose(_)
@@ -131,6 +133,8 @@ impl Control {
             Self::SettingsGroup(group) => settings_ui::group_label(group),
             Self::SettingsGroupStep(false) => "‹",
             Self::SettingsGroupStep(true) => "›",
+            Self::SettingsFindRowsStep(false) => "−",
+            Self::SettingsFindRowsStep(true) => "+",
             Self::UseDefaults => "Use defaults for this session",
             Self::WelcomeOpen => "Open File",
             Self::WelcomeNew => "New Scratch",
@@ -446,6 +450,16 @@ impl LayoutSnapshot {
                                 Control::SettingsRow(row),
                                 Rect::new(rows.x, y, rows.width, 1),
                             );
+                            if row == settings_ui::FIND_MATCH_ROWS && writable {
+                                let label = crate::settings::Scalar::FindMatchRows.label();
+                                let x = rows.x + label.width() as u16 + 5;
+                                for (increase, left) in [(false, x), (true, x + 8)] {
+                                    result.add(
+                                        Control::SettingsFindRowsStep(increase),
+                                        Rect::new(left, y, 3, 1),
+                                    );
+                                }
+                            }
                             if let Some((index, scalar)) = inline
                                 && row == index
                             {
@@ -879,7 +893,7 @@ impl LayoutSnapshot {
         self.next_when(current, backwards, |control| match control {
             Control::SettingsSection(active) => active == section,
             Control::SettingsGroup(active) => Some(active) == group,
-            Control::SettingsGroupStep(_) => false,
+            Control::SettingsGroupStep(_) | Control::SettingsFindRowsStep(_) => false,
             Control::SettingsField | Control::SettingsRow(_) => control == row,
             _ => true,
         })
@@ -1980,6 +1994,23 @@ fn render_settings(frame: &mut Frame<'_>, app: &AppState, layout: &LayoutSnapsho
             Control::SettingsGroupStep(_) => {
                 frame.render_widget(
                     Paragraph::new(format!("[{}]", target.control.label())),
+                    target.area,
+                );
+            }
+            Control::SettingsFindRowsStep(increase) => {
+                let rows = draft.find_match_rows();
+                let at_bound = if increase {
+                    rows == crate::settings::Scalar::FindMatchRows.maximum()
+                } else {
+                    rows == 1
+                };
+                let style = if at_bound {
+                    Style::default().add_modifier(Modifier::DIM)
+                } else {
+                    style
+                };
+                frame.render_widget(
+                    Paragraph::new(format!("[{}]", target.control.label())).style(style),
                     target.area,
                 );
             }
