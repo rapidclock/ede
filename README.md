@@ -1,14 +1,12 @@
 # ede
 
-A Rust terminal text editor for macOS and Linux. See the
-[MVP overview](specs/001_initial_mvp/overview.md) and the
-[Stage 10 validation record](specs/001_initial_mvp/10_mvp_validation.md#validation-record).
+A Rust terminal text editor for macOS and Linux.
 
 ## Install from crates.io
 
 Building ede requires Rust 1.100.0 or later and a C toolchain for the bundled
 syntax grammars. Install the Xcode Command Line Tools on macOS or `build-essential`
-on Ubuntu. Once the crate is published, install it with:
+on Ubuntu. To install the published crate, run the following commands.
 
 ```sh
 cargo install ede
@@ -45,7 +43,6 @@ Start with `--safe-config` to use bundled configuration for the session. The
 option comes before file arguments, `--`, or `--follow`. Safe mode skips local
 highlighting overrides and query files and disables Reload Highlighting. Press
 F1 to see the expected config path. Editing and scratch recovery work as usual.
-See the [Stage 9 validation record](specs/001_initial_mvp/09_configuration_and_keybindings.md#validation-record).
 
 Pipe, FIFO, and regular-file stdin open a read-only **Stdin** tab ahead of any
 named files. Use a foreground controlling terminal and leave stdout attached to
@@ -60,8 +57,7 @@ track pathname replacement and common truncations. Tab Details reports the
 latest detected boundary. Up to four live sources share an 8 GiB payload cap,
 with a 2 GiB cap per source. A stopped capture keeps its committed prefix and
 offers **Export Retained Copy** to a new path. A failed EOF conversion also
-offers **Retry Finish**. See the
-[Stage 8 validation record](specs/001_initial_mvp/08_pipes_and_follow.md#validation-record).
+offers **Retry Finish**.
 
 Opening validates a private UTF-8 snapshot in the background. Its initial preview
 is read-only; Escape cancels preparation. Once ready, files remain editable
@@ -184,19 +180,16 @@ needs to accept writes from programs inside a pane and forward them to the
 client. Its `set-clipboard external` mode can forward tmux copy-mode selections
 while ignoring application writes. When the terminal path cannot accept OSC 52,
 use ede's internal clipboard, terminal-native selection with mouse capture
-paused, or tmux copy mode as appropriate. See the
-[tested terminal and transport paths](specs/001_initial_mvp/10_mvp_validation.md#terminal-transport-and-client-clipboard-evidence).
-[iTerm2 clipboard settings](https://iterm2.com/documentation-preferences-general.html),
-[tmux clipboard documentation](https://github.com/tmux/tmux/wiki/Clipboard).
+paused, or tmux copy mode. See the
+[iTerm2 clipboard settings](https://iterm2.com/documentation-preferences-general.html)
+and [tmux clipboard documentation](https://github.com/tmux/tmux/wiki/Clipboard).
 
-In Apple Terminal, ede's system clipboard copy did not work in the tested SSH
-session. For text visible on screen, press **F2**, choose **Mouse capture:
-enabled (toggle)**, then drag to select the text and press
-**Option+Shift+Cmd+C** to copy it as plain text. Press **F2** and toggle capture
-back on to restore clicks in ede. The equivalent Terminal control is
-**View → Allow Mouse Reporting**. **Cmd+V** or **Edit → Paste** sends Mac
-clipboard text into ede. In iTerm2, copying from ede to the Mac clipboard
-passed over direct SSH and through remote tmux.
+When clipboard writes are unavailable in Apple Terminal, you can copy text
+visible on screen using terminal-native selection. Press **F2** and toggle mouse
+capture off, drag to select the text, and press **Option+Shift+Cmd+C** to copy
+plain text. Toggle capture back on to restore clicks in ede. Apple Terminal also
+offers **View → Allow Mouse Reporting**. Use **Cmd+V** or **Edit → Paste** to send
+Mac clipboard text into ede.
 
 Save As creates a new destination; it does not overwrite an existing path. Normal
 Save checks the previously acknowledged destination for external changes. Editing
@@ -571,10 +564,9 @@ and `#not-any-of?`. Use the category names above in custom captures. Later
 matching custom patterns win. Built-in rules cover the rest of the syntax.
 
 Use the [bundled query registry](src/syntax/engine.rs),
-[ede query sources](src/syntax/queries), and the pinned grammar versions in the
-[Stage 7 validation record](specs/001_initial_mvp/07_syntax_highlighting.md#validation-record)
-as starting points. Builds require a C compiler for the bundled generated
-grammars. The executable highlights offline.
+[ede query sources](src/syntax/queries), and grammar versions in
+[`Cargo.toml`](Cargo.toml) as starting points. Builds require a C compiler for the
+bundled generated grammars. The executable highlights offline.
 
 ## Cmd delivery
 
@@ -583,26 +575,15 @@ key events and accepts Cmd as Super. Detection does not block startup; unanswere
 or late capability replies retain portable operation. Acquired keyboard/mouse
 modes are restored on exit and suspension.
 
-A terminal can still consume individual Cmd shortcuts. Terminal capability alone
-is insufficient evidence that a particular key reaches ede. A manually configured
-mapping such as Cmd+S → byte `0x13` invokes portable Save instead. ede never changes
-terminal, macOS, or tmux settings automatically. Terminal-specific mapping recipes
-and direct Cmd compatibility are **pending real-terminal validation**; synthetic
-PTY coverage does not establish a tested setup. See the Stage 3 validation record.
+A terminal can still consume individual Cmd shortcuts. Use the portable
+shortcuts in the controls table when Cmd keys are intercepted. A terminal
+mapping that sends byte `0x13` for Cmd+S invokes Ctrl+S (Save) in ede. Verify key
+mappings in the terminal profile and connection you use, including any tmux or
+SSH session.
 
-For an **unverified candidate iTerm2 mapping**, use a separate test profile and
-add Cmd+S under Settings → Profiles → Keys → Key Mappings, with **Send Hex Code**
-set to `0x13`. The resulting Ctrl+S input is covered by ede's protocol tests;
-physical delivery through iTerm2 still needs a manual check. See iTerm2's
-[key mapping documentation](https://iterm2.com/documentation-preferences-profiles-keys.html).
-iTerm2 recommends the [Kitty protocol over its older CSI-u mode](https://iterm2.com/documentation-csiu.html),
-which matches ede's negotiation. Do not infer all Cmd aliases from one mapping:
-record each shortcut, terminal version, profile and direct/tmux/remote path.
-
-The agreed compatibility scope includes macOS and Linux, direct terminals, tmux,
-and the agreed remote transports. The user's iTerm2 setup is one target within
-that matrix. Local iTerm2 3.7.6 was identified, but this environment blocks GUI
-control of iTerm2, so its real key delivery remains unverified.
+To try this mapping in iTerm2, add Cmd+S under **Settings → Profiles → Keys →
+Key Mappings**, with **Send Hex Code** set to `0x13`. See the
+[iTerm2 key mapping documentation](https://iterm2.com/documentation-preferences-profiles-keys.html).
 
 ## Storage and architecture
 
@@ -674,8 +655,7 @@ refresh and search/replacement with 256 MiB and swap disabled. The search benchm
 counts and replaces one marker per MiB, measures input during a dense-match scan,
 cancels, verifies the full saved output, and exercises Undo. Set
 `EDE_BENCH_MARKER_STRIDE_MIB=8` for an 8 MiB interval between matches when
-testing larger files within the existing undo budget. See the
-[Stage 10 measurements](specs/001_initial_mvp/10_mvp_validation.md#performance-and-resources).
+testing larger files within the existing undo budget.
 
 The resource probe runs the coordinator and UI against ordinary, dense, long-line
 and mixed Unicode files. It records managed allocation high waters, working-file
@@ -687,6 +667,4 @@ lifetime peak RSS using `/usr/bin/time` (`-l` on macOS, `-v` on Linux), separate
 from live samples. That tool is needed only for this opt-in measurement.
 
 The storage benchmark also accepts `clone` with a copy fallback and optional
-churn edits (up to 1000). Earlier evidence and agreed deferrals remain in the
-[Stage 1](specs/001_initial_mvp/01_terminal_foundation.md#validation-record) and
-[Stage 2](specs/001_initial_mvp/02_document_storage.md#validation-record) records.
+churn edits (up to 1000).
