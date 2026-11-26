@@ -1,7 +1,7 @@
 # Improvement Spec — Find and Find & Replace windows
 
-**Status** — The collapsed-title revision and its CI follow-up are implemented
-and validated on macOS and Ubuntu 26.10.
+**Status** — The collapsed-title revision and release CI follow-up are
+implemented and locally validated on macOS and Ubuntu 26.10.
 **Release** — Final package version `0.1.2`, approved by the user as a patch
 from `0.1.1` on `main`.
 **Branch** — `enhance/find-windows`, based on `main` at `3004bb3`.
@@ -270,6 +270,19 @@ Minimized title  ┌ Find ──────────────────
 
 ## Validation record
 
+- Full CI follow-up — The [hosted Ubuntu job](https://github.com/rapidclock/ede/actions/runs/45782060556/job/139779652201)
+  timed out waiting for Save in the 1 GiB highlighting and search overlap
+  test. The test waited for a label removed with the old Find dock. The failure
+  reproduced on the Ubuntu UTM guest under a 256 MiB limit with swap disabled.
+  The benchmark now clicks the Find close button and waits for it to disappear
+  before sending Save. It passed on both hosts, including at the Linux limit.
+- Full local validation — With Rust `1.100.0`, formatting and strict Clippy
+  passed on arm64 macOS 27.2.1 and arm64 Ubuntu 26.10 UTM. The locked workspace
+  suites passed 394 and 397 tests respectively. All 10 ignored tests on macOS
+  and all 11 on Ubuntu also passed when run explicitly. Ubuntu passed all 13
+  memory-capped CI cases, with the workflow's 1 GiB fixtures and swap disabled.
+  macOS passed the portable release benchmarks with the same fixture sizes.
+  Linux cgroup enforcement and X11 were exercised on Ubuntu.
 - Final `0.1.2` — The user approved removing the development suffix after the
   `dev.5` hosted macOS check passed. Upstream `main` was still at `0.1.1`.
   Cargo's manifest and lockfile agree, and `ede --version` reports `0.1.2` on

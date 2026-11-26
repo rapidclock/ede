@@ -5072,8 +5072,8 @@ fn large_highlighting_and_search_overlap() {
         process.expect_body(&format!("{}fn LEADING_TOKEN", " ".repeat(count)), TIMEOUT);
         max_input = max_input.max(event.elapsed());
     }
-    process.send(b"\x1b");
-    process.expect_absent("Scope: All open");
+    process.click_label("[×]", 1);
+    process.expect_absent("[×]");
     process.send(b"\x13");
     process.expect_with_timeout("Saved", Duration::from_secs(30));
     process.send(b"\x11");
