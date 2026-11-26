@@ -420,6 +420,22 @@ impl AppState {
             self.capture = None;
         }
     }
+    /// Keep a press on an unchanged Find control when only a tab badge updates.
+    pub(crate) fn preserve_search_press(
+        &mut self,
+        previous: &LayoutSnapshot,
+        next: &LayoutSnapshot,
+    ) {
+        if let Some(capture) = &mut self.capture
+            && matches!(capture.control, Control::Search(_))
+            && capture.generation == previous.generation
+            && previous.only_tab_label_widths_changed(next)
+            && next.hit(capture.x, capture.y) == Some(capture.control)
+        {
+            capture.generation = next.generation;
+        }
+    }
+
     /// Record display-safe bounded status and schedule a redraw.
     pub fn notify(&mut self, message: StatusMessage) {
         if self.status != message {

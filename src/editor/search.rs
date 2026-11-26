@@ -185,7 +185,6 @@ struct Run {
     stream_resume: Option<Found>,
     read_only: Vec<TabId>,
     progress: Arc<Mutex<Progress>>,
-    previous_message: String,
     receipts_started: bool,
 }
 struct Worker {
@@ -411,7 +410,9 @@ impl State {
         }
         if let Some(run) = &self.run {
             run.cancel.cancel();
-            self.status.message = "Cancelling search".into();
+            if run.request.operation != Operation::Decorate {
+                self.status.message = "Cancelling search".into();
+            }
         }
         if invalidate {
             self.status.current = None;
@@ -593,7 +594,6 @@ impl State {
             stream_resume,
             read_only,
             progress: Arc::new(Mutex::new(Progress::default())),
-            previous_message: self.status.message.clone(),
             receipts_started: false,
         };
         if self.run.is_some() || self.maintaining.is_some() {
@@ -716,8 +716,15 @@ impl State {
         } else {
             None
         };
-        self.status.message = if decorating && successful {
-            run.previous_message.clone()
+        self.status.message = if decorating {
+            // Highlighting owns decorations. An edit may have invalidated the
+            // list and changed its message while this pass was still reading.
+            if !run.cancel.is_cancelled()
+                && let Some(reason) = reason
+            {
+                owner.event(Event::Failure(reason));
+            }
+            std::mem::take(&mut self.status.message)
         } else if run.cancel.is_cancelled() {
             self.status.current = None;
             self.status.decorations.clear();
@@ -762,7 +769,7 @@ impl State {
         } else {
             "No further matches".into()
         };
-        if run.cancel.is_cancelled() {
+        if !decorating && run.cancel.is_cancelled() {
             self.status.message = format!(
                 "Cancelled; {} processed; {} changed documents",
                 self.status.processed, self.status.changed
@@ -1081,17 +1088,18 @@ impl Coordinator {
         let mut state = std::mem::take(&mut self.search);
         let result = state.poll(self);
         if let Err(error) = &result {
+            let decorating = state.operation == Some(Operation::Decorate);
             state.cancel(false);
             state.status.busy = false;
             state.status.replacing = false;
-            state.status.message = format!(
-                "Stopped: {error}; {} processed, {} changed documents",
-                state.status.processed, state.status.changed
-            );
             self.view_cancel
                 .search_replacing
                 .store(false, Ordering::Release);
-            if state.operation != Some(Operation::Decorate) {
+            if !decorating {
+                state.status.message = format!(
+                    "Stopped: {error}; {} processed, {} changed documents",
+                    state.status.processed, state.status.changed
+                );
                 for tab in &state.targets {
                     if !state
                         .status

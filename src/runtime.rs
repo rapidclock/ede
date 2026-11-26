@@ -478,6 +478,7 @@ fn reconcile_layout(area: Rect, app: &mut AppState, layout: &mut LayoutSnapshot)
         {
             next.document_generation = layout.document_generation;
         }
+        app.preserve_search_press(layout, &next);
         *layout = next;
     }
     app.sync_layout(layout);
@@ -1068,6 +1069,86 @@ mod tests {
         assert!(
             matches!(app.input(Input::Text("x".into()), &layout), Some(Intent::Editor(Action::Insert(text))) if text == "x")
         );
+    }
+
+    /// A scratch badge may appear during a click without moving Find's actions.
+    #[test]
+    fn search_button_click_survives_only_tab_label_changes() {
+        use crate::{
+            app::Modal,
+            editor::{TabId, TabSummary},
+            ui::Control,
+        };
+        use std::sync::Arc;
+        let area = Rect::new(0, 0, 80, 24);
+        for (change, activates) in [
+            ("badge", true),
+            ("tab", false),
+            ("resize", false),
+            ("search", false),
+        ] {
+            let mut app = AppState::new();
+            app.screen.tab = Some(TabId(1));
+            app.screen.tabs = Arc::from([TabSummary {
+                id: TabId(1),
+                label: Arc::from("Untitled 1"),
+                path_hint: None,
+                modified: false,
+                waiting: false,
+                loading: false,
+                saving: false,
+                queued_save: false,
+                attention: false,
+                scratch: true,
+                retention: "",
+                warning: None,
+                language: None,
+                language_auto: true,
+                line_ending: crate::editor::LineEndingStatus::Hidden,
+                stream: None,
+            }]);
+            app.search.open = true;
+            app.search.replace = true;
+            app.search.query.literal = "one".into();
+            Arc::make_mut(&mut app.screen.search).rows.count = 1;
+            let mut layout = LayoutSnapshot::for_app(area, &app, 1);
+            let (column, row) = (0..area.height)
+                .flat_map(|row| (0..area.width).map(move |x| (x, row)))
+                .find(|&(x, y)| layout.hit(x, y) == Some(Control::Search(8)))
+                .unwrap();
+            let mouse = |kind| {
+                Input::Pointer(MouseEvent {
+                    kind,
+                    column,
+                    row,
+                    modifiers: KeyModifiers::NONE,
+                })
+            };
+            let left = crossterm::event::MouseButton::Left;
+            app.input(mouse(MouseEventKind::Down(left)), &layout);
+            Arc::make_mut(&mut app.screen.tabs)[0].modified = true;
+            if change == "tab" {
+                app.screen.tab = Some(TabId(2));
+            }
+            if change == "search" {
+                Arc::make_mut(&mut app.screen.search).rows.generation += 1;
+            }
+            let updated = if change == "resize" {
+                Rect::new(0, 0, 80, 23)
+            } else {
+                area
+            };
+            reconcile_layout(updated, &mut app, &mut layout);
+            if change != "resize" {
+                assert_eq!(layout.hit(column, row), Some(Control::Search(8)));
+            }
+            app.input(mouse(MouseEventKind::Up(left)), &layout);
+            assert_eq!(
+                matches!(app.modal, Some(Modal::ReplaceAll(_))),
+                activates,
+                "{change}"
+            );
+        }
     }
 
     /// Scripted runtime advances virtual time during polls; no sleeps or real terminal needed.

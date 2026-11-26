@@ -1,9 +1,9 @@
 # Improvement Spec — Find and Find & Replace windows
 
-**Status** — The collapsed-title revision is implemented and validated on
-macOS and Ubuntu 26.10.
+**Status** — The collapsed-title revision and its CI follow-up are implemented
+and validated on macOS and Ubuntu 26.10.
 **Release** — User-confirmed patch target `0.1.2`, from `0.1.1` on `main`.
-The review build is `0.1.2-dev.3`.
+The review build is `0.1.2-dev.4`.
 **Branch** — `enhance/find-windows`, based on `main` at `3004bb3`.
 
 ## Current behavior and scope
@@ -266,9 +266,26 @@ Minimized title  ┌ Find ──────────────────
 | A9 | In both expanded modes, verify blue Minimize and red Close are individually clickable and keyboard reachable, with two blank, inactive cells between them. Verify monochrome focus. At `80×24` and `40×8`, minimize to a single bordered row in the same width, with the full title, a blue `[+]` at Minimize's column, and the red `[×]` at the same column. Verify independent click targets, resize, and progress or counts in the editor status bar. |
 | A10 | Hold a scan at a controlled point, minimize it, and verify the editor accepts input without losing focus. Verify both restore routes while busy and after completion, preserved search state without resubmission, and no delayed caret or tab jump. Exercise Current tab invalidation and stale revisions while minimized. Verify Close cancels and clears in both views and Esc preserves the expanded window while cancelling. |
 | A11 | Verify Actions → Search contains only Find and Find & Replace. F3, Shift+F3, and an existing remap for a removed editor-level route cannot start a scan with Find closed. Verify in-window match navigation and replacement, including Replace All confirmation and cancellation. |
+| A12 | When an unrelated tab-label width changes between press and release, an unchanged search form button still activates. A release after resize, a changed active tab, or a changed result generation does not activate. Background highlighting preserves the stale-result notice and zero live rows after an edit, including cancellation and read failure. |
 
 ## Validation record
 
+- Hosted macOS regression (A4, A5, A10, A12) — The `dev.3` PR job passed
+  formatting and Clippy and failed two native terminal tests. A scratch edit
+  finished between press and release on Replace All, and a highlight pass
+  restored the previous search message after an edit invalidated the results.
+  Both deterministic checks reproduced the failures before the fix. See the
+  [failed Actions job](https://github.com/rapidclock/ede/actions/runs/45746338227/job/139663209523).
+- CI follow-up `dev.4` — The runtime test preserves a press through a tab
+  badge update and rejects release after resize, an active-tab change, or a
+  changed result generation. An isolated mutation of the active-tab guard
+  failed the intended assertion. A gated test covers a successful, cancelled,
+  or failed highlight pass after edit invalidation and verifies that read
+  errors still reach the editor. Independent re-review found no remaining
+  actionable issues. Formatting, strict Clippy, and the full locked suite
+  passed on arm64 macOS 27.2.1 and Ubuntu 26.10 on UTM with Rust `1.100.0`.
+  The suites passed 394 and 397 tests respectively. Hosted results are tracked
+  in the [PR checks](https://github.com/rapidclock/ede/pull/20/checks).
 - Collapsed-title revision (A9–A10) — The user requested a true single-row
   title bar at the regular dialog width, with `[+]` in the Minimize position.
   The new terminal-cell regression failed on `dev.2` because the minimized

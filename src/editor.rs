@@ -3370,6 +3370,7 @@ mod search_tests {
     #[derive(Debug)]
     struct SearchGate {
         armed: AtomicBool,
+        fail: AtomicBool,
         name: &'static str,
         entered: SyncSender<()>,
         release: Mutex<Receiver<()>>,
@@ -3467,24 +3468,42 @@ mod search_tests {
             {
                 self.entered.send(()).unwrap();
                 self.release.lock().unwrap().recv().unwrap();
+                if self.fail.load(Ordering::Acquire) {
+                    return Err(std::io::Error::other("test read failed"));
+                }
             }
             Ok(())
         }
     }
 
     fn gated(name: &'static str) -> (Coordinator, Receiver<()>, SyncSender<()>) {
+        let (worker, entered, release, _) = search_gate(name, true);
+        (worker, entered, release)
+    }
+
+    fn search_gate(
+        name: &'static str,
+        armed: bool,
+    ) -> (Coordinator, Receiver<()>, SyncSender<()>, Arc<SearchGate>) {
         let (entered, entered_rx) = mpsc::sync_channel(1);
         let (release, release_rx) = mpsc::sync_channel(1);
+        let gate = Arc::new(SearchGate {
+            armed: AtomicBool::new(armed),
+            fail: AtomicBool::new(false),
+            name,
+            entered,
+            release: Mutex::new(release_rx),
+        });
         let options = OpenOptions {
-            faults: Some(Arc::new(SearchGate {
-                armed: AtomicBool::new(true),
-                name,
-                entered,
-                release: Mutex::new(release_rx),
-            })),
+            faults: Some(gate.clone()),
             ..OpenOptions::default()
         };
-        (super::tests::coordinator(options), entered_rx, release)
+        (
+            super::tests::coordinator(options),
+            entered_rx,
+            release,
+            gate,
+        )
     }
 
     fn request(operation: search::Operation) -> search::SearchRequest {
@@ -3500,6 +3519,51 @@ mod search_tests {
             operation,
             browse: false,
             expected: None,
+        }
+    }
+
+    /// A highlight pass cannot overwrite invalidation published after it first started.
+    #[test]
+    fn search_decoration_keeps_stale_notice_after_edit() {
+        for (cancelled, read_failure) in [(false, false), (true, false), (false, true)] {
+            let (mut worker, reached, release, gate) = search_gate("ede-search-scan", false);
+            let (events, notices) = mpsc::sync_channel(16);
+            worker.events = events;
+            worker.action(Action::Insert("one one".into())).unwrap();
+            let mut find = request(search::Operation::First);
+            find.browse = true;
+            worker.action(Action::Search(find)).unwrap();
+            settle(&mut worker);
+            assert_eq!(worker.search.status.rows.live, 2);
+            gate.armed.store(true, Ordering::Release);
+            worker
+                .action(Action::Size {
+                    width: 71,
+                    height: 20,
+                    generation: 1,
+                    search_cover: 0,
+                })
+                .unwrap();
+            worker.poll_background();
+            worker.poll_background();
+            reached.recv_timeout(Duration::from_secs(5)).unwrap();
+            worker.action(Action::Insert("x".into())).unwrap();
+            worker.poll_background();
+            assert_eq!(worker.search.status.rows.live, 0);
+            assert!(worker.search.status.message.contains("stale"));
+            if cancelled {
+                worker.action(Action::CancelSearch).unwrap();
+            }
+            gate.fail.store(read_failure, Ordering::Release);
+            release.send(()).unwrap();
+            settle(&mut worker);
+            assert_eq!(worker.search.status.rows.live, 0);
+            assert!(
+                worker.search.status.message.contains("stale"),
+                "{}",
+                worker.search.status.message
+            );
+            assert_eq!(notices.try_iter().any(|event| matches!(event, Event::Failure(text) if text.contains("test read failed"))), read_failure);
         }
     }
 
@@ -3671,6 +3735,7 @@ mod search_tests {
         let (entered, reached) = mpsc::sync_channel(1);
         let (release, gate) = mpsc::sync_channel(1);
         let fault = Arc::new(SearchGate {
+            fail: AtomicBool::new(false),
             armed: AtomicBool::new(false),
             name: "ede-search-scan",
             entered,

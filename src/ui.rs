@@ -233,6 +233,24 @@ impl LayoutSnapshot {
         self.search_window
     }
 
+    /// Tab badges can resize labels without changing any part of the Find dialog.
+    pub(crate) fn only_tab_label_widths_changed(&self, next: &Self) -> bool {
+        if self.area != next.area
+            || self.search_window.is_none()
+            || self.search_window != next.search_window
+            || !self.signature.tabs.iter().map(|(id, _)| id).eq(next
+                .signature
+                .tabs
+                .iter()
+                .map(|(id, _)| id))
+        {
+            return false;
+        }
+        let mut before = self.signature.clone();
+        before.tabs.clone_from(&next.signature.tabs);
+        before == next.signature
+    }
+
     pub(crate) fn search_result_rows(&self) -> u16 {
         self.search_list.map_or(0, |list| list.height)
     }
