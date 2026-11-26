@@ -128,10 +128,10 @@ without moving the caret. F6 returns to editor text. **Previous** and **Next**
 wrap through live matches. **Summary** opens Search Details with per-tab counts
 and outcomes.
 
-Click the blue **`−`** to minimize either window and return to the editor. A
-one-line bar shows progress or the match count. Click **Restore** or press
-Ctrl+F / Cmd+F to reopen the same window with its results. In the form,
-press Up from the first row to reach Minimize and Close, then use Left or
+Click the blue **`−`** to collapse either window into its title row and return
+to the editor. The editor status bar shows progress or the match count. Click
+the blue **`+`** or press Ctrl+F / Cmd+F to reopen the window with its results.
+In the form, press Up from the first row to reach Minimize and Close, then use Left or
 Right to choose and Enter to activate. The red **`×`** cancels and closes
 either view. While the window is expanded, Escape cancels active work or
 closes the idle window.

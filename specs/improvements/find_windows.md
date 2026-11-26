@@ -1,9 +1,9 @@
 # Improvement Spec — Find and Find & Replace windows
 
-**Status** — Minimize is implemented and validated for review on macOS and
-Ubuntu 26.10.
+**Status** — The collapsed-title revision is implemented and validated on
+macOS and Ubuntu 26.10.
 **Release** — User-confirmed patch target `0.1.2`, from `0.1.1` on `main`.
-The review build is `0.1.2-dev.2`.
+The review build is `0.1.2-dev.3`.
 **Branch** — `enhance/find-windows`, based on `main` at `3004bb3`.
 
 ## Current behavior and scope
@@ -212,22 +212,21 @@ search, replace, and cancel commands.
   between them, Down returns to the form, and Enter activates the focused
   control.
 - Minimize returns keyboard focus to the editor while the same scan continues.
-  Replace the expanded window with a single row anchored at the bottom right
-  above the status bar. Show the window name, `Searching…` while busy or the
-  match count when complete, and **Restore** and red **Close** actions separated
-  by the same two-cell gap. Use the applicable status for cancelled, incomplete,
-  or stale results. Reserve that editor row so the caret cannot land behind
-  the bar. Give the two controls priority in compact terminals and shorten
-  the mode label to **Replace** if needed to display the status. Only clicks
-  on the bar's controls activate it. Normal editor input and clicks elsewhere
-  leave the bar in place.
+  Collapse the expanded window into its single bordered title row at the bottom
+  right above the editor status bar. Keep the same width, full **Find** or
+  **Find & Replace** title, and button columns in both views. Switch blue
+  `[−]` to blue `[+]` when minimized. Keep red `[×]` and the two-cell gap.
+  Show progress, match counts, and applicable cancellation or stale-result
+  messages in the editor status bar as space allows. Reserve the title row so
+  the caret cannot land behind it. Normal editor input and clicks elsewhere
+  leave the title row in place.
 - Preserve the mode, field values, flags, and any still-valid results and list
-  position while minimized. Scan completion may update the bar but cannot move
+  position while minimized. Scan completion may update the status bar but cannot move
   the caret, scroll the editor, switch tabs, or take focus. Existing revision
   and scope rules still govern result validity, including edits made from the
   editor while the window is minimized. Minimizing cannot confirm a pending
   replacement, repeat an action, or change replacement safeguards.
-- **Restore** and **Ctrl+F / Cmd+F** reopen the same minimized window, including
+- **`[+]`** and **Ctrl+F / Cmd+F** reopen the same minimized window, including
   Find & Replace, with the same search and any available results. Opening a
   search from Actions or the Find & Replace shortcut while minimized also
   restores that window. Restore a valid previous form or results focus, with
@@ -248,9 +247,8 @@ search, replace, and cancel commands.
   the editor has focus.
 
 ```text
-Expanded title   ┌─ Find ───────────────────────[−]  [×]┐
-Minimized busy    Find · Searching…        [Restore]  [×]
-Minimized done    Find · 18 matches        [Restore]  [×]
+Expanded title   ┌ Find ────────────────────────[−]  [×]┐
+Minimized title  ┌ Find ────────────────────────[+]  [×]┐
 ```
 
 ## Acceptance criteria
@@ -265,12 +263,23 @@ Minimized done    Find · 18 matches        [Restore]  [×]
 | A6 | Verify Replaced for changed text and Removed for deletion, including a partial batch and feedback beyond the first page. Verify identical, skipped, and uncommitted edits leave no new marker. Browse feedback without jumping or changing the live count, including when inserted text itself matches. Verify feedback clears on undo, subsequent edits, and search changes. |
 | A7 | Both modes anchor at the bottom right and list results above the form. With no saved preference, show up to three result rows. The Settings stepper stops at 1 and 10, accepts keyboard and mouse input, and persists on Save. After restart the preference applies to both modes. Reduce rows as needed at compact sizes and keep the selected document occurrence visible above the window. |
 | A8 | With the editor caret at the last match or in a later tab, submit a search and verify the first result is selected. Use Down immediately after completion and Tab or Shift+Tab to return from anywhere in the list. A no-match query leaves the field usable. Verify a visible dim divider when both parts fit and Search Details with per-tab lines and no escaped layout newlines. |
-| A9 | In both expanded modes, verify blue Minimize and red Close are individually clickable and keyboard reachable, with two blank, inactive cells between them. Verify monochrome focus, the compact layout and resize, and independent Restore and Close targets on the minimized bar. |
+| A9 | In both expanded modes, verify blue Minimize and red Close are individually clickable and keyboard reachable, with two blank, inactive cells between them. Verify monochrome focus. At `80×24` and `40×8`, minimize to a single bordered row in the same width, with the full title, a blue `[+]` at Minimize's column, and the red `[×]` at the same column. Verify independent click targets, resize, and progress or counts in the editor status bar. |
 | A10 | Hold a scan at a controlled point, minimize it, and verify the editor accepts input without losing focus. Verify both restore routes while busy and after completion, preserved search state without resubmission, and no delayed caret or tab jump. Exercise Current tab invalidation and stale revisions while minimized. Verify Close cancels and clears in both views and Esc preserves the expanded window while cancelling. |
 | A11 | Verify Actions → Search contains only Find and Find & Replace. F3, Shift+F3, and an existing remap for a removed editor-level route cannot start a scan with Find closed. Verify in-window match navigation and replacement, including Replace All confirmation and cancellation. |
 
 ## Validation record
 
+- Collapsed-title revision (A9–A10) — The user requested a true single-row
+  title bar at the regular dialog width, with `[+]` in the Minimize position.
+  The new terminal-cell regression failed on `dev.2` because the minimized
+  row was 50 columns wide and the expanded row was 60. The `dev.3` check verifies
+  width and position, the full titles, button columns, colors, inactive space,
+  and progress in the editor status bar at `80×24` and `40×8`. Native terminal
+  tests cover mouse and keyboard restore, close, resize, and stale results.
+  Formatting, strict Clippy, and the full locked workspace suites passed on
+  arm64 macOS 27.2.1 and the arm64 Ubuntu 26.10 UTM guest with Rust `1.100.0`.
+  The suites passed 392 and 395 tests respectively, with 10 and 11 existing
+  ignored tests.
 - Minimize addendum (A9–A11) — The user approved the interaction, spaced
   title controls, and implementation for `0.1.2-dev.2`. A new native terminal
   test failed on `dev.1` because Minimize was absent. Terminal-cell and native

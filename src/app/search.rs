@@ -159,7 +159,7 @@ impl Panel {
             FORM_UP => "↑".into(),
             FORM_DOWN => "↓".into(),
             MINIMIZE => "−".into(),
-            RESTORE => "Restore".into(),
+            RESTORE => "+".into(),
             _ => "Cancel".into(),
         }
     }

@@ -9,6 +9,7 @@ use crate::{
 };
 use ratatui::text::{Line, Span};
 
+const MAX_WINDOW_WIDTH: u16 = 60;
 /// Keep the two window actions visually and physically apart.
 const TITLE_ACTION_GAP: u16 = 2;
 
@@ -47,7 +48,7 @@ impl Signature {
 impl LayoutSnapshot {
     /// Add hit regions above the ordinary editor without resizing its document view.
     pub(super) fn add_search_window(&mut self, app: &AppState) {
-        let width = self.area.width.min(60);
+        let width = self.area.width.min(MAX_WINDOW_WIDTH);
         let groups = app.search.groups(app.screen.search.busy);
         let form_rows = groups.len() as u16;
         let rows = app.search.current_rows(&app.screen.search.rows);
@@ -127,9 +128,9 @@ impl LayoutSnapshot {
         }
     }
 
-    /// Give the minimized bar a stable footprint while its status changes.
+    /// Keep the expanded window's width and reserve one editor row for its title.
     pub(super) fn add_search_bar(&mut self, app: &AppState) {
-        let width = self.area.width.min(50);
+        let width = self.area.width.min(MAX_WINDOW_WIDTH);
         let bar = Rect::new(self.area.right() - width, self.area.bottom() - 2, width, 1);
         if let Some(content) = self
             .targets
@@ -199,13 +200,8 @@ fn divider(width: u16) -> Line<'static> {
     )
 }
 
-/// Paint progress without taking focus or covering more than one editor row.
-pub(super) fn render_bar(
-    frame: &mut Frame<'_>,
-    app: &AppState,
-    layout: &LayoutSnapshot,
-    bar: Rect,
-) {
+/// Summarize the minimized search in the editor's existing status row.
+pub(super) fn minimized_status(app: &AppState) -> Option<String> {
     let status = &app.screen.search;
     let rows = app.search.current_rows(&status.rows);
     let message = if status.busy {
@@ -220,38 +216,47 @@ pub(super) fn render_bar(
     {
         "Incomplete".into()
     } else if status.outcomes.is_empty() || rows.is_none() {
-        "Ready".into()
+        return None;
     } else {
         let count = status.rows.live;
         format!("{count} {}", if count == 1 { "match" } else { "matches" })
     };
+    Some(message)
+}
+
+fn search_title(app: &AppState) -> &'static str {
+    if app.search.replace {
+        " Find & Replace "
+    } else {
+        " Find "
+    }
+}
+
+/// Draw the window's title and its two actions on the reserved editor row.
+pub(super) fn render_bar(
+    frame: &mut Frame<'_>,
+    app: &AppState,
+    layout: &LayoutSnapshot,
+    bar: Rect,
+) {
     frame.render_widget(Clear, bar);
-    let mut text_width = 0;
+    frame.render_widget(
+        Block::default()
+            .title(search_title(app))
+            .borders(Borders::TOP | Borders::LEFT | Borders::RIGHT),
+        bar,
+    );
     for target in &layout.targets {
         if let Control::Search(index @ (RESTORE | CLOSE)) = target.control {
-            if index == RESTORE {
-                text_width = target.area.x - bar.x - 2;
-            }
             render_title_action(frame, app, target.area, index);
         }
     }
-    let name = if app.search.replace {
-        if ("Find & Replace · ".width() + message.width()) <= usize::from(text_width) {
-            "Find & Replace"
-        } else {
-            "Replace"
-        }
-    } else {
-        "Find"
-    };
-    frame.render_widget(
-        Paragraph::new(format!("{name} · {message}"))
-            .style(Style::default().add_modifier(Modifier::DIM)),
-        Rect::new(bar.x + 1, bar.y, text_width, 1),
-    );
 }
 
 fn render_title_action(frame: &mut Frame<'_>, app: &AppState, area: Rect, index: u8) {
+    if matches!(index, MINIMIZE | RESTORE) {
+        frame.render_widget(Clear, Rect::new(area.right(), area.y, TITLE_ACTION_GAP, 1));
+    }
     let label = app.search.label(index);
     let focused = app.focus == Some(Control::Search(index));
     let text = if focused {
@@ -261,7 +266,7 @@ fn render_title_action(frame: &mut Frame<'_>, app: &AppState, area: Rect, index:
     };
     let color = match index {
         CLOSE => Some(Color::Red),
-        MINIMIZE => Some(Color::LightBlue),
+        MINIMIZE | RESTORE => Some(Color::LightBlue),
         _ => None,
     };
     frame.render_widget(
@@ -292,11 +297,6 @@ pub(super) fn details(report: &Summary, width: u16) -> Paragraph<'static> {
 pub(super) fn render(frame: &mut Frame<'_>, app: &AppState, layout: &LayoutSnapshot, window: Rect) {
     let status = &app.screen.search;
     let rows = app.search.current_rows(&status.rows);
-    let title = if app.search.replace {
-        " Find & Replace "
-    } else {
-        " Find "
-    };
     let nav = layout
         .targets
         .iter()
@@ -339,7 +339,12 @@ pub(super) fn render(frame: &mut Frame<'_>, app: &AppState, layout: &LayoutSnaps
         status.message.clone()
     };
     frame.render_widget(Clear, window);
-    frame.render_widget(Block::default().title(title).borders(Borders::ALL), window);
+    frame.render_widget(
+        Block::default()
+            .title(search_title(app))
+            .borders(Borders::ALL),
+        window,
+    );
     if let Some(list) = layout.search_list
         && layout
             .targets
@@ -403,12 +408,6 @@ pub(super) fn render(frame: &mut Frame<'_>, app: &AppState, layout: &LayoutSnaps
                 }
             }
             Control::Search(index @ (MINIMIZE | CLOSE)) => {
-                if index == MINIMIZE {
-                    frame.render_widget(
-                        Clear,
-                        Rect::new(target.area.right(), target.area.y, TITLE_ACTION_GAP, 1),
-                    );
-                }
                 render_title_action(frame, app, target.area, index);
             }
             Control::Search(index) => {
@@ -612,6 +611,62 @@ mod tests {
             .rows
             .generation += 1;
         assert_ne!(Signature::new(&app), visible);
+    }
+
+    /// Collapsing keeps the window edge, title, and controls on a single row.
+    #[test]
+    fn minimized_search_matches_the_expanded_title_row() {
+        for (width, height) in [(80, 24), (40, 8)] {
+            let area = Rect::new(0, 0, width, height);
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            for (replace, title) in [(false, "Find"), (true, "Find & Replace")] {
+                let mut app = AppState::new();
+                app.notify(crate::status::StatusMessage::new(
+                    crate::status::Severity::Info,
+                    "Ready",
+                ));
+                app.search.open = true;
+                app.search.replace = replace;
+                let expanded = LayoutSnapshot::for_app(area, &app, 1);
+                let window = expanded.search_bounds().unwrap();
+                let column = |layout: &LayoutSnapshot, index| {
+                    layout
+                        .targets
+                        .iter()
+                        .find(|t| t.control == Control::Search(index))
+                        .unwrap()
+                        .area
+                        .x
+                };
+                app.minimize_search();
+                std::sync::Arc::make_mut(&mut app.screen.search).busy = true;
+                let collapsed = LayoutSnapshot::for_app(area, &app, 2);
+                let bar = collapsed.search_bar.unwrap();
+                assert_eq!(bar, Rect::new(window.x, area.bottom() - 2, window.width, 1));
+                assert_eq!(column(&expanded, MINIMIZE), column(&collapsed, RESTORE));
+                assert_eq!(column(&expanded, CLOSE), column(&collapsed, CLOSE));
+                terminal
+                    .draw(|frame| super::super::render(frame, &app, &collapsed))
+                    .unwrap();
+                let buffer = terminal.backend().buffer();
+                let row: String = (bar.x..bar.right())
+                    .map(|x| buffer[(x, bar.y)].symbol())
+                    .collect();
+                assert!(row.starts_with(&format!("┌ {title} ─")), "{row:?}");
+                assert!(row.ends_with("[+]  [×]┐"), "{row:?}");
+                assert!(!row.contains("Searching"));
+                let status: String = (0..width)
+                    .map(|x| buffer[(x, height - 1)].symbol())
+                    .collect();
+                assert!(status.contains("Searching…"), "{status:?}");
+                let expand_x = column(&collapsed, RESTORE);
+                assert_eq!(buffer[(expand_x, bar.y)].fg, Color::LightBlue);
+                assert_eq!(buffer[(column(&collapsed, CLOSE), bar.y)].fg, Color::Red);
+                for x in expand_x + 3..column(&collapsed, CLOSE) {
+                    assert_eq!(collapsed.hit(x, bar.y), Some(Control::SearchSurface));
+                }
+            }
+        }
     }
 
     /// Search action colors and alignment come from the same regions used for clicks.

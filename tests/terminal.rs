@@ -36,7 +36,7 @@ fn search_minimize_restores_results_and_keeps_editor_focus() {
         "green apple\napple tree\napple baked\n4\n5\n6\n7\n8\nlast line",
     )
     .unwrap();
-    for shortcut in [b"\x06", b"\x08"] {
+    for (shortcut, title) in [(b"\x06", "Find"), (b"\x08", "Find & Replace")] {
         let mut process = PtyChild::editor_with_path(Some("xterm-256color"), Some(&file));
         process.expect_status("Ln 1 Col 1");
         process.send(shortcut);
@@ -47,13 +47,14 @@ fn search_minimize_restores_results_and_keeps_editor_focus() {
         process.expect_status("Ln 2 Col 1");
 
         process.click_label("[−]", 1);
-        process.expect(" · 3 matches");
-        process.expect("[Restore]  [×]");
+        process.expect("[+]  [×]┐");
+        process.expect(&format!("┌ {title} ─"));
+        process.expect_status("3 matches");
         process.expect_absent("Find:");
         process.send(b"\x1b[B");
         process.expect_status("Ln 3 Col 1");
         process.send(b"\x1b[27u");
-        process.expect("[Restore]  [×]");
+        process.expect("[+]  [×]┐");
         process.send(b"\x06");
         process.expect("> 2:1 apple tree");
         process.expect_status("Ln 3 Col 1");
@@ -64,20 +65,20 @@ fn search_minimize_restores_results_and_keeps_editor_focus() {
         process.send(b"\t");
         process.expect(">Find: apple");
         process.send(b"\x1b[A\r");
-        process.expect("[Restore]  [×]");
+        process.expect("[+]  [×]┐");
         process.resize(40, 8);
-        process.expect("[Restore]  [×]");
+        process.expect("[+]  [×]┐");
         process.send(b"\x1b[1;5F");
         process.expect_status("Ln 9 Col 10");
         process.expect_body("last line", TIMEOUT);
         assert!(process.parser.screen().cursor_position().0 < 6);
-        process.click_label("[Restore]", 1);
+        process.click_label("[+]", 1);
         process.expect(">Find: apple");
-        process.expect_absent("[Restore]");
+        process.expect_absent("[+]");
         process.send(b"\x1b[A\r");
-        process.expect("[Restore]  [×]");
+        process.expect("[+]  [×]┐");
         process.click_label("[×]", 1);
-        process.expect_absent("[Restore]");
+        process.expect_absent("[+]");
         process.send(shortcut);
         process.expect(">Find: apple");
         process.expect_absent("3 matches");
@@ -123,20 +124,20 @@ fn search_minimized_marks_changed_revision_and_current_tab_stale() {
     process.send(b"\x06apple\r");
     process.expect("1 of 1 match");
     process.click_label("[−]", 1);
-    process.expect("Find · 1 match");
+    process.expect_status("1 match");
     process.send(b"x");
     process.expect_body("xapple left", TIMEOUT);
-    process.expect("Find · Stale results");
+    process.expect_status("Stale results");
     process.send(b"\x1a\x06");
     process.expect(">Find: apple");
     process.expect_absent("1:1 apple left");
     process.send(b"\r");
     process.expect("1 of 1 match");
     process.click_label("[−]", 1);
-    process.expect("Find · 1 match");
+    process.expect_status("1 match");
     process.send(b"\x1b[19~");
     process.expect_body("apple right", TIMEOUT);
-    process.expect("Find · Stale results");
+    process.expect_status("Stale results");
     process.send(b"\x06");
     process.expect(">Find: apple");
     process.expect_absent("1:1 apple left");

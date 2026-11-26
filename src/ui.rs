@@ -1261,6 +1261,12 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &AppState, layout: &LayoutSnaps
         crate::status::Severity::Warning => "Warning: ",
         crate::status::Severity::Error => "Error: ",
     };
+    let footer_width = area.width
+        - if layout.contains(Control::ToggleFollow) {
+            16
+        } else {
+            0
+        };
     let footer = app.receiving_paste_status().unwrap_or_else(|| {
         if app.guard_waiting() {
             let cancel = app
@@ -1295,36 +1301,30 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &AppState, layout: &LayoutSnaps
         } else {
             ""
         };
-        format!(
-            "{config}{syntax}{}{} | {}{}{}",
+        let mut footer = format!(
+            "{config}{syntax}{}{} | {}{}",
             severity,
             app.status.text(),
             coordinates,
             if app.pending { " | working" } else { "" },
-            if !app.search.open && !app.search.minimized && !app.screen.search.message.is_empty() {
-                format!(" | {}", app.screen.search.message)
-            } else {
-                String::new()
+        );
+        if layout.search_bar.is_some() {
+            if let Some(message) = search::minimized_status(app)
+                && footer.width() + 3 + message.width() <= usize::from(footer_width)
+            {
+                footer.push_str(" | ");
+                footer.push_str(&message);
             }
-        )
+        } else if !app.search.open && !app.search.minimized && !app.screen.search.message.is_empty()
+        {
+            footer.push_str(" | ");
+            footer.push_str(&app.screen.search.message);
+        }
+        footer
     });
     frame.render_widget(
         Paragraph::new(footer),
-        Rect::new(
-            area.x,
-            area.bottom() - 1,
-            area.width
-                - if layout
-                    .targets
-                    .iter()
-                    .any(|target| target.control == Control::ToggleFollow)
-                {
-                    16
-                } else {
-                    0
-                },
-            1,
-        ),
+        Rect::new(area.x, area.bottom() - 1, footer_width, 1),
     );
     if let Some(window) = layout.search_bounds() {
         search::render(frame, app, layout, window);
