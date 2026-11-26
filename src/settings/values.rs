@@ -10,14 +10,22 @@ pub(crate) enum Scalar {
     Document,
     Line,
     Timeout,
+    FindMatchRows,
 }
 
 impl Scalar {
-    pub const ALL: [Self; 4] = [Self::Checkpoint, Self::Document, Self::Line, Self::Timeout];
+    pub const ALL: [Self; 5] = [
+        Self::Checkpoint,
+        Self::Document,
+        Self::Line,
+        Self::Timeout,
+        Self::FindMatchRows,
+    ];
 
     pub const fn table(self) -> &'static str {
         match self {
             Self::Checkpoint => "recovery",
+            Self::FindMatchRows => "editor",
             _ => "highlighting",
         }
     }
@@ -28,6 +36,7 @@ impl Scalar {
             Self::Document => "max_document_bytes",
             Self::Line => "max_line_bytes",
             Self::Timeout => "parse_timeout_ms",
+            Self::FindMatchRows => "find_match_rows",
         }
     }
 
@@ -37,6 +46,7 @@ impl Scalar {
             Self::Document => "Document limit (B)",
             Self::Line => "Line limit (bytes)",
             Self::Timeout => "Parse timeout (ms)",
+            Self::FindMatchRows => "Find match rows",
         }
     }
 
@@ -46,12 +56,14 @@ impl Scalar {
             Self::Document => 20 * 1024 * 1024,
             Self::Line => 64 * 1024,
             Self::Timeout => 250,
+            Self::FindMatchRows => 3,
         }
     }
 
     pub const fn maximum(self) -> u64 {
         match self {
             Self::Checkpoint => 3600,
+            Self::FindMatchRows => 10,
             _ => self.default(),
         }
     }
@@ -101,7 +113,7 @@ impl ClipboardMode {
 /// Explicit overrides are separate from their effective defaults.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct Values {
-    scalars: [Option<u64>; 4],
+    scalars: [Option<u64>; Scalar::ALL.len()],
     pub(crate) clipboard_override: Option<ClipboardMode>,
     /// Fallback for documents with no LF or CRLF yet.
     pub(crate) default_line_ending: Option<Newline>,

@@ -544,6 +544,8 @@ mod tests {
                 replacement: "two".into(),
                 all: true,
                 operation: search::Operation::ReplaceAll,
+                browse: false,
+                expected: None,
             }))
             .unwrap();
         while owner.search.status.busy {

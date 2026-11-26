@@ -593,7 +593,14 @@ mod tests {
             }),
             ..State::default()
         };
-        editor.action(Action::Size(40, 8, 2)).unwrap();
+        editor
+            .action(Action::Size {
+                width: 40,
+                height: 8,
+                generation: 2,
+                search_cover: 0,
+            })
+            .unwrap();
         release.send(()).unwrap();
         let until = Instant::now() + Duration::from_secs(2);
         while !state.running.as_ref().unwrap().task.is_finished() {

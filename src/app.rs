@@ -37,10 +37,11 @@ pub(crate) enum Intent {
     Suspend,
     MouseCapture(bool),
     Editor(Action),
-    CancelWork,
+    CancelWork { keep_search: bool },
     Picker(picker::Request),
     CancelPicker,
     DismissSearch,
+    MinimizeSearch,
 }
 /// Direct-path dialog intent; paths remain separate from safe display labels.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -79,6 +80,7 @@ pub(crate) enum Modal {
         settings_focus: Control,
     },
     Details(String),
+    SearchDetails(crate::editor::search::Summary),
     SaveError(String),
     PersistenceError(String),
     Recovery(Box<recovery::Dialog>),
@@ -374,6 +376,10 @@ impl AppState {
     }
     /// Preserve valid focus and invalidate capture after geometry or overlay changes.
     pub fn sync_layout(&mut self, layout: &LayoutSnapshot) {
+        self.search_resize_results(layout.search_result_rows());
+        if matches!(self.modal, Some(Modal::SearchDetails(_))) {
+            self.help_scroll = self.help_scroll.min(layout.search_details_scroll_limit);
+        }
         if let Some(Modal::Open(picker)) = &mut self.modal {
             picker.top = picker.list_start(layout.list_rows());
         }
@@ -392,11 +398,20 @@ impl AppState {
             });
         }
         if !self.focus.is_some_and(|focus| layout.contains(focus)) {
-            self.focus = if layout.contains(Control::Content) {
-                Some(Control::Content)
+            if layout.search_bounds().is_some()
+                && matches!(
+                    self.focus,
+                    Some(Control::Search(_) | Control::SearchList | Control::SearchResult(_))
+                )
+            {
+                self.search_focus(0);
             } else {
-                layout.next(None, false)
-            };
+                self.focus = if layout.contains(Control::Content) {
+                    Some(Control::Content)
+                } else {
+                    layout.next(None, false)
+                };
+            }
         }
         if self
             .capture
@@ -405,6 +420,22 @@ impl AppState {
             self.capture = None;
         }
     }
+    /// Keep a press on an unchanged Find control when only a tab badge updates.
+    pub(crate) fn preserve_search_press(
+        &mut self,
+        previous: &LayoutSnapshot,
+        next: &LayoutSnapshot,
+    ) {
+        if let Some(capture) = &mut self.capture
+            && matches!(capture.control, Control::Search(_))
+            && capture.generation == previous.generation
+            && previous.only_tab_label_widths_changed(next)
+            && next.hit(capture.x, capture.y) == Some(capture.control)
+        {
+            capture.generation = next.generation;
+        }
+    }
+
     /// Record display-safe bounded status and schedule a redraw.
     pub fn notify(&mut self, message: StatusMessage) {
         if self.status != message {
@@ -461,7 +492,9 @@ impl AppState {
             .as_ref()
             .map_or(screen.message.as_str(), |feedback| feedback.message);
         self.notify(StatusMessage::new(Severity::Info, message));
+        self.sync_search_selection(&screen.search.rows);
         self.screen = screen;
+        self.sync_find_focus();
         self.pending = pending;
         self.dirty = true;
     }
@@ -636,11 +669,11 @@ impl AppState {
                 }
                 self.dirty = true;
                 if let Some(field) = pending.search_field {
-                    return Some(Intent::Editor(if field == 1 {
-                        Action::InvalidateReplacement
+                    return Some(if field == 1 {
+                        Intent::Editor(Action::InvalidateReplacement)
                     } else {
-                        Action::InvalidateSearch
-                    }));
+                        self.invalidate_search_rows()
+                    });
                 }
             }
         }
@@ -929,7 +962,12 @@ impl AppState {
             Some(Modal::Settings) => Context::Settings,
             Some(_) => Context::Dialog,
             None if self.help || self.guard_request.is_some() => Context::Dialog,
-            None if self.search.open && matches!(self.focus, Some(Control::Search(_))) => {
+            None if self.search.open
+                && matches!(
+                    self.focus,
+                    Some(Control::Search(_) | Control::SearchList | Control::SearchResult(_))
+                ) =>
+            {
                 Context::Search
             }
             None if self.focus == Some(Control::Content) => Context::Editor,
@@ -1206,7 +1244,9 @@ impl AppState {
                 return Some(Intent::Editor(Action::CancelOpen(tab)));
             }
             if self.pending || self.screen.exporting {
-                return Some(Intent::CancelWork);
+                return Some(Intent::CancelWork {
+                    keep_search: self.search.minimized,
+                });
             }
             self.capture = None;
             return self
@@ -1438,6 +1478,7 @@ impl AppState {
             self.modal,
             Some(
                 Modal::Details(_)
+                    | Modal::SearchDetails(_)
                     | Modal::TabDetails { .. }
                     | Modal::About { .. }
                     | Modal::SettingsDiagnostic { .. }
@@ -1462,6 +1503,12 @@ impl AppState {
                 return self
                     .command(Command::Cancel, layout)
                     .or(Some(Intent::Editor(Action::RetryRefresh(tab))));
+            }
+            if let Command::Move(movement, _) = command
+                && matches!(self.modal, Some(Modal::SearchDetails(_)))
+            {
+                self.move_search_details(movement, layout);
+                return None;
             }
             if matches!(command, Command::Move(..)) {
                 self.help_scroll =
@@ -1867,24 +1914,19 @@ impl AppState {
             }
             return None;
         }
-        if self.search.open
-            && self.modal.is_none()
-            && matches!(
-                layout.hit(mouse.column, mouse.row),
-                Some(Control::Search(_))
-            )
+        if layout
+            .search_bounds()
+            .is_some_and(|area| area.contains((mouse.column, mouse.row).into()))
             && matches!(
                 mouse.kind,
                 MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
             )
         {
-            let controls = self.search.controls();
-            self.search.row = if mouse.kind == MouseEventKind::ScrollUp {
-                self.search.row.saturating_sub(1)
-            } else {
-                (self.search.row + 1).min(controls.len().saturating_sub(2))
-            };
-            self.dirty = true;
+            self.search_wheel(
+                mouse.kind == MouseEventKind::ScrollUp,
+                layout,
+                layout.search_result_hit(mouse.column, mouse.row),
+            );
             return None;
         }
         if matches!(
@@ -1909,6 +1951,13 @@ impl AppState {
                 if let Some(commands) = layout.menu_column(mouse.column, mouse.row) {
                     let movement = if up { Movement::Up } else { Movement::Down };
                     menu.move_in(commands, movement, layout.list_rows());
+                }
+            } else if matches!(self.modal, Some(Modal::SearchDetails(_))) {
+                if layout
+                    .overlay
+                    .is_some_and(|area| area.contains((mouse.column, mouse.row).into()))
+                {
+                    self.scroll_search_details(if up { -3 } else { 3 }, layout);
                 }
             } else if self.help
                 || matches!(
@@ -1937,6 +1986,7 @@ impl AppState {
         }
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
+                self.search.focus_after_find = None;
                 self.pointer_press = self.pointer_press.wrapping_add(1);
                 self.capture = hit.map(|control| Capture {
                     control,
@@ -1946,9 +1996,21 @@ impl AppState {
                     y: mouse.row,
                 });
                 if let Some(control) = hit.filter(|control| {
-                    !matches!(control, Control::PaneOutside | Control::TabClose(_))
+                    !matches!(
+                        control,
+                        Control::PaneOutside
+                            | Control::TabClose(_)
+                            | Control::SearchSurface
+                            | Control::SearchList
+                            | Control::Search(search::MINIMIZE | search::CLOSE | search::RESTORE)
+                            | Control::SettingsFindRowsStep(_)
+                    )
                 }) {
-                    self.focus = Some(control);
+                    if let Control::Search(index @ (0 | 1)) = control {
+                        self.search_focus(index);
+                    } else {
+                        self.focus = Some(control);
+                    }
                     self.dirty = true;
                 }
                 if hit == Some(Control::Content) {
@@ -2019,6 +2081,18 @@ impl AppState {
                         if capture.control == Control::PaneOutside {
                             return self.dismiss_outside(layout);
                         }
+                        match capture.control {
+                            Control::SearchSurface => return None,
+                            Control::Search(search::MINIMIZE) => {
+                                return Some(Intent::MinimizeSearch);
+                            }
+                            Control::Search(search::CLOSE) => return Some(Intent::DismissSearch),
+                            Control::Search(search::RESTORE) => {
+                                self.restore_search();
+                                return None;
+                            }
+                            _ => {}
+                        }
                         if let (Control::PickerRow(row), Some(Modal::Open(picker))) =
                             (capture.control, &mut self.modal)
                         {
@@ -2034,7 +2108,10 @@ impl AppState {
                         }
                         // Keyboard focus may have changed while the button was held.
                         // Activate the clicked control, not another focused button.
-                        if !matches!(capture.control, Control::TabClose(_)) {
+                        if !matches!(
+                            capture.control,
+                            Control::TabClose(_) | Control::SettingsFindRowsStep(_)
+                        ) {
                             self.focus = Some(capture.control);
                         }
                         if let Control::SettingsButton(button) = capture.control {
@@ -2045,6 +2122,8 @@ impl AppState {
                             self.settings_group(group);
                         } else if let Control::SettingsGroupStep(next) = capture.control {
                             self.settings_group_adjacent(if next { 1 } else { -1 });
+                        } else if let Control::SettingsFindRowsStep(increase) = capture.control {
+                            self.settings_step_find_rows(increase, layout);
                         } else if let Control::SettingsRow(row) = capture.control {
                             self.settings_row(row, layout);
                         } else if let Some(Modal::Menu(menu)) = &mut self.modal {
@@ -2109,6 +2188,7 @@ impl AppState {
                 | Modal::Recovery(_)
                 | Modal::Path(..)
                 | Modal::Details(_)
+                | Modal::SearchDetails(_)
                 | Modal::TabDetails { .. }
                 | Modal::About { .. }
                 | Modal::SettingsDiagnostic { .. },
@@ -2195,6 +2275,9 @@ impl AppState {
                 .map(Control::Search)
                 .or(Some(Control::PathField));
             return self.command(Command::Newline, layout);
+        }
+        if let Some(intent) = self.search_fetch(layout) {
+            return Some(intent);
         }
         if now.saturating_sub(self.last_drag) < Duration::from_millis(50) {
             return None;
@@ -2303,6 +2386,16 @@ impl AppState {
     }
     /// Paste completion targets its original field even after the user changes focus.
     fn apply_target_field_edit(&mut self, target: Option<u8>, edit: FieldEdit) -> bool {
+        use unicode_segmentation::UnicodeSegmentation;
+
+        let offset = target.map(|field| {
+            let text = if field == 1 {
+                &self.search.replacement
+            } else {
+                &self.search.query.literal
+            };
+            self.search.field_cursor(field, text)
+        });
         let field = if let Some(field) = target {
             if field == 1 {
                 &mut self.search.replacement
@@ -2320,17 +2413,32 @@ impl AppState {
                 _ => return false,
             }
         };
-        match edit {
+        let caret = match edit {
             FieldEdit::Text(text) => {
                 if field.len() + text.len() > 4096 || text.contains('\0') {
                     self.field_message("Invalid or oversized field paste/input");
                     return false;
                 }
-                field.push_str(&text);
+                let offset = offset.unwrap_or(field.len());
+                field.insert_str(offset, &text);
+                offset + text.len()
             }
             FieldEdit::Backspace => {
-                field.pop();
+                if let Some(offset) = offset {
+                    let start = field[..offset]
+                        .grapheme_indices(true)
+                        .next_back()
+                        .map_or(0, |(start, _)| start);
+                    field.replace_range(start..offset, "");
+                    start
+                } else {
+                    field.pop();
+                    field.len()
+                }
             }
+        };
+        if let Some(target) = target {
+            self.search.set_field_cursor(target, caret);
         }
         self.field_error = None;
         self.dirty = true;

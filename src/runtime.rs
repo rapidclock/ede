@@ -362,10 +362,16 @@ fn event_loop_impl(
             area.width,
             layout.content_height(),
             layout.document_generation,
+            layout.search_bounds().map_or(0, |window| window.height),
         );
         if requested_geometry != Some(geometry) {
             if let Some(bridge) = editor.as_deref_mut() {
-                if bridge.submit(Action::Size(geometry.0, geometry.1, geometry.2)) {
+                if bridge.submit(Action::Size {
+                    width: geometry.0,
+                    height: geometry.1,
+                    generation: geometry.2,
+                    search_cover: geometry.3,
+                }) {
                     requested_geometry = Some(geometry);
                     app.pending = true;
                 }
@@ -472,6 +478,7 @@ fn reconcile_layout(area: Rect, app: &mut AppState, layout: &mut LayoutSnapshot)
         {
             next.document_generation = layout.document_generation;
         }
+        app.preserve_search_press(layout, &next);
         *layout = next;
     }
     app.sync_layout(layout);
@@ -522,9 +529,15 @@ fn effect(
                 ));
             }
         }
-        Intent::CancelWork => {
+        Intent::MinimizeSearch => {
             if let Some(editor) = editor {
-                editor.cancel();
+                editor.revoke_search_navigation();
+            }
+            app.minimize_search();
+        }
+        Intent::CancelWork { keep_search } => {
+            if let Some(editor) = editor {
+                editor.cancel_work(!keep_search);
             }
         }
         Intent::Editor(action) => {
@@ -567,7 +580,15 @@ fn effect(
                         | Action::CancelOpen(_)
                         | Action::CancelActiveOpen(_)
                 ) || matches!(action, Action::RemoveTab(tab) if Some(tab) == app.screen.tab);
+                let search_page = match &action {
+                    Action::SearchPage(request) => Some(*request),
+                    _ => None,
+                };
+                let find = matches!(&action, Action::Search(request) if request.operation == crate::editor::search::Operation::First);
                 if editor.submit(action) {
+                    if find {
+                        app.expect_find_focus(editor.sequence());
+                    }
                     if let Some(after) = guard {
                         app.expect_guard_for(editor.sequence(), after);
                     }
@@ -580,6 +601,9 @@ fn effect(
                     app.pending = true;
                     app.dirty = true;
                 } else {
+                    if let Some(request) = search_page {
+                        app.search_page_rejected(request);
+                    }
                     let message = "Busy: input rejected; retry when ready";
                     // Keep rejection visible even when a pending worker immediately
                     // replaces the status row with its next ordinary completion.
@@ -1047,6 +1071,86 @@ mod tests {
         );
     }
 
+    /// A scratch badge may appear during a click without moving Find's actions.
+    #[test]
+    fn search_button_click_survives_only_tab_label_changes() {
+        use crate::{
+            app::Modal,
+            editor::{TabId, TabSummary},
+            ui::Control,
+        };
+        use std::sync::Arc;
+        let area = Rect::new(0, 0, 80, 24);
+        for (change, activates) in [
+            ("badge", true),
+            ("tab", false),
+            ("resize", false),
+            ("search", false),
+        ] {
+            let mut app = AppState::new();
+            app.screen.tab = Some(TabId(1));
+            app.screen.tabs = Arc::from([TabSummary {
+                id: TabId(1),
+                label: Arc::from("Untitled 1"),
+                path_hint: None,
+                modified: false,
+                waiting: false,
+                loading: false,
+                saving: false,
+                queued_save: false,
+                attention: false,
+                scratch: true,
+                retention: "",
+                warning: None,
+                language: None,
+                language_auto: true,
+                line_ending: crate::editor::LineEndingStatus::Hidden,
+                stream: None,
+            }]);
+            app.search.open = true;
+            app.search.replace = true;
+            app.search.query.literal = "one".into();
+            Arc::make_mut(&mut app.screen.search).rows.count = 1;
+            let mut layout = LayoutSnapshot::for_app(area, &app, 1);
+            let (column, row) = (0..area.height)
+                .flat_map(|row| (0..area.width).map(move |x| (x, row)))
+                .find(|&(x, y)| layout.hit(x, y) == Some(Control::Search(8)))
+                .unwrap();
+            let mouse = |kind| {
+                Input::Pointer(MouseEvent {
+                    kind,
+                    column,
+                    row,
+                    modifiers: KeyModifiers::NONE,
+                })
+            };
+            let left = crossterm::event::MouseButton::Left;
+            app.input(mouse(MouseEventKind::Down(left)), &layout);
+            Arc::make_mut(&mut app.screen.tabs)[0].modified = true;
+            if change == "tab" {
+                app.screen.tab = Some(TabId(2));
+            }
+            if change == "search" {
+                Arc::make_mut(&mut app.screen.search).rows.generation += 1;
+            }
+            let updated = if change == "resize" {
+                Rect::new(0, 0, 80, 23)
+            } else {
+                area
+            };
+            reconcile_layout(updated, &mut app, &mut layout);
+            if change != "resize" {
+                assert_eq!(layout.hit(column, row), Some(Control::Search(8)));
+            }
+            app.input(mouse(MouseEventKind::Up(left)), &layout);
+            assert_eq!(
+                matches!(app.modal, Some(Modal::ReplaceAll(_))),
+                activates,
+                "{change}"
+            );
+        }
+    }
+
     /// Scripted runtime advances virtual time during polls; no sleeps or real terminal needed.
     struct Fake {
         now: Cell<Duration>,
@@ -1150,6 +1254,252 @@ mod tests {
         assert_eq!(host.now(), Duration::from_millis(100));
     }
 
+    /// Minimize and restore a held scan without cancelling it or replaying its jump.
+    #[test]
+    fn minimizing_a_busy_search_preserves_scan_and_revokes_navigation() {
+        use crate::{
+            document::{FaultInjector, IoPoint, OpenOptions},
+            ui::Control,
+        };
+        use std::sync::{
+            Arc, Mutex,
+            atomic::{AtomicBool, Ordering},
+            mpsc,
+        };
+
+        #[derive(Debug)]
+        struct HoldScan {
+            armed: AtomicBool,
+            entered: mpsc::SyncSender<()>,
+            release: Mutex<mpsc::Receiver<()>>,
+            hold_reveal: AtomicBool,
+            reveal_entered: mpsc::SyncSender<()>,
+            reveal_release: Mutex<mpsc::Receiver<()>>,
+        }
+        impl FaultInjector for HoldScan {
+            fn check(&self, point: IoPoint) -> io::Result<()> {
+                if point == IoPoint::Read
+                    && std::thread::current().name() == Some("ede-search-scan")
+                    && self.armed.swap(false, Ordering::AcqRel)
+                {
+                    self.entered.send(()).unwrap();
+                    self.release.lock().unwrap().recv().ok();
+                }
+                if point == IoPoint::Read
+                    && std::thread::current().name() == Some("ede-editor")
+                    && self.hold_reveal.swap(false, Ordering::AcqRel)
+                {
+                    self.reveal_entered.send(()).unwrap();
+                    self.reveal_release.lock().unwrap().recv().ok();
+                }
+                Ok(())
+            }
+        }
+
+        let (entered, reached) = mpsc::sync_channel(1);
+        let (release, gate) = mpsc::sync_channel(1);
+        let (reveal_entered, reveal_reached) = mpsc::sync_channel(1);
+        let (release_reveal, reveal_gate) = mpsc::sync_channel(1);
+        let faults = Arc::new(HoldScan {
+            armed: AtomicBool::new(true),
+            entered,
+            release: Mutex::new(gate),
+            hold_reveal: AtomicBool::new(false),
+            reveal_entered,
+            reveal_release: Mutex::new(reveal_gate),
+        });
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("fruit.txt");
+        let other = root.path().join("other.txt");
+        std::fs::write(&path, "apple\npear apple\n").unwrap();
+        std::fs::write(&other, "header\nother text\n").unwrap();
+        let mut bridge = Editor::with_options(
+            root.path().into(),
+            crate::stream::Startup {
+                paths: vec![path, other],
+                ..Default::default()
+            },
+            crate::recovery::Store::open(crate::recovery::Options {
+                root: root.path().join("recovery"),
+                reserve_bytes: 0,
+                ..Default::default()
+            })
+            .unwrap(),
+            None,
+            None,
+            OpenOptions {
+                faults: Some(faults.clone()),
+                ..OpenOptions::default()
+            },
+        )
+        .unwrap();
+        let mut app = AppState::new();
+        let mut host = Fake::new(vec![]);
+        let area = Rect::new(0, 0, 80, 24);
+        let wait_for = |bridge: &Editor, accept: &dyn Fn(&crate::editor::Screen) -> bool| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                if let Some(screen) = bridge.screen()
+                    && accept(&screen)
+                {
+                    break screen;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "missing search screen"
+                );
+                std::thread::yield_now();
+            }
+        };
+        let screen = wait_for(&bridge, &|screen| {
+            !screen.loading && screen.tabs.len() == 2 && screen.tabs.iter().all(|tab| !tab.loading)
+        });
+        let other_tab = screen
+            .tabs
+            .iter()
+            .find(|tab| tab.label.as_ref() == "other.txt")
+            .unwrap()
+            .id;
+        drop(screen);
+        assert!(bridge.submit(Action::Switch(other_tab)));
+        assert!(bridge.submit(Action::GoTo { line: 1, column: 3 }));
+        let sequence = bridge.sequence();
+        app.update(
+            wait_for(&bridge, &|screen| screen.acknowledged == sequence),
+            false,
+        );
+        let before = app.screen.position;
+        assert_eq!(app.screen.tab, Some(other_tab));
+        let mut send = |input, app: &mut AppState, bridge: &mut Editor| {
+            let layout = LayoutSnapshot::for_app(area, app, 1);
+            if let Some(intent) = app.input(input, &layout) {
+                effect(intent, &mut host, app, Some(bridge), None).unwrap();
+            }
+        };
+        send(Input::Command(Command::Find), &mut app, &mut bridge);
+        send(
+            Input::Command(Command::ToggleSearchScope),
+            &mut app,
+            &mut bridge,
+        );
+        send(Input::Text("apple".into()), &mut app, &mut bridge);
+        send(Input::Command(Command::Newline), &mut app, &mut bridge);
+        let submission = bridge.sequence();
+        reached.recv_timeout(Duration::from_secs(5)).unwrap();
+        app.update(wait_for(&bridge, &|screen| screen.search.busy), false);
+        for restore in [true, false] {
+            send(
+                Input::Command(Command::Move(crate::command::Movement::Up, false)),
+                &mut app,
+                &mut bridge,
+            );
+            send(Input::Command(Command::Newline), &mut app, &mut bridge);
+            assert!(app.search.minimized);
+            assert_eq!(app.focus, Some(Control::Content));
+            app.pending = true;
+            send(Input::Command(Command::Cancel), &mut app, &mut bridge);
+            if restore {
+                send(Input::Command(Command::Find), &mut app, &mut bridge);
+                assert!(app.search.open);
+                assert!(app.screen.search.busy);
+            }
+        }
+        release.send(()).unwrap();
+        let screen = wait_for(&bridge, &|screen| {
+            screen.search.find_submission == Some(submission)
+        });
+        assert_eq!(screen.search.rows.live, 2);
+        assert_eq!(screen.position, before);
+        app.update(screen, false);
+        assert_eq!(app.focus, Some(Control::Content));
+        send(Input::Command(Command::Find), &mut app, &mut bridge);
+        assert!(app.search.open);
+        assert_eq!(app.screen.search.rows.live, 2);
+
+        faults.hold_reveal.store(true, Ordering::Release);
+        send(Input::Command(Command::Newline), &mut app, &mut bridge);
+        let submission = bridge.sequence();
+        assert!(
+            reveal_reached.recv_timeout(Duration::from_secs(5)).is_ok(),
+            "search never reached its reveal read; screen {:?}, events {:?}",
+            bridge.screen().map(|screen| (
+                screen.tab,
+                screen.search.message.clone(),
+                screen.search.current.clone()
+            )),
+            bridge.events.try_iter().collect::<Vec<_>>(),
+        );
+        send(
+            Input::Command(Command::Move(crate::command::Movement::Up, false)),
+            &mut app,
+            &mut bridge,
+        );
+        send(Input::Command(Command::Newline), &mut app, &mut bridge);
+        assert!(app.search.minimized);
+        release_reveal.send(()).unwrap();
+        let screen = wait_for(&bridge, &|screen| {
+            screen.search.find_submission == Some(submission)
+        });
+        assert_eq!(screen.search.rows.live, 2);
+        assert_eq!(screen.position, before);
+        assert_eq!(screen.tab, app.screen.tab);
+        app.update(screen, false);
+
+        for (minimize, close) in [(false, false), (false, true), (true, true)] {
+            send(Input::Command(Command::Find), &mut app, &mut bridge);
+            faults.armed.store(true, Ordering::Release);
+            send(Input::Command(Command::Newline), &mut app, &mut bridge);
+            let submission = bridge.sequence();
+            reached.recv_timeout(Duration::from_secs(5)).unwrap();
+            app.update(wait_for(&bridge, &|screen| screen.search.busy), false);
+            if minimize {
+                send(
+                    Input::Command(Command::Move(crate::command::Movement::Up, false)),
+                    &mut app,
+                    &mut bridge,
+                );
+                send(Input::Command(Command::Newline), &mut app, &mut bridge);
+            }
+            if close {
+                let geometry = LayoutSnapshot::for_app(area, &app, 1);
+                let (column, row) = (0..area.height)
+                    .flat_map(|row| (0..area.width).map(move |column| (column, row)))
+                    .find(|&(column, row)| {
+                        geometry.hit(column, row)
+                            == Some(Control::Search(crate::app::search::CLOSE))
+                    })
+                    .unwrap();
+                for kind in [
+                    MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                    MouseEventKind::Up(crossterm::event::MouseButton::Left),
+                ] {
+                    send(
+                        Input::Pointer(MouseEvent {
+                            kind,
+                            column,
+                            row,
+                            modifiers: KeyModifiers::NONE,
+                        }),
+                        &mut app,
+                        &mut bridge,
+                    );
+                }
+            } else {
+                send(Input::Command(Command::Cancel), &mut app, &mut bridge);
+            }
+            assert!(!app.search.minimized);
+            assert_eq!(app.search.open, !close);
+            release.send(()).unwrap();
+            let screen = wait_for(&bridge, &|screen| {
+                !screen.search.busy && screen.search.find_submission == Some(submission)
+            });
+            assert_eq!(screen.search.rows.count, 0);
+            assert_eq!(screen.position, before);
+            app.update(screen, false);
+        }
+        bridge.shutdown().unwrap().join().unwrap();
+    }
+
     /// Closing a busy search requires admission, even if another operation filled the queue.
     #[test]
     fn search_dismissal_waits_for_cancellation_admission() {
@@ -1159,10 +1509,9 @@ mod tests {
         let area = Rect::new(0, 0, 80, 24);
         let layout = LayoutSnapshot::for_app(area, &app, 1);
         app.input(Input::Command(Command::Find), &layout);
-        app.screen.search = std::sync::Arc::new(crate::editor::search::Status {
-            busy: true,
-            ..Default::default()
-        });
+        let mut search = crate::editor::search::Status::default();
+        search.busy = true;
+        app.screen.search = std::sync::Arc::new(search);
         let layout = LayoutSnapshot::for_app(area, &app, 2);
         let outside = |kind| {
             Input::Pointer(MouseEvent {

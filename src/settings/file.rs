@@ -180,6 +180,14 @@ fn parse(text: &str) -> io::Result<Revision> {
             return Err(invalid("editor: expected table"));
         };
         for (key, value) in entries {
+            let find_rows = Scalar::FindMatchRows;
+            if key == find_rows.id() {
+                let value = find_rows
+                    .validate(value.as_integer().and_then(|n| u64::try_from(n).ok()))
+                    .map_err(invalid)?;
+                settings.values.set(find_rows, Some(value));
+                continue;
+            }
             if key != DEFAULT_LINE_ENDING {
                 return Err(invalid(format!("editor.{key}: unknown setting")));
             }

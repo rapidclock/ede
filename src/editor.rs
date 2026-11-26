@@ -60,7 +60,7 @@ struct ViewControl {
     current: Mutex<Option<TabId>>,
     receiving: Mutex<Option<TabId>>,
     search: Mutex<Cancellation>,
-    search_navigation: AtomicU64,
+    search_navigation: Arc<AtomicU64>,
     search_replacing: AtomicBool,
     streamed: AtomicBool,
     export: Mutex<Option<Cancellation>>,
@@ -121,7 +121,7 @@ impl ViewControl {
             .unwrap_or_else(|poison| poison.into_inner());
         let all = matches!(
             action,
-            Action::Size(..)
+            Action::Size { .. }
                 | Action::Switch(_)
                 | Action::CycleTab(_)
                 | Action::New
@@ -211,6 +211,7 @@ pub(crate) enum After {
 #[derive(Clone, Debug)]
 pub(crate) enum Action {
     Search(search::SearchRequest),
+    SearchPage(search::results::PageRequest),
     CancelSearch,
     InvalidateSearch,
     InvalidateReplacement,
@@ -269,7 +270,12 @@ pub(crate) enum Action {
     SaveGuard(After, Option<PathBuf>),
     Guard(After),
     Discard(After, Option<JobId>),
-    Size(u16, u16, u64),
+    Size {
+        width: u16,
+        height: u16,
+        generation: u64,
+        search_cover: u16,
+    },
     Scroll(i64, i64),
     Hit {
         caret: u64,
@@ -304,6 +310,7 @@ impl Action {
                     || matches!(
                         self,
                         Self::Search(_)
+                            | Self::SearchPage(search::results::PageRequest { jump: Some(_), .. })
                             | Self::Guard(_)
                             | Self::RemoveTab(_)
                             | Self::New
@@ -694,7 +701,7 @@ impl Editor {
         // enqueueing so even a job that has not created its read token sees it.
         let layout_epoch = if matches!(
             inner,
-            Action::Size(..)
+            Action::Size { .. }
                 | Action::Scroll(..)
                 | Action::Guard(_)
                 | Action::Switch(_)
@@ -729,6 +736,11 @@ impl Editor {
             ) {
                 request.replacement_scope = Some(self.view_cancel.replacement_scope());
             }
+        }
+        if let Action::SearchPage(request) = dispatched
+            && request.jump.is_some()
+        {
+            request.navigation = Some(self.view_cancel.search_navigation.load(Ordering::Acquire));
         }
         let envelope = Envelope {
             action,
@@ -772,7 +784,12 @@ impl Editor {
     }
     /// Cancel the current long operation without requiring admission to its queue.
     pub fn cancel(&self) {
-        if let Ok(cancel) = self.view_cancel.search.lock() {
+        self.cancel_work(true);
+    }
+
+    /// Cancel general editor work while optionally preserving a minimized scan.
+    pub(crate) fn cancel_work(&self, include_search: bool) {
+        if include_search && let Ok(cancel) = self.view_cancel.search.lock() {
             cancel.cancel();
         }
         if let Ok(export) = self.view_cancel.export.lock()
@@ -864,6 +881,7 @@ struct Coordinator {
     cache: Checkpoints,
     width: u16,
     height: u16,
+    search_cover: u16,
     generation: u64,
     counter: u64,
     active_sequence: u64,
@@ -928,6 +946,7 @@ impl Coordinator {
             cache: Checkpoints::default(),
             width: 80,
             height: 22,
+            search_cover: 0,
             generation: 0,
             counter: 0,
             active_sequence: 0,
@@ -967,7 +986,7 @@ impl Coordinator {
                     // navigation, and lifecycle intentions retain their exact ordering.
                     while let Ok(mut next) = self.inbox.try_recv() {
                         match (&envelope.action, &mut next.action) {
-                            (Action::Size(..), Action::Size(..)) => {}
+                            (Action::Size { .. }, Action::Size { .. }) => {}
                             (Action::Scroll(v, h), Action::Scroll(nv, nh))
                                 if scrolls_combine(*v, *h, *nv, *nh)
                                     && (*v == 0 || self.tab.left == 0) =>
@@ -1207,6 +1226,15 @@ impl Coordinator {
     }
     /// Render a fresh revision/geometry-tagged view; no snapshot is retained afterward.
     fn layout(&mut self, reveal: bool) -> Result<(), Error> {
+        self.prepare_layout(reveal, None)
+    }
+
+    /// Leave the selected occurrence above the floating search window.
+    fn layout_search(&mut self, last_byte: u64) -> Result<(), Error> {
+        self.prepare_layout(true, (self.search_cover != 0).then_some(last_byte))
+    }
+
+    fn prepare_layout(&mut self, reveal: bool, match_end: Option<u64>) -> Result<(), Error> {
         self.tab.screen.view = None;
         if self.parked_action {
             return Ok(());
@@ -1233,18 +1261,22 @@ impl Coordinator {
             self.tab.top = snapshot.line_count().saturating_sub(u64::from(self.height));
             self.tab.left = 0;
         }
-        let result = Text::new(&snapshot, &cancel).view(
-            ViewRequest {
-                position: self.tab.screen.position,
-                top: self.tab.top,
-                left: self.tab.left,
-                width: self.width,
-                height: self.height,
-                reveal: reveal || following,
-                generation: self.generation,
-            },
-            &mut self.cache,
-        );
+        let request = ViewRequest {
+            position: self.tab.screen.position,
+            top: self.tab.top,
+            left: self.tab.left,
+            width: self.width,
+            height: self.height,
+            reveal: reveal || following,
+            generation: self.generation,
+        };
+        let mut text = Text::new(&snapshot, &cancel);
+        let result = match match_end {
+            Some(last) => {
+                text.view_revealing_match(request, &mut self.cache, Some((self.search_cover, last)))
+            }
+            None => text.view(request, &mut self.cache),
+        };
         let view = match result {
             Ok(view) => view,
             Err(Error::Cancelled) if !self.cancel.is_cancelled() => {
@@ -1589,12 +1621,14 @@ impl Coordinator {
                 | Action::RecoveryPage { .. }
                 | Action::OpenRetained { .. }
                 | Action::DiscardRetained { .. }
-                | Action::Size(..)
+                | Action::Size { .. }
+                | Action::SearchPage(..)
         ) {
             self.reconcile_edit()?;
         }
         match action {
             Action::Search(request) => self.start_search(request)?,
+            Action::SearchPage(request) => self.search.page(request),
             Action::CancelSearch | Action::InvalidateSearch => self
                 .search
                 .cancel(matches!(action, Action::InvalidateSearch)),
@@ -1734,12 +1768,34 @@ impl Coordinator {
                 Replacement::Paste(&spool),
                 self.tab.screen.position.selection(),
             )?,
-            Action::Size(width, height, generation) => {
+            Action::Size {
+                width,
+                height,
+                generation,
+                search_cover,
+            } => {
+                let reveal_after_minimize =
+                    self.search_cover != 0 && search_cover == 0 && height < self.height;
+                let search_stayed_expanded = self.search_cover != 0 && search_cover != 0;
                 self.width = width;
                 self.height = height;
                 self.generation = generation;
+                self.search_cover = search_cover;
                 if self.tab.screen.document.is_some() {
-                    self.layout(false)?;
+                    let found = self.search.status.current.as_ref().filter(|found| {
+                        search_stayed_expanded
+                            && self.tab.screen.tab == Some(found.tab)
+                            && self
+                                .tab
+                                .info
+                                .as_ref()
+                                .is_some_and(|info| info.revision == found.revision)
+                    });
+                    if let Some(found) = found {
+                        self.layout_search(found.range.end.saturating_sub(1))?;
+                    } else {
+                        self.layout(reveal_after_minimize)?;
+                    }
                 }
             }
             Action::Scroll(vertical, horizontal) => {
@@ -2929,7 +2985,14 @@ mod tests {
             } else {
                 (80, 24)
             };
-            worker.action(Action::Size(width, height - 2, 7)).unwrap();
+            worker
+                .action(Action::Size {
+                    width,
+                    height: height - 2,
+                    generation: 7,
+                    search_cover: 0,
+                })
+                .unwrap();
             let mut app = crate::app::AppState::new();
             let layout =
                 crate::ui::LayoutSnapshot::for_app(Rect::new(0, 0, width, height), &app, 7);
@@ -3119,7 +3182,12 @@ mod ordering_tests {
         worker.action(Action::Insert("abc".into())).unwrap();
         assert!(editor.submit(Action::GoTo { line: 0, column: 1 }));
         let seek = inbox.recv().unwrap();
-        assert!(editor.submit(Action::Size(40, 6, 2)));
+        assert!(editor.submit(Action::Size {
+            width: 40,
+            height: 6,
+            generation: 2,
+            search_cover: 0,
+        }));
         worker.begin_envelope(&seek);
         worker.action(seek.action.clone()).unwrap();
         assert_eq!(worker.tab.screen.position.caret, 1);
@@ -3302,6 +3370,7 @@ mod search_tests {
     #[derive(Debug)]
     struct SearchGate {
         armed: AtomicBool,
+        fail: AtomicBool,
         name: &'static str,
         entered: SyncSender<()>,
         release: Mutex<Receiver<()>>,
@@ -3399,24 +3468,42 @@ mod search_tests {
             {
                 self.entered.send(()).unwrap();
                 self.release.lock().unwrap().recv().unwrap();
+                if self.fail.load(Ordering::Acquire) {
+                    return Err(std::io::Error::other("test read failed"));
+                }
             }
             Ok(())
         }
     }
 
     fn gated(name: &'static str) -> (Coordinator, Receiver<()>, SyncSender<()>) {
+        let (worker, entered, release, _) = search_gate(name, true);
+        (worker, entered, release)
+    }
+
+    fn search_gate(
+        name: &'static str,
+        armed: bool,
+    ) -> (Coordinator, Receiver<()>, SyncSender<()>, Arc<SearchGate>) {
         let (entered, entered_rx) = mpsc::sync_channel(1);
         let (release, release_rx) = mpsc::sync_channel(1);
+        let gate = Arc::new(SearchGate {
+            armed: AtomicBool::new(armed),
+            fail: AtomicBool::new(false),
+            name,
+            entered,
+            release: Mutex::new(release_rx),
+        });
         let options = OpenOptions {
-            faults: Some(Arc::new(SearchGate {
-                armed: AtomicBool::new(true),
-                name,
-                entered,
-                release: Mutex::new(release_rx),
-            })),
+            faults: Some(gate.clone()),
             ..OpenOptions::default()
         };
-        (super::tests::coordinator(options), entered_rx, release)
+        (
+            super::tests::coordinator(options),
+            entered_rx,
+            release,
+            gate,
+        )
     }
 
     fn request(operation: search::Operation) -> search::SearchRequest {
@@ -3430,7 +3517,216 @@ mod search_tests {
             replacement: "123456789".into(),
             all: false,
             operation,
+            browse: false,
+            expected: None,
         }
+    }
+
+    /// A highlight pass cannot overwrite invalidation published after it first started.
+    #[test]
+    fn search_decoration_keeps_stale_notice_after_edit() {
+        for (cancelled, read_failure) in [(false, false), (true, false), (false, true)] {
+            let (mut worker, reached, release, gate) = search_gate("ede-search-scan", false);
+            let (events, notices) = mpsc::sync_channel(16);
+            worker.events = events;
+            worker.action(Action::Insert("one one".into())).unwrap();
+            let mut find = request(search::Operation::First);
+            find.browse = true;
+            worker.action(Action::Search(find)).unwrap();
+            settle(&mut worker);
+            assert_eq!(worker.search.status.rows.live, 2);
+            gate.armed.store(true, Ordering::Release);
+            worker
+                .action(Action::Size {
+                    width: 71,
+                    height: 20,
+                    generation: 1,
+                    search_cover: 0,
+                })
+                .unwrap();
+            worker.poll_background();
+            worker.poll_background();
+            reached.recv_timeout(Duration::from_secs(5)).unwrap();
+            worker.action(Action::Insert("x".into())).unwrap();
+            worker.poll_background();
+            assert_eq!(worker.search.status.rows.live, 0);
+            assert!(worker.search.status.message.contains("stale"));
+            if cancelled {
+                worker.action(Action::CancelSearch).unwrap();
+            }
+            gate.fail.store(read_failure, Ordering::Release);
+            release.send(()).unwrap();
+            settle(&mut worker);
+            assert_eq!(worker.search.status.rows.live, 0);
+            assert!(
+                worker.search.status.message.contains("stale"),
+                "{}",
+                worker.search.status.message
+            );
+            assert_eq!(notices.try_iter().any(|event| matches!(event, Event::Failure(text) if text.contains("test read failed"))), read_failure);
+        }
+    }
+
+    /// A completed scan must respect a newer focus choice or an outstanding submission.
+    #[test]
+    fn find_completion_respects_newer_focus_and_submissions() {
+        use crate::{
+            app::{AppState, search::OPTIONS},
+            input::Input,
+            ui::{Control, LayoutSnapshot},
+        };
+        use ratatui::layout::Rect;
+
+        let (mut worker, reached, release) = gated("ede-search-scan");
+        worker.action(Action::Insert("one one one".into())).unwrap();
+        worker.publish();
+        let mut app = AppState::new();
+        app.update(worker.tab.screen.clone(), false);
+        let layout = |app: &AppState| LayoutSnapshot::for_app(Rect::new(0, 0, 80, 24), app, 1);
+        app.input(Input::Command(Command::Find), &layout(&app));
+        let mut find = request(search::Operation::First);
+        find.browse = true;
+        app.expect_find_focus(1);
+        worker.active_sequence = 1;
+        worker.action(Action::Search(find.clone())).unwrap();
+        worker.poll_background();
+        reached.recv_timeout(Duration::from_secs(5)).unwrap();
+        app.input(
+            Input::Command(Command::Move(Movement::Down, false)),
+            &layout(&app),
+        );
+        release.send(()).unwrap();
+        settle(&mut worker);
+        worker.publish();
+        let first = worker.tab.screen.clone();
+        assert_eq!(first.search.find_submission, Some(1));
+        app.update(first.clone(), false);
+        assert_eq!(app.focus, Some(Control::Search(OPTIONS)));
+
+        let mut replace = request(search::Operation::ReplaceNext);
+        replace.replacement.clear();
+        replace.browse = true;
+        worker.action(Action::Search(replace)).unwrap();
+        settle(&mut worker);
+        app.input(Input::Command(Command::Find), &layout(&app));
+        app.expect_find_focus(2);
+        app.update(first, false);
+        assert_eq!(app.focus, Some(Control::Search(0)));
+        worker.active_sequence = 2;
+        worker.action(Action::Search(find)).unwrap();
+        settle(&mut worker);
+        worker.publish();
+        app.update(worker.tab.screen.clone(), false);
+        assert_eq!(app.focus, Some(Control::Search(0)));
+        let compact = LayoutSnapshot::for_app(Rect::new(0, 0, 40, 8), &app, 2);
+        let Some(crate::app::Intent::Editor(page)) = app.tick(Duration::ZERO, &compact) else {
+            panic!("compact form did not request the first live selection");
+        };
+        worker.action(page).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while worker.search.status.rows.current.is_none() {
+            worker.poll_background();
+            assert!(Instant::now() < deadline, "result page did not settle");
+            thread::yield_now();
+        }
+        worker.publish();
+        app.update(worker.tab.screen.clone(), false);
+        assert_eq!(app.focus, Some(Control::SearchList));
+        assert_eq!(
+            app.screen.search.rows.current,
+            Some(1),
+            "first live row follows a receipt"
+        );
+    }
+
+    /// A later replacement may not edit the previous match while a chosen row is unresolved.
+    #[test]
+    fn pending_result_selection_cannot_replace_previous_match() {
+        let (mut worker, reached, release) = gated("ede-search-page");
+        worker.add_new().unwrap();
+        worker.action(Action::Insert("one one".into())).unwrap();
+        worker
+            .action(Action::Command(Command::Move(Movement::Start, false)))
+            .unwrap();
+        let mut find = request(search::Operation::Next);
+        find.browse = true;
+        worker.action(Action::Search(find)).unwrap();
+        settle(&mut worker);
+        assert_eq!(worker.search.status.current.as_ref().unwrap().range, 0..3);
+        let generation = worker.search.status.rows.generation;
+        let navigation = worker
+            .view_cancel
+            .search_navigation
+            .fetch_add(1, Ordering::AcqRel)
+            + 1;
+        worker
+            .action(Action::SearchPage(search::results::PageRequest {
+                generation,
+                start: 0,
+                jump: Some(1),
+                navigation: Some(navigation),
+            }))
+            .unwrap();
+        worker.poll_background();
+        reached.recv_timeout(Duration::from_secs(5)).unwrap();
+        worker
+            .view_cancel
+            .search_navigation
+            .fetch_add(1, Ordering::AcqRel);
+        let mut replace = request(search::Operation::ReplaceNext);
+        replace.browse = true;
+        replace.expected = Some((generation, 1));
+        let result = worker.action(Action::Search(replace));
+        release.send(()).unwrap();
+        settle(&mut worker);
+        assert_eq!(super::tests::contents(&mut worker), "one one");
+        assert!(matches!(result, Err(Error::StaleRevision)));
+    }
+
+    /// A folded no-op stays live while a changed occurrence also gets a receipt.
+    #[test]
+    fn replacement_feedback_records_only_actual_changes_and_clears_on_undo() {
+        let mut worker = super::tests::coordinator(OpenOptions::default());
+        worker.action(Action::Insert("one ONE one".into())).unwrap();
+        let mut replace = request(search::Operation::ReplaceAll);
+        replace.browse = true;
+        replace.query.match_case = false;
+        replace.replacement = "one".into();
+        worker.action(Action::Search(replace)).unwrap();
+        settle(&mut worker);
+        let rows = &worker.search.status.rows;
+        assert_eq!((rows.count, rows.live), (4, 3));
+        worker
+            .action(Action::SearchPage(search::results::PageRequest {
+                generation: rows.generation,
+                start: 0,
+                jump: None,
+                navigation: None,
+            }))
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while worker.search.status.rows.page.is_empty() {
+            assert!(Instant::now() < deadline, "replacement page did not arrive");
+            worker.poll_background();
+            thread::yield_now();
+        }
+        let mut changed = worker
+            .search
+            .status
+            .rows
+            .page
+            .iter()
+            .filter(|row| row.change.is_some());
+        let receipt = changed.next().unwrap();
+        assert_eq!(
+            (receipt.column, receipt.matched.as_str(), receipt.change),
+            (5, "ONE", Some("Replaced"))
+        );
+        assert!(changed.next().is_none());
+        worker.action(Action::Command(Command::Undo)).unwrap();
+        worker.poll_background();
+        assert_eq!(super::tests::contents(&mut worker), "one ONE one");
+        assert_eq!(worker.search.status.rows.count, 0);
     }
 
     /// Cancelling automatic navigation retains the replacement already acknowledged.
@@ -3439,6 +3735,7 @@ mod search_tests {
         let (entered, reached) = mpsc::sync_channel(1);
         let (release, gate) = mpsc::sync_channel(1);
         let fault = Arc::new(SearchGate {
+            fail: AtomicBool::new(false),
             armed: AtomicBool::new(false),
             name: "ede-search-scan",
             entered,
@@ -3705,11 +4002,14 @@ mod search_tests {
         }
         let mut request = request(search::Operation::ReplaceAll);
         request.all = true;
+        request.browse = true;
         worker.action(Action::Search(request.clone())).unwrap();
         settle(&mut worker);
         assert_eq!(worker.search.status.processed, 64);
         assert_eq!(worker.search.status.changed, 64);
         assert_eq!(worker.search.status.outcomes.len(), 64);
+        assert_eq!(worker.search.status.rows.count, 64);
+        assert!(!worker.search.status.rows.feedback_incomplete);
         request.operation = search::Operation::Next;
         request.query.literal = request.replacement.clone();
         for _ in 0..20 {
@@ -3723,6 +4023,7 @@ mod search_tests {
         worker.action(Action::Search(request)).unwrap();
         settle(&mut worker);
         assert_eq!(worker.search.status.total(), 64);
+        assert_eq!(worker.search.status.rows.live, 64);
         let document = worker.document().unwrap();
         let Response::Stats { usage, .. } = worker.call(Request::Stats(document)).unwrap() else {
             panic!("expected storage usage");
@@ -3933,6 +4234,11 @@ mod search_tests {
         settle(&mut worker);
         assert_eq!(worker.search.status.total(), 1);
         assert_eq!(worker.search.status.outcomes[0].tab, a);
+        assert_eq!(worker.search.status.rows.count, 0);
+        assert_eq!(
+            worker.search.status.message,
+            "Current tab changed; press Find"
+        );
         assert_eq!(worker.tab.screen.tab, Some(b));
     }
 
@@ -4047,6 +4353,8 @@ mod search_tests {
             replacement: "1".into(),
             all: false,
             operation: search::Operation::Next,
+            browse: false,
+            expected: None,
         };
         worker.action(Action::Search(request.clone())).unwrap();
         settle(&mut worker);

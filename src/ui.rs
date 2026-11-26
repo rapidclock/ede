@@ -16,6 +16,7 @@ use ratatui::{
 };
 use std::ops::Range;
 use unicode_width::UnicodeWidthStr;
+mod search;
 
 /// Blank terminal cells between adjacent workspace buttons.
 const WORKSPACE_BUTTON_GAP: u16 = 2;
@@ -29,8 +30,12 @@ pub(crate) enum Control {
     SettingsSection(settings_ui::Section),
     SettingsGroup(Context),
     SettingsGroupStep(bool),
+    SettingsFindRowsStep(bool),
     UseDefaults,
     Search(u8),
+    SearchSurface,
+    SearchList,
+    SearchResult(u64),
     Content,
     WelcomeOpen,
     WelcomeNew,
@@ -90,12 +95,14 @@ impl Control {
             | Self::SettingsSection(_)
             | Self::SettingsGroup(_)
             | Self::SettingsGroupStep(_)
+            | Self::SettingsFindRowsStep(_)
             | Self::PaneOutside
+            | Self::SearchSurface
             | Self::TabClose(_)
             | Self::TabDivider => None,
             Self::UseDefaults => Some(Command::Cancel),
             Self::Search(0 | 1) => None,
-            Self::Search(_) => Some(Command::Activate),
+            Self::Search(_) | Self::SearchList | Self::SearchResult(_) => Some(Command::Activate),
             Self::Content
             | Self::PathField
             | Self::Tab(_)
@@ -126,10 +133,12 @@ impl Control {
             Self::SettingsGroup(group) => settings_ui::group_label(group),
             Self::SettingsGroupStep(false) => "‹",
             Self::SettingsGroupStep(true) => "›",
+            Self::SettingsFindRowsStep(false) => "−",
+            Self::SettingsFindRowsStep(true) => "+",
             Self::UseDefaults => "Use defaults for this session",
             Self::WelcomeOpen => "Open File",
             Self::WelcomeNew => "New Scratch",
-            Self::Search(_) => "",
+            Self::Search(_) | Self::SearchSurface | Self::SearchList | Self::SearchResult(_) => "",
             Self::Content
             | Self::PathField
             | Self::Tab(_)
@@ -193,7 +202,8 @@ pub(crate) struct Signature {
     picker_revision: u64,
     picker_request: u64,
     switching: Option<u64>,
-    search: Option<(bool, usize)>,
+    search: Option<search::Signature>,
+    search_minimized: bool,
     stream: bool,
     stream_confirmation: bool,
     settings_epoch: u64,
@@ -212,15 +222,45 @@ pub(crate) struct LayoutSnapshot {
     pub signature: Signature,
     targets: Vec<Target>,
     list_rows: u16,
+    search_window: Option<Rect>,
+    search_bar: Option<Rect>,
+    search_list: Option<Rect>,
+    pub(crate) search_details_scroll_limit: u16,
 }
 impl LayoutSnapshot {
-    /// The docked search controls and summary occupy three rows above the status bar.
+    /// The non-modal window covers part of the editor's otherwise full viewport.
     pub(crate) fn search_bounds(&self) -> Option<Rect> {
-        (self.area.width >= 40 && self.area.height >= 8 && self.signature.search.is_some())
-            .then(|| Rect::new(self.area.x, self.area.bottom() - 4, self.area.width, 3))
+        self.search_window
     }
 
-    /// Actual text viewport leaves room for the non-modal search controls.
+    /// Tab badges can resize labels without changing any part of the Find dialog.
+    pub(crate) fn only_tab_label_widths_changed(&self, next: &Self) -> bool {
+        if self.area != next.area
+            || self.search_window.is_none()
+            || self.search_window != next.search_window
+            || !self.signature.tabs.iter().map(|(id, _)| id).eq(next
+                .signature
+                .tabs
+                .iter()
+                .map(|(id, _)| id))
+        {
+            return false;
+        }
+        let mut before = self.signature.clone();
+        before.tabs.clone_from(&next.signature.tabs);
+        before == next.signature
+    }
+
+    pub(crate) fn search_result_rows(&self) -> u16 {
+        self.search_list.map_or(0, |list| list.height)
+    }
+
+    pub(crate) fn search_result_hit(&self, x: u16, y: u16) -> bool {
+        self.search_list
+            .is_some_and(|list| list.contains((x, y).into()))
+    }
+
+    /// Actual editor text viewport height, including cells underneath a floating window.
     pub(crate) fn content_height(&self) -> u16 {
         self.targets
             .iter()
@@ -240,6 +280,10 @@ impl LayoutSnapshot {
             },
             targets: Vec::new(),
             list_rows: 0,
+            search_window: None,
+            search_bar: None,
+            search_list: None,
+            search_details_scroll_limit: 0,
         };
         if area.width < 40 || area.height < 8 {
             return result;
@@ -278,6 +322,7 @@ impl LayoutSnapshot {
             Some(Modal::Path(..)) => (2, 0),
             Some(Modal::Confirm(after, _)) => (3, after.target().map_or(0, |tab| tab.0)),
             Some(Modal::Details(_)) => (4, u64::from(app.details_refresh_target().is_some())),
+            Some(Modal::SearchDetails(_)) => (18, 0),
             Some(Modal::TabDetails { tab, .. }) => (
                 13,
                 tab.map_or(0, |tab| tab.0.wrapping_mul(2))
@@ -326,10 +371,8 @@ impl LayoutSnapshot {
             picker_revision,
             picker_request,
             switching: app.switching,
-            search: app
-                .search
-                .open
-                .then_some((app.search.replace, app.search.row)),
+            search: app.search.open.then(|| search::Signature::new(app)),
+            search_minimized: app.search.minimized,
             stream: app.screen.stream.is_some(),
             stream_confirmation: app.stream_confirmation.is_some(),
             settings_epoch: app.settings_generation,
@@ -380,26 +423,9 @@ impl LayoutSnapshot {
                     );
                 }
                 if app.search.open {
-                    if let Some(content) = result
-                        .targets
-                        .iter_mut()
-                        .find(|t| t.control == Control::Content)
-                    {
-                        content.area.height = content.area.height.saturating_sub(3);
-                    }
-                    for (row, index) in app
-                        .search
-                        .controls()
-                        .into_iter()
-                        .skip(app.search.row)
-                        .take(2)
-                        .enumerate()
-                    {
-                        result.add(
-                            Control::Search(index),
-                            Rect::new(area.x, area.bottom() - 4 + row as u16, area.width, 1),
-                        );
-                    }
+                    result.add_search_window(app);
+                } else if app.search.minimized {
+                    result.add_search_bar(app);
                 }
             }
             return result;
@@ -414,6 +440,14 @@ impl LayoutSnapshot {
                 width,
                 height,
             )
+        } else if let Some(Modal::SearchDetails(report)) = &app.modal {
+            let width = result.overlay_rect(76, 22).width - 2;
+            let lines = search::details(report, width).line_count(width);
+            let overlay = result.overlay_rect(76, (lines + 5).clamp(8, 22) as u16);
+            result.search_details_scroll_limit = lines
+                .saturating_sub(usize::from(overlay.height - 3))
+                .min(usize::from(u16::MAX)) as u16;
+            overlay
         } else {
             result.overlay_rect(76, 22)
         };
@@ -451,6 +485,16 @@ impl LayoutSnapshot {
                                 Control::SettingsRow(row),
                                 Rect::new(rows.x, y, rows.width, 1),
                             );
+                            if row == settings_ui::FIND_MATCH_ROWS && writable {
+                                let label = crate::settings::Scalar::FindMatchRows.label();
+                                let x = rows.x + label.width() as u16 + 5;
+                                for (increase, left) in [(false, x), (true, x + 8)] {
+                                    result.add(
+                                        Control::SettingsFindRowsStep(increase),
+                                        Rect::new(left, y, 3, 1),
+                                    );
+                                }
+                            }
                             if let Some((index, scalar)) = inline
                                 && row == index
                             {
@@ -718,6 +762,7 @@ impl LayoutSnapshot {
             }
             Some(
                 Modal::Details(_)
+                | Modal::SearchDetails(_)
                 | Modal::TabDetails { .. }
                 | Modal::About { .. }
                 | Modal::SettingsDiagnostic { .. },
@@ -865,6 +910,13 @@ impl LayoutSnapshot {
                 Control::PickerRow(_)
                     | Control::TabListRow(_)
                     | Control::RecoveryRow(_)
+                    | Control::SearchSurface
+                    | Control::Search(
+                        crate::app::search::CLOSE
+                            | crate::app::search::MINIMIZE
+                            | crate::app::search::RESTORE
+                    )
+                    | Control::SearchResult(_)
                     | Control::TabDivider
             )
         })
@@ -882,7 +934,7 @@ impl LayoutSnapshot {
         self.next_when(current, backwards, |control| match control {
             Control::SettingsSection(active) => active == section,
             Control::SettingsGroup(active) => Some(active) == group,
-            Control::SettingsGroupStep(_) => false,
+            Control::SettingsGroupStep(_) | Control::SettingsFindRowsStep(_) => false,
             Control::SettingsField | Control::SettingsRow(_) => control == row,
             _ => true,
         })
@@ -1184,23 +1236,10 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &AppState, layout: &LayoutSnaps
                     if range.start >= span.bytes.end || range.end <= span.bytes.start {
                         continue;
                     }
-                    let (lo, hi) = if let Some((bytes, cells)) = span.unit {
-                        let (bytes, cells) = (u64::from(bytes), u64::from(cells));
-                        (
-                            span.column
-                                + range.start.saturating_sub(span.bytes.start) / bytes * cells,
-                            span.column
-                                + range
-                                    .end
-                                    .min(span.bytes.end)
-                                    .saturating_sub(span.bytes.start)
-                                    .div_ceil(bytes)
-                                    * cells,
-                        )
-                    } else {
-                        (span.column, span.column + span.width)
-                    };
-                    for column in lo.max(view.left)..hi.min(view.left + u64::from(area.width)) {
+                    let columns = columns_for_range(span, range);
+                    for column in columns.start.max(view.left)
+                        ..columns.end.min(view.left + u64::from(area.width))
+                    {
                         let style = Style::default()
                             .bg(if selected {
                                 Color::Magenta
@@ -1240,6 +1279,12 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &AppState, layout: &LayoutSnaps
         crate::status::Severity::Warning => "Warning: ",
         crate::status::Severity::Error => "Error: ",
     };
+    let footer_width = area.width
+        - if layout.contains(Control::ToggleFollow) {
+            16
+        } else {
+            0
+        };
     let footer = app.receiving_paste_status().unwrap_or_else(|| {
         if app.guard_waiting() {
             let cancel = app
@@ -1274,60 +1319,35 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &AppState, layout: &LayoutSnaps
         } else {
             ""
         };
-        format!(
-            "{config}{syntax}{}{} | {}{}{}",
+        let mut footer = format!(
+            "{config}{syntax}{}{} | {}{}",
             severity,
             app.status.text(),
             coordinates,
             if app.pending { " | working" } else { "" },
-            if !app.search.open && !app.screen.search.message.is_empty() {
-                format!(" | {}", app.screen.search.message)
-            } else {
-                String::new()
+        );
+        if layout.search_bar.is_some() {
+            if let Some(message) = search::minimized_status(app)
+                && footer.width() + 3 + message.width() <= usize::from(footer_width)
+            {
+                footer.push_str(" | ");
+                footer.push_str(&message);
             }
-        )
+        } else if !app.search.open && !app.search.minimized && !app.screen.search.message.is_empty()
+        {
+            footer.push_str(" | ");
+            footer.push_str(&app.screen.search.message);
+        }
+        footer
     });
     frame.render_widget(
         Paragraph::new(footer),
-        Rect::new(
-            area.x,
-            area.bottom() - 1,
-            area.width
-                - if layout
-                    .targets
-                    .iter()
-                    .any(|target| target.control == Control::ToggleFollow)
-                {
-                    16
-                } else {
-                    0
-                },
-            1,
-        ),
+        Rect::new(area.x, area.bottom() - 1, footer_width, 1),
     );
-    if app.search.open && app.modal.is_none() && !app.help {
-        let status = &app.screen.search;
-        let mut text = if status.busy {
-            format!(
-                "{} | {}/{} bytes; {} matches",
-                status.message,
-                status.progress.scanned,
-                status.progress.total,
-                status.progress.matches
-            )
-        } else {
-            status.message.clone()
-        };
-        if let Some(error) = &app.field_error {
-            text = error.clone();
-        }
-        if status.partial_highlighting {
-            text.push_str(" | Partial highlighting");
-        }
-        frame.render_widget(
-            Paragraph::new(text),
-            Rect::new(area.x, area.bottom() - 2, area.width, 1),
-        );
+    if let Some(window) = layout.search_bounds() {
+        search::render(frame, app, layout, window);
+    } else if let Some(bar) = layout.search_bar {
+        search::render_bar(frame, app, layout, bar);
     }
     if let Some(overlay) = layout.overlay {
         if matches!(app.modal, Some(Modal::Settings)) {
@@ -1363,6 +1383,7 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &AppState, layout: &LayoutSnaps
             }
             Some(Modal::Confirm(..)) => " Unsaved changes ",
             Some(Modal::Details(_)) => " Details ",
+            Some(Modal::SearchDetails(_)) => " Search Details ",
             Some(Modal::TabDetails { .. }) => " Tab Details ",
             Some(Modal::About { .. }) => " About ",
             Some(Modal::SettingsDiagnostic { .. }) => " Settings Details ",
@@ -1399,6 +1420,7 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &AppState, layout: &LayoutSnaps
                 Modal::Menu(_)
                 | Modal::Language { .. }
                 | Modal::SyntaxTheme { .. }
+                | Modal::SearchDetails(_)
                 | Modal::Path(..)
                 | Modal::Open(_)
                 | Modal::Tabs(_),
@@ -1595,13 +1617,19 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &AppState, layout: &LayoutSnaps
                 );
             }
         } else {
+            let paragraph = if let Some(Modal::SearchDetails(report)) = &app.modal {
+                search::details(report, inner.width)
+            } else {
+                Paragraph::new(text)
+            };
             frame.render_widget(
-                Paragraph::new(text).wrap(Wrap { trim: false }).scroll((
+                paragraph.wrap(Wrap { trim: false }).scroll((
                     if app.help
                         || matches!(
                             app.modal,
                             Some(
                                 Modal::Details(_)
+                                    | Modal::SearchDetails(_)
                                     | Modal::TabDetails { .. }
                                     | Modal::About { .. }
                                     | Modal::SettingsDiagnostic { .. }
@@ -1622,6 +1650,17 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &AppState, layout: &LayoutSnaps
         }
     }
     for target in &layout.targets {
+        if (layout.search_bounds().is_some() || layout.search_bar.is_some())
+            && matches!(
+                target.control,
+                Control::Search(_)
+                    | Control::SearchSurface
+                    | Control::SearchList
+                    | Control::SearchResult(_)
+            )
+        {
+            continue;
+        }
         if target.control == Control::TabDivider {
             frame.render_widget(Paragraph::new("│"), target.area);
             continue;
@@ -1769,62 +1808,25 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &AppState, layout: &LayoutSnaps
         ) {
             continue;
         }
-        if let Control::Search(index) = target.control {
-            let label = if index <= 1 {
-                let (prefix, field) = if index == 0 {
-                    ("Find: ", &app.search.query.literal)
-                } else {
-                    ("Replace: ", &app.search.replacement)
-                };
-                format!(
-                    "{prefix}{}",
-                    tail_cells(
-                        &crate::app::search::display(field),
-                        target.area.width.saturating_sub(prefix.len() as u16 + 2)
-                    )
-                )
-            } else {
-                let label = app.search.label(index);
-                let command = match index {
-                    5 => Some(Command::FindPrevious),
-                    6 => Some(Command::FindNext),
-                    7 => Some(Command::ReplaceNext),
-                    8 => Some(Command::ReplaceAll),
-                    9 => Some(Command::CancelSearch),
-                    _ => None,
-                };
-                let keys = command
-                    .map(|command| app.settings.applied.map.shortcuts(Context::Global, command))
-                    .unwrap_or_default();
-                if keys.is_empty() {
-                    label
-                } else {
-                    format!("{label} ({keys})")
-                }
-            };
+        if let Control::Search(index @ (15 | 16)) = target.control {
+            let label = app.search.label(index);
             let focused = app.focus == Some(target.control);
-            let style = if focused {
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD)
+            let text = if focused {
+                format!(">{label}<")
             } else {
-                Style::default()
+                format!("[{label}]")
+            };
+            let color = if index == 15 {
+                Some(Color::Yellow)
+            } else if focused {
+                Some(Color::Cyan)
+            } else {
+                None
             };
             frame.render_widget(
-                Paragraph::new(tail_cells(
-                    &format!("{}{label}", if focused { ">" } else { " " }),
-                    target.area.width,
-                ))
-                .style(style),
+                Paragraph::new(text).style(button_style(color, focused)),
                 target.area,
             );
-            if focused && index <= 1 {
-                frame.set_cursor_position((
-                    target.area.x
-                        + (label.width() as u16 + 1).min(target.area.width.saturating_sub(1)),
-                    target.area.y,
-                ));
-            }
             continue;
         }
         let focused = app.focus == Some(target.control);
@@ -2046,6 +2048,23 @@ fn render_settings(frame: &mut Frame<'_>, app: &AppState, layout: &LayoutSnapsho
                     target.area,
                 );
             }
+            Control::SettingsFindRowsStep(increase) => {
+                let rows = draft.find_match_rows();
+                let at_bound = if increase {
+                    rows == crate::settings::Scalar::FindMatchRows.maximum()
+                } else {
+                    rows == 1
+                };
+                let style = if at_bound {
+                    Style::default().add_modifier(Modifier::DIM)
+                } else {
+                    style
+                };
+                frame.render_widget(
+                    Paragraph::new(format!("[{}]", target.control.label())).style(style),
+                    target.area,
+                );
+            }
             Control::SettingsField => {
                 let text = tail_cells(&safe(&draft.field), target.area.width);
                 frame.render_widget(Clear, target.area);
@@ -2167,6 +2186,21 @@ fn render_run(frame: &mut Frame<'_>, span: &Span, selection: &Range<u64>, start:
     }
 }
 /// Shared occupied-cell selection styling for full and clipped run fragments.
+/// Convert a byte intersection into the terminal cells used to paint it.
+fn columns_for_range(span: &Span, range: &Range<u64>) -> Range<u64> {
+    let Some((bytes, cells)) = span.unit else {
+        return span.column..span.column + span.width;
+    };
+    let (bytes, cells) = (u64::from(bytes), u64::from(cells));
+    let start = range.start.saturating_sub(span.bytes.start) / bytes;
+    let end = range
+        .end
+        .min(span.bytes.end)
+        .saturating_sub(span.bytes.start)
+        .div_ceil(bytes);
+    span.column + start * cells..span.column + end * cells
+}
+
 fn selection_style(selected: bool) -> Style {
     if selected {
         Style::default().bg(Color::Blue).fg(Color::White)

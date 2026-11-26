@@ -82,8 +82,7 @@ binary data report errors.
 | Move / extend selection | Arrows, Home, End, Page Up/Down; Shift extends | Same |
 | Document start / end | Ctrl+Home / Ctrl+End | Same |
 | Go to line or line:cell | Ctrl+G; numbers start at 1 | Same |
-| Find / Replace | Ctrl+F / Ctrl+H | Cmd+F / Cmd+H |
-| Next / previous match | F3 / Shift+F3 | Same |
+| Find / Find & Replace | Ctrl+F / Ctrl+H | Cmd+F / Shift+Cmd+H |
 | Help / actions | F1 / F2 | Same |
 | Leave text / previous control | F6 / Shift+F6 | Same |
 | Activate / cancel | Enter / Escape | Same |
@@ -106,20 +105,44 @@ details for the active tab. Dividers separate tabs in the strip, where reverse
 video marks the active tab. The strip also marks modified (`*`), waiting (`…`), loading
 (`↓`), queued save (`⇡`), saving (`↑`), scratch (`~`), and attention (`!`).
 
-Find and Replace search the current document or all open tabs, including unsaved
-scratches. Queries are literal, with optional Unicode case folding and whole-word
-matching. Tab / Shift+Tab cycles panel controls; F6 returns to text. Fields accept
-up to 4096 UTF-8 bytes and preserve literal paste. Insert Tab, LF and CRLF controls
-insert actual characters; displayed escapes are not query syntax. Portable
-Backspace uses DEL (`0x7f`); Ctrl+H (`0x08`) opens Replace.
+**Find** and **Find & Replace** open at the bottom right of the editor with
+matches above the form. **Settings → Editor → Find match rows** controls the
+list height in both windows, from 1 to 10 rows (default 3). Short terminals can
+show fewer rows. In `config.toml`, set `find_match_rows` under `[editor]`.
 
-F3 / Shift+F3 wraps explicitly. Replace next reveals a match before changing it
-and advances without wrapping. Replace all confirms the scope with Cancel selected
-initially. Each changed document gets one Undo step; replacement does not save
-files. Cross-tab failures preserve completed documents and report unprocessed
-ones in Search summary. Escape cancels active work, then closes the panel.
-Search highlights the exact match separately from ordinary selection; navigation
-clears the old selection and keeps the caret on a grapheme boundary.
+Enter the query and press Enter or click **Find** to select the first match and
+focus the results. Expand **Options** with a click, Enter, or Right to change
+**Match case**, **Match Whole Word**, or the search
+scope. **Current tab** searches the active tab. **All open tabs** also includes
+the unsaved text in other tabs. Queries are literal, with optional Unicode case
+folding. Fields accept up to 4096 UTF-8 bytes, including pasted Tab, LF and CRLF.
+The expanded options also insert those characters directly. Portable Backspace
+uses DEL (`0x7f`).
+Ctrl+H (`0x08`) opens Find & Replace.
+
+Use Tab or Shift+Tab to switch between the form and results. Use Up and Down
+to navigate the focused section, including every expanded option in the form.
+Click a result or use the arrow keys in the list to jump to its exact match.
+Page Up, Page Down, Home and End browse the list. The mouse wheel scrolls it
+without moving the caret. F6 returns to editor text. **Previous** and **Next**
+wrap through live matches. **Summary** opens Search Details with per-tab counts
+and outcomes.
+
+Click the blue **`−`** to collapse either window into its title row and return
+to the editor. The editor status bar shows progress or the match count. Click
+the blue **`+`** or press Ctrl+F / Cmd+F to reopen the window with its results.
+In the form, press Up from the first row to reach Minimize and Close, then use Left or
+Right to choose and Enter to activate. The red **`×`** cancels and closes
+either view. While the window is expanded, Escape cancels active work or
+closes the idle window.
+
+**Replace Next** reveals a match before changing it and advances without
+wrapping. **Replace All** confirms the scope with Cancel focused. **Replaced**
+and **Removed** mark the latest committed changes in the result list. Each
+changed document gets one Undo step, and saving remains a separate action.
+Search navigation clears ordinary selection and keeps the
+caret on a grapheme boundary. The exact-match highlight shows the replacement
+range.
 
 Open starts in the active file's parent directory or the launch directory.
 Use arrows or the wheel to select an entry and Enter to open it. Double-click
@@ -135,8 +158,8 @@ to turn it back on. Native-selection modifiers depend on the terminal; use tmux'
 copy mode inside tmux.
 
 With mouse capture enabled, click outside a pane to dismiss it. This includes
-docked Find/Replace. The click leaves the editor caret and underlying controls
-alone. Confirmations and guarded Save As require an explicit choice. Click a tab
+the Find and Find & Replace windows. The click leaves the editor caret and
+underlying controls alone. Confirmations and guarded Save As require an explicit choice. Click a tab
 name in the header to switch or its × to close that tab. Each close uses the same
 save and discard checks as keyboard Close Tab.
 
@@ -323,8 +346,8 @@ that a command starts unbound and is available when its surface permits it.
 | `global` | `close_tab` | Ctrl+W / Cmd+W |
 | `global` | `export_retained` | — |
 | `global` | `find` | Ctrl+F / Cmd+F |
-| `global` | `find_next` | F3 |
-| `global` | `find_previous` | Shift+F3 |
+| `global` | `find_next` | — |
+| `global` | `find_previous` | — |
 | `global` | `follow_file` | — |
 | `global` | `go_to` | Ctrl+G |
 | `global` | `help` | F1 |
@@ -400,6 +423,16 @@ that a command starts unbound and is available when its surface permits it.
 | `search` | `insert_query_crlf` | — |
 | `search` | `insert_query_lf` | — |
 | `search` | `insert_query_tab` | — |
+| `search` | `move_document_end` | Ctrl+End / Ctrl+Shift+End |
+| `search` | `move_document_start` | Ctrl+Home / Ctrl+Shift+Home |
+| `search` | `move_down` | Down / Shift+Down |
+| `search` | `move_end` | End / Shift+End |
+| `search` | `move_home` | Home / Shift+Home |
+| `search` | `move_left` | Left / Shift+Left |
+| `search` | `move_page_down` | PageDown / Shift+PageDown |
+| `search` | `move_page_up` | PageUp / Shift+PageUp |
+| `search` | `move_right` | Right / Shift+Right |
+| `search` | `move_up` | Up / Shift+Up |
 | `search` | `search_details` | — |
 | `search` | `toggle_match_case` | — |
 | `search` | `toggle_search_scope` | — |
