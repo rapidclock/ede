@@ -135,8 +135,6 @@ pub(crate) const BINDINGS: &[Binding] = &[
     Binding::new(K::Char('f'), M::SUPER, C::Find),
     Binding::new(K::Char('h'), M::CONTROL, C::Replace),
     Binding::new(K::Char('h'), M::SUPER.union(M::SHIFT), C::Replace),
-    Binding::new(K::F(3), M::NONE, C::FindNext),
-    Binding::new(K::F(3), M::SHIFT, C::FindPrevious),
     Binding::new(K::Char('q'), M::CONTROL, C::Quit),
     Binding::new(K::Char('n'), M::CONTROL, C::New),
     Binding::new(K::Char('o'), M::CONTROL, C::Open),
@@ -296,7 +294,7 @@ impl Command {
     pub(crate) const fn label(self) -> &'static str {
         match self {
             Self::Find => "Find",
-            Self::Replace => "Replace",
+            Self::Replace => "Find & Replace",
             Self::FindNext => "Find next",
             Self::FindPrevious => "Find previous",
             Self::ReplaceNext => "Replace next",

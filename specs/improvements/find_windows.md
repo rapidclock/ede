@@ -1,8 +1,9 @@
 # Improvement Spec — Find and Find & Replace windows
 
-**Status** — Follow-up implemented and validated for review on macOS and Ubuntu.
+**Status** — Minimize is implemented and validated for review on macOS and
+Ubuntu 26.10.
 **Release** — User-confirmed patch target `0.1.2`, from `0.1.1` on `main`.
-The review build is `0.1.2-dev.1`.
+The review build is `0.1.2-dev.2`.
 **Branch** — `enhance/find-windows`, based on `main` at `3004bb3`.
 
 ## Current behavior and scope
@@ -19,6 +20,8 @@ field and replacement actions. Both modes search the current document or all
 open tabs, including unsaved text. Keep literal matching, existing shortcuts
 and remaps, session field retention, cancellation, and replacement safeguards.
 This supersedes the dock and control-navigation design in [Stage 06](../001_initial_mvp/06_search_and_replace.md#commands-and-interaction).
+The [Minimize addendum](#minimize-addendum) updates the window controls and
+search command routes for the same release.
 
 ## Windows
 
@@ -44,7 +47,7 @@ expanded after a replacement. The colored Find button, disclosure marker, and
 result status have distinct text cues for monochrome terminals.
 
 ```text
-┌─ Find ─────────────────────────────────────────── [×] ┐
+┌─ Find ──────────────────────────────────────[−]  [×]─┐
 │   3:7    green apple                                  │
 │ > 12:1   apple tree                                   │
 │   15:7   baked apple                                  │
@@ -56,7 +59,7 @@ result status have distinct text cues for monochrome terminals.
 │ [Previous] [Next]                     2 of 18 matches │
 └───────────────────────────────────────────────────────┘
 
-┌─ Find & Replace ───────────────────────────────── [×] ┐
+┌─ Find & Replace ────────────────────────────[−]  [×]─┐
 │   3:7  notes.txt  Replaced · green apple               │
 │ > 12:1 notes.txt  apple tree                           │
 │───────────────────────────────────────────────────────│
@@ -99,11 +102,11 @@ result status have distinct text cues for monochrome terminals.
   field values and inhibit replacement activation.
 - Keep F6 available to return focus to the editor without closing the window,
   and keep the existing binding for returning to search. With mouse capture
-  enabled, clicking outside dismisses the window and consumes the click.
+  enabled, clicking outside the expanded window dismisses it and consumes the
+  click.
   Escape first cancels active work, then closes the idle window. Show a
   clickable Cancel search action while work is active. Closing retains the
-  entered fields and flags and returns focus to the editor. F3 and Shift+F3
-  can still navigate with the window closed.
+  entered fields and flags and returns focus to the editor.
 
 ## Input and results
 
@@ -118,8 +121,8 @@ result status have distinct text cues for monochrome terminals.
   Select and reveal the first live result in list order regardless of the
   editor caret, and focus the list once the submitted search finds a match.
   A no-match, cancelled, or superseded search leaves form focus alone.
-  F3, Shift+F3, and the Next and Previous actions keep their existing relative
-  navigation. Empty queries clear results and disable match and replacement
+  The Next and Previous actions keep their existing relative navigation.
+  Empty queries clear results and disable match and replacement
   actions. Query or option
   changes invalidate the prior list and cancel superseded search work. The UI
   prompts to search again. Editing only the replacement preserves search
@@ -130,8 +133,8 @@ result status have distinct text cues for monochrome terminals.
   by one visible page. Home and End reach the first and last available rows.
   Moving onto a live match reveals it. Enter or one click reveals a live match
   directly. A replacement feedback row can receive focus for browsing and
-  leaves the editor position unchanged. Previous and Next, including F3 and
-  Shift+F3, wrap through live matches and keep the selection and list viewport
+  leaves the editor position unchanged. Previous and Next wrap through live
+  matches and keep the selection and list viewport
   in sync with the jump. The wheel over results scrolls the list without
   changing the current match, caret, active tab, or editor scroll position.
 - **Result rows** — Include every canonical occurrence in the requested scope.
@@ -192,6 +195,64 @@ result status have distinct text cues for monochrome terminals.
   edit, undo, redo, or refresh, or when the tab becomes unavailable.
   Rescanning live matches after replacement preserves that action's feedback.
 
+## Minimize addendum
+
+This approved v0.1.2 follow-up gives the user a visible way to keep a search
+running while working in the editor. Before this follow-up, closing the dialog
+cancelled the scan and cleared its results. F3 and Shift+F3 could start a fresh
+scan from the editor using remembered search text, and Actions listed separate
+search, replace, and cancel commands.
+
+- Add **Minimize** (`[−]`, blue foreground) and **Close** (`[×]`, red
+  foreground) at the right end of the title row in both modes. Leave at least
+  two blank terminal cells between the buttons. Each glyph and its brackets
+  form a separate click target, and the gap activates neither button. Both
+  controls have visible keyboard focus and remain distinct in monochrome. Up
+  from the first form row reaches the title controls, Left and Right switch
+  between them, Down returns to the form, and Enter activates the focused
+  control.
+- Minimize returns keyboard focus to the editor while the same scan continues.
+  Replace the expanded window with a single row anchored at the bottom right
+  above the status bar. Show the window name, `Searching…` while busy or the
+  match count when complete, and **Restore** and red **Close** actions separated
+  by the same two-cell gap. Use the applicable status for cancelled, incomplete,
+  or stale results. Reserve that editor row so the caret cannot land behind
+  the bar. Give the two controls priority in compact terminals and shorten
+  the mode label to **Replace** if needed to display the status. Only clicks
+  on the bar's controls activate it. Normal editor input and clicks elsewhere
+  leave the bar in place.
+- Preserve the mode, field values, flags, and any still-valid results and list
+  position while minimized. Scan completion may update the bar but cannot move
+  the caret, scroll the editor, switch tabs, or take focus. Existing revision
+  and scope rules still govern result validity, including edits made from the
+  editor while the window is minimized. Minimizing cannot confirm a pending
+  replacement, repeat an action, or change replacement safeguards.
+- **Restore** and **Ctrl+F / Cmd+F** reopen the same minimized window, including
+  Find & Replace, with the same search and any available results. Opening a
+  search from Actions or the Find & Replace shortcut while minimized also
+  restores that window. Restore a valid previous form or results focus, with
+  the Find field as the fallback. Restoring does not run another search or
+  replay a caret jump that was suppressed by minimizing.
+- **Close** cancels running work, clears results, and dismisses either view.
+  The input values and flags remain available on the next open. In the expanded
+  window, **Esc** or the visible **Cancel search** action stops an active scan
+  and leaves the window open. **Esc** closes the expanded window when idle.
+  With the window minimized, **Esc** in the editor leaves the scan and bar in
+  place.
+- List only **Find** and **Find & Replace** under **Actions → Search**. Remove
+  the default F3 and Shift+F3 bindings and the editor-level routes that start,
+  advance, replace, or cancel a remembered search through those command IDs.
+  Next, Previous, Replace Next, Replace All, and Cancel search remain available
+  from the expanded window when applicable. Existing remaps for these actions
+  can operate there only. Close on the minimized bar remains available while
+  the editor has focus.
+
+```text
+Expanded title   ┌─ Find ───────────────────────[−]  [×]┐
+Minimized busy    Find · Searching…        [Restore]  [×]
+Minimized done    Find · 18 matches        [Restore]  [×]
+```
+
 ## Acceptance criteria
 
 | ID | Observable outcome |
@@ -204,9 +265,33 @@ result status have distinct text cues for monochrome terminals.
 | A6 | Verify Replaced for changed text and Removed for deletion, including a partial batch and feedback beyond the first page. Verify identical, skipped, and uncommitted edits leave no new marker. Browse feedback without jumping or changing the live count, including when inserted text itself matches. Verify feedback clears on undo, subsequent edits, and search changes. |
 | A7 | Both modes anchor at the bottom right and list results above the form. With no saved preference, show up to three result rows. The Settings stepper stops at 1 and 10, accepts keyboard and mouse input, and persists on Save. After restart the preference applies to both modes. Reduce rows as needed at compact sizes and keep the selected document occurrence visible above the window. |
 | A8 | With the editor caret at the last match or in a later tab, submit a search and verify the first result is selected. Use Down immediately after completion and Tab or Shift+Tab to return from anywhere in the list. A no-match query leaves the field usable. Verify a visible dim divider when both parts fit and Search Details with per-tab lines and no escaped layout newlines. |
+| A9 | In both expanded modes, verify blue Minimize and red Close are individually clickable and keyboard reachable, with two blank, inactive cells between them. Verify monochrome focus, the compact layout and resize, and independent Restore and Close targets on the minimized bar. |
+| A10 | Hold a scan at a controlled point, minimize it, and verify the editor accepts input without losing focus. Verify both restore routes while busy and after completion, preserved search state without resubmission, and no delayed caret or tab jump. Exercise Current tab invalidation and stale revisions while minimized. Verify Close cancels and clears in both views and Esc preserves the expanded window while cancelling. |
+| A11 | Verify Actions → Search contains only Find and Find & Replace. F3, Shift+F3, and an existing remap for a removed editor-level route cannot start a scan with Find closed. Verify in-window match navigation and replacement, including Replace All confirmation and cancellation. |
 
 ## Validation record
 
+- Minimize addendum (A9–A11) — The user approved the interaction, spaced
+  title controls, and implementation for `0.1.2-dev.2`. A new native terminal
+  test failed on `dev.1` because Minimize was absent. Terminal-cell and native
+  PTY checks verify spacing and colors, keyboard and pointer controls, restore
+  in both modes, the caret above the bar at `40×8`, stale rows after editing or
+  switching tabs, and the two Search menu items. The removed key bindings and
+  remapped command boundaries are checked through application dispatch. The
+  retained stream regression advances through the visible **Next** action.
+- Minimize concurrency and review (A4, A5, A10) — Gated native runtime tests
+  hold the scan and a later viewport read. They verify continued scanning,
+  restore without resubmitting, cancellation and close, and no late caret or
+  active-tab change. Independent review rechecked these paths and the existing
+  stale replacement guard, with no remaining actionable findings.
+- Minimize regression runs — Formatting and strict Clippy passed with Rust
+  `1.100.0` on arm64 macOS 27.2.1 and the arm64 Ubuntu 26.10 UTM guest. The
+  full locked workspace suite passed 391 and 394 tests respectively, with
+  10 and 11 existing ignored tests. Both used the CI 256-file limit.
+- Minimize optimized Linux checks — Twelve enabled native search tests
+  passed. The ordinary, dense-line, and long-line 256 MiB search and replacement
+  benchmarks passed with a 256 MiB memory limit and swap disabled. The full
+  1 GiB benchmark matrix was not run for this build.
 - Second follow-up (A2, A3, A8) — Authorized first-result selection, automatic
   results focus, Tab between form and results, a soft divider, and structured
   Search Details. A native terminal regression reproduced selection of the last

@@ -1,11 +1,16 @@
 //! Geometry and rendering for the floating Find and Find & Replace windows.
 use super::*;
 use crate::{
-    app::search::{FORM_DOWN, FORM_UP, OPTIONS, SHOW_RESULTS, SUBMIT, display},
+    app::search::{
+        CLOSE, FORM_DOWN, FORM_UP, MINIMIZE, OPTIONS, RESTORE, SHOW_RESULTS, SUBMIT, display,
+    },
     editor::search::{Summary, results::Row},
     settings::Scalar,
 };
 use ratatui::text::{Line, Span};
+
+/// Keep the two window actions visually and physically apart.
+const TITLE_ACTION_GAP: u16 = 2;
 
 /// Everything that can change a search click target between press and release.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -75,8 +80,8 @@ impl LayoutSnapshot {
         );
         self.search_window = Some(window);
         self.add(Control::SearchSurface, window);
-        let mut right = window.right() - 1;
-        let mut header = vec![10];
+        let mut right = self.add_search_title_actions(app, window, MINIMIZE) - 1;
+        let mut header = Vec::new();
         if compact {
             if desired_results > 0 {
                 header.push(SHOW_RESULTS);
@@ -122,6 +127,35 @@ impl LayoutSnapshot {
         }
     }
 
+    /// Give the minimized bar a stable footprint while its status changes.
+    pub(super) fn add_search_bar(&mut self, app: &AppState) {
+        let width = self.area.width.min(50);
+        let bar = Rect::new(self.area.right() - width, self.area.bottom() - 2, width, 1);
+        if let Some(content) = self
+            .targets
+            .iter_mut()
+            .find(|target| target.control == Control::Content)
+        {
+            content.area.height -= 1;
+        }
+        self.search_bar = Some(bar);
+        self.add(Control::SearchSurface, bar);
+        self.add_search_title_actions(app, bar, RESTORE);
+    }
+
+    fn add_search_title_actions(&mut self, app: &AppState, area: Rect, primary: u8) -> u16 {
+        let close = button_width(app, CLOSE);
+        let primary_width = button_width(app, primary);
+        let close_x = area.right() - 1 - close;
+        let primary_x = close_x - TITLE_ACTION_GAP - primary_width;
+        self.add(Control::Search(CLOSE), Rect::new(close_x, area.y, close, 1));
+        self.add(
+            Control::Search(primary),
+            Rect::new(primary_x, area.y, primary_width, 1),
+        );
+        primary_x
+    }
+
     fn add_search_group(&mut self, app: &AppState, group: &[u8], area: Rect) {
         let add = |layout: &mut Self, index, x, width| {
             layout.add(Control::Search(index), Rect::new(x, area.y, width, 1));
@@ -163,6 +197,77 @@ fn divider(width: u16) -> Line<'static> {
         "─".repeat(usize::from(width)),
         Style::default().add_modifier(Modifier::DIM),
     )
+}
+
+/// Paint progress without taking focus or covering more than one editor row.
+pub(super) fn render_bar(
+    frame: &mut Frame<'_>,
+    app: &AppState,
+    layout: &LayoutSnapshot,
+    bar: Rect,
+) {
+    let status = &app.screen.search;
+    let rows = app.search.current_rows(&status.rows);
+    let message = if status.busy {
+        "Searching…".into()
+    } else if status.message.starts_with("Cancelled") {
+        "Cancelled".into()
+    } else if status.message.contains("stale") || status.message.starts_with("Current tab changed")
+    {
+        "Stale results".into()
+    } else if status.message.starts_with("Stopped")
+        || rows.is_some_and(|rows| rows.error.is_some() || rows.feedback_incomplete)
+    {
+        "Incomplete".into()
+    } else if status.outcomes.is_empty() || rows.is_none() {
+        "Ready".into()
+    } else {
+        let count = status.rows.live;
+        format!("{count} {}", if count == 1 { "match" } else { "matches" })
+    };
+    frame.render_widget(Clear, bar);
+    let mut text_width = 0;
+    for target in &layout.targets {
+        if let Control::Search(index @ (RESTORE | CLOSE)) = target.control {
+            if index == RESTORE {
+                text_width = target.area.x - bar.x - 2;
+            }
+            render_title_action(frame, app, target.area, index);
+        }
+    }
+    let name = if app.search.replace {
+        if ("Find & Replace · ".width() + message.width()) <= usize::from(text_width) {
+            "Find & Replace"
+        } else {
+            "Replace"
+        }
+    } else {
+        "Find"
+    };
+    frame.render_widget(
+        Paragraph::new(format!("{name} · {message}"))
+            .style(Style::default().add_modifier(Modifier::DIM)),
+        Rect::new(bar.x + 1, bar.y, text_width, 1),
+    );
+}
+
+fn render_title_action(frame: &mut Frame<'_>, app: &AppState, area: Rect, index: u8) {
+    let label = app.search.label(index);
+    let focused = app.focus == Some(Control::Search(index));
+    let text = if focused {
+        format!(">{label}<")
+    } else {
+        format!("[{label}]")
+    };
+    let color = match index {
+        CLOSE => Some(Color::Red),
+        MINIMIZE => Some(Color::LightBlue),
+        _ => None,
+    };
+    frame.render_widget(
+        Paragraph::new(text).style(button_style(color, focused)),
+        area,
+    );
 }
 
 /// Escape individual values and add genuine terminal rows for sections.
@@ -296,6 +401,15 @@ pub(super) fn render(frame: &mut Frame<'_>, app: &AppState, layout: &LayoutSnaps
                         target.area.y,
                     ));
                 }
+            }
+            Control::Search(index @ (MINIMIZE | CLOSE)) => {
+                if index == MINIMIZE {
+                    frame.render_widget(
+                        Clear,
+                        Rect::new(target.area.right(), target.area.y, TITLE_ACTION_GAP, 1),
+                    );
+                }
+                render_title_action(frame, app, target.area, index);
             }
             Control::Search(index) => {
                 if index == 11 {
@@ -519,6 +633,8 @@ mod tests {
                 .area
         };
         let find = target(&layout, SUBMIT);
+        let minimize = target(&layout, MINIMIZE);
+        let close = target(&layout, CLOSE);
         let next = target(&layout, 7);
         let all = target(&layout, 8);
         assert_eq!(find.right(), all.right());
@@ -529,6 +645,13 @@ mod tests {
             .draw(|frame| super::super::render(frame, &app, &layout))
             .unwrap();
         let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(minimize.x, minimize.y)].fg, Color::LightBlue);
+        assert_eq!(buffer[(close.x, close.y)].fg, Color::Red);
+        assert_eq!(close.x - minimize.right(), TITLE_ACTION_GAP);
+        for x in minimize.right()..close.x {
+            assert_eq!(buffer[(x, close.y)].symbol(), " ");
+            assert_eq!(layout.hit(x, close.y), Some(Control::SearchSurface));
+        }
         assert_eq!(buffer[(find.x, find.y)].fg, Color::Green);
         assert_eq!(buffer[(next.x, next.y)].fg, Color::Cyan);
         assert_eq!(buffer[(all.x, all.y)].fg, Color::Yellow);

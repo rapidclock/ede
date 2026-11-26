@@ -710,7 +710,8 @@ impl State {
             Operation::ReplaceAll | Operation::ReplaceNext
         );
         let listing = run.request.operation == Operation::List;
-        let candidate = if successful && !replaced && !decorating && !listing {
+        let changed_scope = !run.request.all && self.result_scope.is_none() && self.query.is_some();
+        let candidate = if successful && !replaced && !decorating && !listing && !changed_scope {
             self.navigation_candidate(owner, &mut run)?
         } else {
             None
@@ -736,20 +737,8 @@ impl State {
                 self.status.processed, self.status.changed
             )
         } else if let Some((wrapped, found)) = candidate {
-            if run.navigation == owner.view_cancel.search_navigation.load(Ordering::Acquire) {
-                owner.activate(found.tab);
-                owner.tab.pause_follow();
-                let snapshot = owner.snapshot()?;
-                let mut text = Text::new(&snapshot, &run.cancel);
-                let ceil = text.ceil(found.range.start)?;
-                let caret = if ceil == found.range.start {
-                    ceil
-                } else {
-                    text.previous(ceil)?
-                };
-                owner.tab.screen.position.move_to(caret, false);
-                owner.tab.preferred = None;
-                owner.layout_search(found.range.end.saturating_sub(1))?;
+            let revealed = owner.reveal_search_result(&found, None, run.navigation, &run.cancel)?;
+            if revealed {
                 self.stream_anchor = owner.tab.live.is_some().then(|| found.clone());
                 self.status.current = Some(found);
                 if self.status.rows.count != 0 {
@@ -757,9 +746,14 @@ impl State {
                 }
             }
             format!(
-                "{} matches{}; exact match differs from ordinary selection",
+                "{} matches{}{}",
                 self.status.total(),
-                if wrapped { "; Wrapped" } else { "" }
+                if wrapped && revealed { "; Wrapped" } else { "" },
+                if revealed {
+                    "; exact match differs from ordinary selection"
+                } else {
+                    ""
+                },
             )
         } else if listing && self.status.total() != 0 {
             format!("{} matches", self.status.total())
@@ -801,6 +795,9 @@ impl State {
                 self.status.message
             );
         }
+        if changed_scope && !replaced && !decorating {
+            self.status.message = "Current tab changed; press Find".into();
+        }
         let auto = replaced
             && successful
             && run.request.operation == Operation::ReplaceNext
@@ -809,8 +806,13 @@ impl State {
         let refresh_list = replaced
             && successful
             && run.request.browse
-            && run.request.operation == Operation::ReplaceAll
+            && matches!(
+                run.request.operation,
+                Operation::ReplaceAll | Operation::ReplaceNext
+            )
+            && !auto
             && self.query.as_ref() == Some(&run.request.query)
+            && self.result_scope.is_some()
             && self.status.changed != 0
             && self.deferred.is_none();
         // The completed worker is joined and publication reconciled. Its full
@@ -966,6 +968,97 @@ impl State {
 }
 
 impl Coordinator {
+    /// Resolve the target and viewport before committing a navigation action. The
+    /// terminal can revoke authority while storage reads or view preparation wait.
+    fn reveal_search_result(
+        &mut self,
+        found: &Found,
+        caret: Option<u64>,
+        navigation: u64,
+        cancel: &Cancellation,
+    ) -> Result<bool, Error> {
+        let authority = cancel.for_epoch(self.view_cancel.search_navigation.clone(), navigation);
+        if authority.is_cancelled() || self.parked_action {
+            return Ok(false);
+        }
+        let snapshot = self.background_snapshot(found.tab, found.document)?;
+        if snapshot.revision() != found.revision || authority.is_cancelled() {
+            return Ok(false);
+        }
+        let mut text = Text::new(&snapshot, &authority);
+        let position = match caret.map_or_else(
+            || {
+                let ceil = text.ceil(found.range.start)?;
+                if ceil == found.range.start {
+                    Ok(ceil)
+                } else {
+                    text.previous(ceil)
+                }
+            },
+            Ok,
+        ) {
+            Ok(caret) => Position {
+                caret,
+                anchor: caret,
+            },
+            Err(Error::Cancelled) if authority.is_cancelled() => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        let target = self.state(found.tab).ok_or(Error::Closed)?;
+        let request = ViewRequest {
+            position,
+            top: target.top,
+            left: target.left,
+            width: self.width,
+            height: self.height,
+            reveal: true,
+            generation: self.generation,
+        };
+        let same_tab = self.tab.screen.tab == Some(found.tab);
+        let mut cache = if same_tab {
+            std::mem::take(&mut self.cache)
+        } else {
+            Checkpoints::default()
+        };
+        // As in ordinary layout, retain at most the displayed view and one in flight.
+        self.tab.screen.view = None;
+        if let Ok(mut slot) = self.output.lock() {
+            slot.take();
+        }
+        let result = text.view_revealing_match(
+            request,
+            &mut cache,
+            (self.search_cover != 0)
+                .then_some((self.search_cover, found.range.end.saturating_sub(1))),
+        );
+        drop(snapshot);
+        match result {
+            Ok(view) if !authority.is_cancelled() => {
+                self.activate(found.tab);
+                self.tab.pause_follow();
+                self.tab.screen.position = position;
+                self.tab.preferred = None;
+                self.tab.top = view.top;
+                self.tab.left = view.left;
+                self.tab.screen.view = Some(Arc::new(view));
+                self.tab.view_retry = None;
+                self.cache = cache;
+                Ok(true)
+            }
+            result => {
+                let error = result.err();
+                if same_tab {
+                    self.cache = cache;
+                }
+                self.layout(false)?;
+                match error {
+                    Some(Error::Cancelled) | None => Ok(false),
+                    Some(error) => Err(error),
+                }
+            }
+        }
+    }
+
     pub(super) fn start_search(&mut self, request: SearchRequest) -> Result<(), Error> {
         let mut state = std::mem::take(&mut self.search);
         let result = state.start(self, request, true);
@@ -1057,15 +1150,18 @@ impl State {
         let (page_changed, jump) =
             self.results
                 .poll(owner, &mut self.status, self.run.is_none())?;
-        if let Some(jump) = jump {
-            owner.activate(jump.found.tab);
-            owner.tab.pause_follow();
-            owner.tab.screen.position.move_to(jump.caret, false);
-            owner.tab.preferred = None;
-            owner.layout_search(jump.found.range.end.saturating_sub(1))?;
+        if let Some(jump) = jump
+            && owner.reveal_search_result(
+                &jump.found,
+                Some(jump.caret),
+                jump.navigation,
+                &Cancellation::default(),
+            )?
+        {
             self.stream_anchor = owner.tab.live.is_some().then(|| jump.found.clone());
             self.status.current = Some(jump.found);
             self.status.rows.current = Some(jump.row);
+            self.status.rows.ordinal = jump.ordinal;
         }
         if self.maintaining.is_some() {
             return self.poll_maintenance(owner);

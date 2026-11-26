@@ -14,12 +14,16 @@ pub(crate) const OPTIONS: u8 = 18;
 pub(crate) const SHOW_RESULTS: u8 = 19;
 pub(crate) const FORM_UP: u8 = 20;
 pub(crate) const FORM_DOWN: u8 = 21;
+pub(crate) const CLOSE: u8 = 10;
+pub(crate) const MINIMIZE: u8 = 22;
+pub(crate) const RESTORE: u8 = 23;
 const EXPANDED_OPTIONS: [u8; 6] = [2, 3, 11, 12, 13, 4];
 
 /// Bounded session fields and the visible slice of keyboard/mouse controls.
 #[derive(Default)]
 pub(crate) struct Panel {
     pub open: bool,
+    pub minimized: bool,
     pub replace: bool,
     pub query: Query,
     pub replacement: String,
@@ -35,6 +39,7 @@ pub(crate) struct Panel {
     requested: Option<(u64, u64)>,
     expected: Option<(u64, u64)>,
     pub(super) focus_after_find: Option<u64>,
+    restore_focus: Option<Control>,
     cursor: [Option<usize>; 2],
 }
 
@@ -136,7 +141,7 @@ impl Panel {
             7 => "Replace Next".into(),
             8 | 15 => "Replace All".into(),
             9 => "Cancel search".into(),
-            10 => "×".into(),
+            CLOSE => "×".into(),
             11 => "Tab".into(),
             12 => "LF".into(),
             13 => "CRLF".into(),
@@ -150,9 +155,11 @@ impl Panel {
                 self.scope_label()
             ),
             SHOW_RESULTS if self.list_open => "Form".into(),
-            SHOW_RESULTS => "Results".into(),
+            SHOW_RESULTS => "List".into(),
             FORM_UP => "↑".into(),
             FORM_DOWN => "↓".into(),
+            MINIMIZE => "−".into(),
+            RESTORE => "Restore".into(),
             _ => "Cancel".into(),
         }
     }
@@ -214,6 +221,46 @@ impl AppState {
 
     /// Retire the window before returning focus to the editor.
     pub(crate) fn close_search(&mut self) {
+        self.search.minimized = false;
+        self.search.restore_focus = None;
+        self.search.hidden = Some(self.screen.search.rows.generation);
+        self.leave_search_window();
+    }
+
+    /// Keep the query and results while handing the terminal back to the editor.
+    pub(crate) fn minimize_search(&mut self) {
+        self.search.restore_focus = self.focus;
+        self.search.minimized = true;
+        self.leave_search_window();
+    }
+
+    /// Reopen the same panel without submitting work or replaying navigation.
+    pub(super) fn restore_search(&mut self) {
+        self.search.minimized = false;
+        self.search.open = true;
+        let have_results = self
+            .search
+            .current_rows(&self.screen.search.rows)
+            .is_some_and(|rows| rows.count != 0);
+        match self.search.restore_focus.take() {
+            Some(Control::SearchList | Control::SearchResult(_)) if have_results => {
+                self.focus = Some(Control::SearchList);
+            }
+            Some(Control::Search(index))
+                if self
+                    .search
+                    .controls(self.screen.search.busy)
+                    .contains(&index) =>
+            {
+                self.search_focus(index);
+            }
+            _ => self.search_focus(0),
+        }
+        self.capture = None;
+        self.dirty = true;
+    }
+
+    fn leave_search_window(&mut self) {
         self.revoke_native_clipboard();
         self.search.open = false;
         self.search.focus_after_find = None;
@@ -478,6 +525,15 @@ impl AppState {
         let Control::Search(index) = control else {
             return None;
         };
+        if matches!(index, MINIMIZE | CLOSE) {
+            match movement {
+                Movement::Left => self.search_focus(MINIMIZE),
+                Movement::Right => self.search_focus(CLOSE),
+                Movement::Down => self.search_focus(0),
+                _ => {}
+            }
+            return None;
+        }
         let groups = self.search.groups(self.screen.search.busy);
         let Some(row) = groups.iter().position(|group| group.contains(&index)) else {
             self.search_focus(0);
@@ -498,6 +554,8 @@ impl AppState {
                     row.checked_add_signed(step).and_then(|row| groups.get(row))
                 {
                     self.search_focus(target[0]);
+                } else if !down && row == 0 {
+                    self.search_focus(MINIMIZE);
                 }
             }
             Movement::Left | Movement::Right if index == OPTIONS => {
@@ -604,6 +662,10 @@ impl AppState {
             return None;
         }
         if matches!(command, Command::Find | Command::Replace) {
+            if self.search.minimized {
+                self.restore_search();
+                return Some(None);
+            }
             if !self.search.open {
                 self.search.expanded = false;
                 self.search.result_top = 0;
@@ -628,15 +690,15 @@ impl AppState {
                 | Command::ReplaceAll
                 | Command::CancelSearch
         ) {
+            if !self.search.open || !matches!(self.key_context(), Context::Search) {
+                return Some(None);
+            }
             self.search.focus_after_find = None;
             if command == Command::CancelSearch {
                 return Some(Some(Intent::Editor(Action::CancelSearch)));
             }
             if self.search.query.literal.is_empty() {
-                if self.search.open {
-                    return Some(None);
-                }
-                return self.search_command(Command::Find, layout);
+                return Some(None);
             }
             if matches!(command, Command::ReplaceNext | Command::ReplaceAll) && !self.search.replace
             {
@@ -714,7 +776,7 @@ impl AppState {
             Command::ToggleMatchCase => Some(2),
             Command::ToggleWholeWord => Some(3),
             Command::ToggleSearchScope => Some(4),
-            Command::CloseSearch => Some(10),
+            Command::CloseSearch => Some(CLOSE),
             Command::InsertQueryTab => Some(11),
             Command::InsertQueryLf => Some(12),
             Command::InsertQueryCrlf => Some(13),
@@ -780,6 +842,14 @@ impl AppState {
         if layout.area.width < 40 || layout.area.height < 8 {
             return Some(None);
         }
+        let target = direct.unwrap_or(index);
+        if matches!(target, MINIMIZE | CLOSE) && layout.contains(Control::Search(target)) {
+            return Some(Some(if target == MINIMIZE {
+                Intent::MinimizeSearch
+            } else {
+                Intent::DismissSearch
+            }));
+        }
         if let Some(pending) = &mut self.field_paste {
             if direct.is_none() {
                 pending.submit = true;
@@ -787,7 +857,7 @@ impl AppState {
             }
             return Some(None);
         }
-        let index = direct.unwrap_or(index);
+        let index = target;
         if direct.is_none() && !layout.contains(Control::Search(index)) && !matches!(index, 0 | 1) {
             return Some(None);
         }
@@ -823,7 +893,6 @@ impl AppState {
             6 => self.search_command(Command::FindNext, layout).flatten(),
             8 => self.search_command(Command::ReplaceAll, layout).flatten(),
             9 => Some(Intent::Editor(Action::CancelSearch)),
-            10 => Some(Intent::DismissSearch),
             11..=13 => {
                 let field = self.search.field;
                 self.search_focus(field);
@@ -908,6 +977,40 @@ mod tests {
         assert_eq!(app.focus, Some(Control::Content));
         app.command(Command::FocusSearch, &layout(&app));
         assert_eq!(app.focus, Some(Control::Search(0)));
+    }
+
+    #[test]
+    fn search_command_remaps_require_expanded_search_focus() {
+        let mut app = AppState::new();
+        app.search.query.literal = "apple".into();
+        for modifiers in [KeyModifiers::NONE, KeyModifiers::SHIFT] {
+            assert!(
+                app.input(
+                    Input::Key(KeyEvent::new(KeyCode::F(3), modifiers)),
+                    &layout(&app)
+                )
+                .is_none()
+            );
+        }
+        for command in [
+            Command::FindNext,
+            Command::FindPrevious,
+            Command::ReplaceNext,
+            Command::ReplaceAll,
+            Command::CancelSearch,
+        ] {
+            assert!(app.command(command, &layout(&app)).is_none());
+            assert!(!app.search.open);
+        }
+        app.command(Command::Find, &layout(&app));
+        assert!(matches!(
+            app.command(Command::FindNext, &layout(&app)),
+            Some(Intent::Editor(Action::Search(_)))
+        ));
+        app.minimize_search();
+        assert!(app.command(Command::FindPrevious, &layout(&app)).is_none());
+        assert!(app.command(Command::CancelSearch, &layout(&app)).is_none());
+        assert!(app.search.minimized);
     }
 
     #[test]

@@ -28,18 +28,7 @@ pub(crate) const GROUPS: &[(&str, &[Command])] = &[
             Command::GoTo,
         ],
     ),
-    (
-        "Search",
-        &[
-            Command::Find,
-            Command::Replace,
-            Command::FindNext,
-            Command::FindPrevious,
-            Command::ReplaceNext,
-            Command::ReplaceAll,
-            Command::CancelSearch,
-        ],
-    ),
+    ("Search", &[Command::Find, Command::Replace]),
     (
         "Tabs",
         &[Command::Tabs, Command::CloseTab, Command::TabDetails],

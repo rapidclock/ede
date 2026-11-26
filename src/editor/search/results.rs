@@ -266,6 +266,8 @@ pub(super) struct Jump {
     pub(super) found: Found,
     pub(super) caret: u64,
     pub(super) row: u64,
+    pub(super) ordinal: Option<u64>,
+    pub(super) navigation: u64,
 }
 
 /// Bounded resident metadata for the submitted search and latest replacement.
@@ -424,8 +426,9 @@ impl Results {
                             status.rows.current = page.selected.map(|(selected, _)| selected);
                             status.rows.ordinal = page.selected.map(|(_, ordinal)| ordinal);
                         }
-                        if request.navigation
-                            == Some(owner.view_cancel.search_navigation.load(Ordering::Acquire))
+                        if let Some(navigation) = request.navigation
+                            && navigation
+                                == owner.view_cancel.search_navigation.load(Ordering::Acquire)
                             && let Some(index) = request.jump
                             && let Some(row) = index
                                 .checked_sub(request.start)
@@ -437,8 +440,9 @@ impl Results {
                                 found: row.found.clone(),
                                 caret: row.caret,
                                 row: index,
+                                ordinal: page.jump_ordinal,
+                                navigation,
                             });
-                            status.rows.ordinal = page.jump_ordinal;
                         }
                     }
                     Err(error) => status.rows.error = Some(error.to_string()),

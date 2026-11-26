@@ -235,6 +235,8 @@ impl Default for Keymap {
             );
         }
         for command in [
+            C::FindNext,
+            C::FindPrevious,
             C::ReplaceNext,
             C::ReplaceAll,
             C::CancelSearch,

@@ -60,7 +60,7 @@ struct ViewControl {
     current: Mutex<Option<TabId>>,
     receiving: Mutex<Option<TabId>>,
     search: Mutex<Cancellation>,
-    search_navigation: AtomicU64,
+    search_navigation: Arc<AtomicU64>,
     search_replacing: AtomicBool,
     streamed: AtomicBool,
     export: Mutex<Option<Cancellation>>,
@@ -784,7 +784,12 @@ impl Editor {
     }
     /// Cancel the current long operation without requiring admission to its queue.
     pub fn cancel(&self) {
-        if let Ok(cancel) = self.view_cancel.search.lock() {
+        self.cancel_work(true);
+    }
+
+    /// Cancel general editor work while optionally preserving a minimized scan.
+    pub(crate) fn cancel_work(&self, include_search: bool) {
+        if include_search && let Ok(cancel) = self.view_cancel.search.lock() {
             cancel.cancel();
         }
         if let Ok(export) = self.view_cancel.export.lock()
@@ -1769,13 +1774,16 @@ impl Coordinator {
                 generation,
                 search_cover,
             } => {
+                let reveal_after_minimize =
+                    self.search_cover != 0 && search_cover == 0 && height < self.height;
+                let search_stayed_expanded = self.search_cover != 0 && search_cover != 0;
                 self.width = width;
                 self.height = height;
                 self.generation = generation;
                 self.search_cover = search_cover;
                 if self.tab.screen.document.is_some() {
                     let found = self.search.status.current.as_ref().filter(|found| {
-                        search_cover != 0
+                        search_stayed_expanded
                             && self.tab.screen.tab == Some(found.tab)
                             && self
                                 .tab
@@ -1786,7 +1794,7 @@ impl Coordinator {
                     if let Some(found) = found {
                         self.layout_search(found.range.end.saturating_sub(1))?;
                     } else {
-                        self.layout(false)?;
+                        self.layout(reveal_after_minimize)?;
                     }
                 }
             }
@@ -4161,6 +4169,11 @@ mod search_tests {
         settle(&mut worker);
         assert_eq!(worker.search.status.total(), 1);
         assert_eq!(worker.search.status.outcomes[0].tab, a);
+        assert_eq!(worker.search.status.rows.count, 0);
+        assert_eq!(
+            worker.search.status.message,
+            "Current tab changed; press Find"
+        );
         assert_eq!(worker.tab.screen.tab, Some(b));
     }
 

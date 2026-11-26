@@ -26,6 +26,126 @@ use nix::{
 /// Bounded timeouts turn a broken terminal loop into a useful test failure, not a hanging CI job.
 const TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Minimize and restore either search mode through real keyboard and mouse input.
+#[test]
+fn search_minimize_restores_results_and_keeps_editor_focus() {
+    let root = tempfile::tempdir().unwrap();
+    let file = root.path().join("fruit.txt");
+    std::fs::write(
+        &file,
+        "green apple\napple tree\napple baked\n4\n5\n6\n7\n8\nlast line",
+    )
+    .unwrap();
+    for shortcut in [b"\x06", b"\x08"] {
+        let mut process = PtyChild::editor_with_path(Some("xterm-256color"), Some(&file));
+        process.expect_status("Ln 1 Col 1");
+        process.send(shortcut);
+        process.expect("[−]  [×]");
+        process.send(b"apple\r");
+        process.expect("1 of 3 matches");
+        process.send(b"\x1b[B");
+        process.expect_status("Ln 2 Col 1");
+
+        process.click_label("[−]", 1);
+        process.expect(" · 3 matches");
+        process.expect("[Restore]  [×]");
+        process.expect_absent("Find:");
+        process.send(b"\x1b[B");
+        process.expect_status("Ln 3 Col 1");
+        process.send(b"\x1b[27u");
+        process.expect("[Restore]  [×]");
+        process.send(b"\x06");
+        process.expect("> 2:1 apple tree");
+        process.expect_status("Ln 3 Col 1");
+        assert_eq!(
+            process.parser.screen().contents().contains("Replace:"),
+            shortcut == b"\x08"
+        );
+        process.send(b"\t");
+        process.expect(">Find: apple");
+        process.send(b"\x1b[A\r");
+        process.expect("[Restore]  [×]");
+        process.resize(40, 8);
+        process.expect("[Restore]  [×]");
+        process.send(b"\x1b[1;5F");
+        process.expect_status("Ln 9 Col 10");
+        process.expect_body("last line", TIMEOUT);
+        assert!(process.parser.screen().cursor_position().0 < 6);
+        process.click_label("[Restore]", 1);
+        process.expect(">Find: apple");
+        process.expect_absent("[Restore]");
+        process.send(b"\x1b[A\r");
+        process.expect("[Restore]  [×]");
+        process.click_label("[×]", 1);
+        process.expect_absent("[Restore]");
+        process.send(shortcut);
+        process.expect(">Find: apple");
+        process.expect_absent("3 matches");
+        process.send(b"\x1b");
+        process.expect_absent("Find:");
+        process.send(b"\x1bOQ");
+        process.expect("Actions (wheel/arrows)");
+        process.click_label("Search", 1);
+        process.expect("Find & Replace");
+        for removed in [
+            "Find next",
+            "Find previous",
+            "Replace next",
+            "Replace all",
+            "Cancel search",
+        ] {
+            assert!(!process.parser.screen().contents().contains(removed));
+        }
+        process.send(b"\x1b");
+        process.expect_absent("Actions (wheel/arrows)");
+        process.send(b"\x11");
+        assert!(process.wait().success());
+    }
+}
+
+/// A minimized Current tab search never offers rows from an edited or inactive tab.
+#[test]
+fn search_minimized_marks_changed_revision_and_current_tab_stale() {
+    let root = tempfile::tempdir().unwrap();
+    let left = root.path().join("left.txt");
+    let right = root.path().join("right.txt");
+    std::fs::write(&left, "apple left\n").unwrap();
+    std::fs::write(&right, "apple right\n").unwrap();
+    let mut process = PtyChild::editor_with_options(
+        Some("xterm-256color"),
+        [left.as_os_str(), right.as_os_str()],
+        None,
+        Some(root.path()),
+        None,
+    );
+    process.expect_body("apple left", TIMEOUT);
+    process.expect_status("Ready | Ln 1 Col 1");
+    process.send(b"\x06apple\r");
+    process.expect("1 of 1 match");
+    process.click_label("[−]", 1);
+    process.expect("Find · 1 match");
+    process.send(b"x");
+    process.expect_body("xapple left", TIMEOUT);
+    process.expect("Find · Stale results");
+    process.send(b"\x1a\x06");
+    process.expect(">Find: apple");
+    process.expect_absent("1:1 apple left");
+    process.send(b"\r");
+    process.expect("1 of 1 match");
+    process.click_label("[−]", 1);
+    process.expect("Find · 1 match");
+    process.send(b"\x1b[19~");
+    process.expect_body("apple right", TIMEOUT);
+    process.expect("Find · Stale results");
+    process.send(b"\x06");
+    process.expect(">Find: apple");
+    process.expect_absent("1:1 apple left");
+    process.send(b"\x1b");
+    process.expect_absent("Find:");
+    process.send(b"\x11");
+    assert!(process.wait().success());
+}
+
 /// A fresh search starts at the first match and gives its arrow keys to the list.
 #[test]
 fn search_submission_selects_first_and_tabs_between_sections() {
@@ -1811,7 +1931,7 @@ fn live_find_advances_after_append() {
     process.expect_status("Ln 1 Col 8");
     writer.write_all(b"stream item two\n").unwrap();
     process.expect("Results stale");
-    process.send(b"\x1bOR");
+    process.click_label("[Next]", 1);
     process.expect_status("Ln 2 Col 8");
     drop(writer);
     process.expect_status("Editable scratch");
@@ -4879,7 +4999,10 @@ fn large_highlighting_and_search_overlap() {
     process.expect_with_timeout("Plain syntax", Duration::from_secs(120));
     process.send(b"\x1b[18~");
     process.expect_body("fn LEADING_TOKEN()", Duration::from_secs(10));
-    process.send(b"\x06ABSENT_MARKER\t\t\t\r\x1bOR");
+    process.send(b"\x06ABSENT_MARKER");
+    process.click_label("Options", 1);
+    process.click_label("[Current tab]", 1);
+    process.click_label("[Find]", 1);
     process.expect("Searching");
 
     let pid = process.editor_pid().as_raw();

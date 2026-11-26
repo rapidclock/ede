@@ -203,6 +203,7 @@ pub(crate) struct Signature {
     picker_request: u64,
     switching: Option<u64>,
     search: Option<search::Signature>,
+    search_minimized: bool,
     stream: bool,
     stream_confirmation: bool,
     settings_epoch: u64,
@@ -222,6 +223,7 @@ pub(crate) struct LayoutSnapshot {
     targets: Vec<Target>,
     list_rows: u16,
     search_window: Option<Rect>,
+    search_bar: Option<Rect>,
     search_list: Option<Rect>,
     pub(crate) search_details_scroll_limit: u16,
 }
@@ -261,6 +263,7 @@ impl LayoutSnapshot {
             targets: Vec::new(),
             list_rows: 0,
             search_window: None,
+            search_bar: None,
             search_list: None,
             search_details_scroll_limit: 0,
         };
@@ -351,6 +354,7 @@ impl LayoutSnapshot {
             picker_request,
             switching: app.switching,
             search: app.search.open.then(|| search::Signature::new(app)),
+            search_minimized: app.search.minimized,
             stream: app.screen.stream.is_some(),
             stream_confirmation: app.stream_confirmation.is_some(),
             settings_epoch: app.settings_generation,
@@ -402,6 +406,8 @@ impl LayoutSnapshot {
                 }
                 if app.search.open {
                     result.add_search_window(app);
+                } else if app.search.minimized {
+                    result.add_search_bar(app);
                 }
             }
             return result;
@@ -887,6 +893,11 @@ impl LayoutSnapshot {
                     | Control::TabListRow(_)
                     | Control::RecoveryRow(_)
                     | Control::SearchSurface
+                    | Control::Search(
+                        crate::app::search::CLOSE
+                            | crate::app::search::MINIMIZE
+                            | crate::app::search::RESTORE
+                    )
                     | Control::SearchResult(_)
                     | Control::TabDivider
             )
@@ -1290,7 +1301,7 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &AppState, layout: &LayoutSnaps
             app.status.text(),
             coordinates,
             if app.pending { " | working" } else { "" },
-            if !app.search.open && !app.screen.search.message.is_empty() {
+            if !app.search.open && !app.search.minimized && !app.screen.search.message.is_empty() {
                 format!(" | {}", app.screen.search.message)
             } else {
                 String::new()
@@ -1317,6 +1328,8 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &AppState, layout: &LayoutSnaps
     );
     if let Some(window) = layout.search_bounds() {
         search::render(frame, app, layout, window);
+    } else if let Some(bar) = layout.search_bar {
+        search::render_bar(frame, app, layout, bar);
     }
     if let Some(overlay) = layout.overlay {
         if matches!(app.modal, Some(Modal::Settings)) {
@@ -1619,7 +1632,7 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &AppState, layout: &LayoutSnaps
         }
     }
     for target in &layout.targets {
-        if layout.search_bounds().is_some()
+        if (layout.search_bounds().is_some() || layout.search_bar.is_some())
             && matches!(
                 target.control,
                 Control::Search(_)

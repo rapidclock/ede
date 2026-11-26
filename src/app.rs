@@ -37,10 +37,11 @@ pub(crate) enum Intent {
     Suspend,
     MouseCapture(bool),
     Editor(Action),
-    CancelWork,
+    CancelWork { keep_search: bool },
     Picker(picker::Request),
     CancelPicker,
     DismissSearch,
+    MinimizeSearch,
 }
 /// Direct-path dialog intent; paths remain separate from safe display labels.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1227,7 +1228,9 @@ impl AppState {
                 return Some(Intent::Editor(Action::CancelOpen(tab)));
             }
             if self.pending || self.screen.exporting {
-                return Some(Intent::CancelWork);
+                return Some(Intent::CancelWork {
+                    keep_search: self.search.minimized,
+                });
             }
             self.capture = None;
             return self
@@ -1983,6 +1986,7 @@ impl AppState {
                             | Control::TabClose(_)
                             | Control::SearchSurface
                             | Control::SearchList
+                            | Control::Search(search::MINIMIZE | search::CLOSE | search::RESTORE)
                             | Control::SettingsFindRowsStep(_)
                     )
                 }) {
@@ -2060,6 +2064,18 @@ impl AppState {
                     } else if hit == Some(capture.control) {
                         if capture.control == Control::PaneOutside {
                             return self.dismiss_outside(layout);
+                        }
+                        match capture.control {
+                            Control::SearchSurface => return None,
+                            Control::Search(search::MINIMIZE) => {
+                                return Some(Intent::MinimizeSearch);
+                            }
+                            Control::Search(search::CLOSE) => return Some(Intent::DismissSearch),
+                            Control::Search(search::RESTORE) => {
+                                self.restore_search();
+                                return None;
+                            }
+                            _ => {}
                         }
                         if let (Control::PickerRow(row), Some(Modal::Open(picker))) =
                             (capture.control, &mut self.modal)

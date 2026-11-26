@@ -82,8 +82,7 @@ binary data report errors.
 | Move / extend selection | Arrows, Home, End, Page Up/Down; Shift extends | Same |
 | Document start / end | Ctrl+Home / Ctrl+End | Same |
 | Go to line or line:cell | Ctrl+G; numbers start at 1 | Same |
-| Find / Replace | Ctrl+F / Ctrl+H | Cmd+F / Cmd+H |
-| Next / previous match | F3 / Shift+F3 | Same |
+| Find / Find & Replace | Ctrl+F / Ctrl+H | Cmd+F / Shift+Cmd+H |
 | Help / actions | F1 / F2 | Same |
 | Leave text / previous control | F6 / Shift+F6 | Same |
 | Activate / cancel | Enter / Escape | Same |
@@ -125,15 +124,23 @@ Use Tab or Shift+Tab to switch between the form and results. Use Up and Down
 to navigate the focused section, including every expanded option in the form.
 Click a result or use the arrow keys in the list to jump to its exact match.
 Page Up, Page Down, Home and End browse the list. The mouse wheel scrolls it
-without moving the caret. F6 returns to editor text. F3 and Shift+F3 wrap through
-live matches. **Summary** opens Search Details with per-tab counts and outcomes.
+without moving the caret. F6 returns to editor text. **Previous** and **Next**
+wrap through live matches. **Summary** opens Search Details with per-tab counts
+and outcomes.
+
+Click the blue **`−`** to minimize either window and return to the editor. A
+one-line bar shows progress or the match count. Click **Restore** or press
+Ctrl+F / Cmd+F to reopen the same window with its results. In the form,
+press Up from the first row to reach Minimize and Close, then use Left or
+Right to choose and Enter to activate. The red **`×`** cancels and closes
+either view. While the window is expanded, Escape cancels active work or
+closes the idle window.
 
 **Replace Next** reveals a match before changing it and advances without
 wrapping. **Replace All** confirms the scope with Cancel focused. **Replaced**
 and **Removed** mark the latest committed changes in the result list. Each
 changed document gets one Undo step, and saving remains a separate action.
-Search Summary reports per-tab outcomes. Escape cancels active work and closes
-the idle window. Search navigation clears ordinary selection and keeps the
+Search navigation clears ordinary selection and keeps the
 caret on a grapheme boundary. The exact-match highlight shows the replacement
 range.
 
@@ -339,8 +346,8 @@ that a command starts unbound and is available when its surface permits it.
 | `global` | `close_tab` | Ctrl+W / Cmd+W |
 | `global` | `export_retained` | — |
 | `global` | `find` | Ctrl+F / Cmd+F |
-| `global` | `find_next` | F3 |
-| `global` | `find_previous` | Shift+F3 |
+| `global` | `find_next` | — |
+| `global` | `find_previous` | — |
 | `global` | `follow_file` | — |
 | `global` | `go_to` | Ctrl+G |
 | `global` | `help` | F1 |
