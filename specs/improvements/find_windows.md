@@ -2,8 +2,8 @@
 
 **Status** — The collapsed-title revision and its CI follow-up are implemented
 and validated on macOS and Ubuntu 26.10.
-**Release** — User-confirmed patch target `0.1.2`, from `0.1.1` on `main`.
-The review build is `0.1.2-dev.5`.
+**Release** — Final package version `0.1.2`, approved by the user as a patch
+from `0.1.1` on `main`.
 **Branch** — `enhance/find-windows`, based on `main` at `3004bb3`.
 
 ## Current behavior and scope
@@ -270,6 +270,12 @@ Minimized title  ┌ Find ──────────────────
 
 ## Validation record
 
+- Final `0.1.2` — The user approved removing the development suffix after the
+  `dev.5` hosted macOS check passed. Upstream `main` was still at `0.1.1`.
+  Cargo's manifest and lockfile agree, and `ede --version` reports `0.1.2` on
+  macOS and Ubuntu 26.10 UTM. Formatting and strict Clippy passed on both.
+  The full locked workspace suites passed 394 tests on macOS and 397 on Ubuntu.
+  Cargo built and verified the `ede-0.1.2` package on macOS.
 - Hosted terminal harness follow-up — Both Find regressions passed in the
   `dev.4` hosted run. The remaining workspace-header test timed out after
   Help closed. Both surfaces expose a focused Quit label, so the test must
@@ -401,6 +407,6 @@ Minimized title  ┌ Find ──────────────────
   native controlling-terminal access. Linux release benchmarks were pending
   at the initial handoff.
 - Release baseline — Fetched upstream before handoff. `origin/main` remained
-  at `3004bb3` with package version `0.1.1`. Finalizing `0.1.2` awaits
-  explicit release approval.
+  at `3004bb3` with package version `0.1.1`. The user subsequently approved
+  finalizing the version on `enhance/find-windows`.
 - Authorization — The user requested implementation on 2026-11-24.
