@@ -211,6 +211,7 @@ fn search_details_use_separate_lines_and_a_soft_divider() {
     assert!(!process.parser.screen().contents().contains("<U+000A>"));
     process.send(b"\x1b");
     process.expect_absent("Search Details");
+    process.expect(">Summary<");
     process.send(b"\x1b");
     process.expect_absent("Options");
     process.send(b"\x11");
@@ -2476,6 +2477,7 @@ fn real_shortcuts_paste_and_cleanup() {
 #[test]
 fn workspace_header_buttons_are_spaced_colored_and_reachable() {
     let header = "[Tabs]  [Settings]  [Menu]  [Quit]";
+    let quit = header.find("[Quit]").unwrap();
     for (width, height) in [(80, 24), (40, 8)] {
         let mut process = PtyChild::editor();
         if width != 80 {
@@ -2536,7 +2538,10 @@ fn workspace_header_buttons_are_spaced_colored_and_reachable() {
         process.send(b"\x1b");
         process.expect(">Menu<");
         process.send(b"\t");
-        process.click_label(">Quit<", 1);
+        // Help's own Quit can still be present in a partially drawn frame.
+        process.expect(&format!("{}>Quit<", &header[..quit]));
+        let column = usize::from(start) + quit + 1;
+        process.send(format!("\x1b[<0;{column};1M\x1b[<0;{column};1m").as_bytes());
         assert!(process.wait().success());
         process.assert_restored();
     }

@@ -3,7 +3,7 @@
 **Status** — The collapsed-title revision and its CI follow-up are implemented
 and validated on macOS and Ubuntu 26.10.
 **Release** — User-confirmed patch target `0.1.2`, from `0.1.1` on `main`.
-The review build is `0.1.2-dev.4`.
+The review build is `0.1.2-dev.5`.
 **Branch** — `enhance/find-windows`, based on `main` at `3004bb3`.
 
 ## Current behavior and scope
@@ -270,6 +270,14 @@ Minimized title  ┌ Find ──────────────────
 
 ## Validation record
 
+- Hosted terminal harness follow-up — Both Find regressions passed in the
+  `dev.4` hosted run. The remaining workspace-header test timed out after
+  Help closed. Both surfaces expose a focused Quit label, so the test must
+  wait for the focused header and click its known row. The Search Details
+  test waits for the restored Find window before dismissing it. The `dev.5`
+  revision passed formatting, strict Clippy, and the full locked suites on
+  local macOS and the Ubuntu 26.10 UTM guest with 394 and 397 tests passing.
+  See the [dev.4 Actions job](https://github.com/rapidclock/ede/actions/runs/45779783088/job/139772149010).
 - Hosted macOS regression (A4, A5, A10, A12) — The `dev.3` PR job passed
   formatting and Clippy and failed two native terminal tests. A scratch edit
   finished between press and release on Replace All, and a highlight pass
